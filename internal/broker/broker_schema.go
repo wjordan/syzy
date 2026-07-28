@@ -217,6 +217,7 @@ func (b *Broker) ReconcileSchemaToSQLite(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	repaired, skipped := 0, 0
+	decoded := make([]reconcileSchemaEvent, 0, len(events))
 	for _, e := range events {
 		select {
 		case <-ctx.Done():
@@ -238,11 +239,20 @@ func (b *Broker) ReconcileSchemaToSQLite(ctx context.Context) (int, error) {
 				"schema_seq", e.SchemaSeq, "err", err)
 			continue
 		}
+		decoded = append(decoded, reconcileSchemaEvent{schemaSeq: e.SchemaSeq, op: op})
+	}
+	for _, e := range terminalNamedDDLEvents(decoded) {
+		select {
+		case <-ctx.Done():
+			return repaired, ctx.Err()
+		default:
+		}
+		op := e.op
 		missing, err := structuralEffectMissing(op, b.cfg.AppApply, b.cfg.Catalog)
 		if err != nil {
 			skipped++
 			b.log.Warn("broker: reconcile skipping op; precheck failed",
-				"schema_seq", e.SchemaSeq, "op", op.Kind.String(), "err", err)
+				"schema_seq", e.schemaSeq, "op", op.Kind.String(), "err", err)
 			continue
 		}
 		if !missing {
@@ -259,10 +269,10 @@ func (b *Broker) ReconcileSchemaToSQLite(ctx context.Context) (int, error) {
 			// genuine unhealed skew) loud.
 			if isSupersededDDLErr(err) {
 				b.log.Info("broker: reconcile skipping superseded DDL op (dependency dropped)",
-					"schema_seq", e.SchemaSeq, "op", op.Kind.String(), "err", err)
+					"schema_seq", e.schemaSeq, "op", op.Kind.String(), "err", err)
 			} else {
 				b.log.Error("broker: reconcile skipping op; re-apply failed",
-					"schema_seq", e.SchemaSeq, "op", op.Kind.String(), "err", err)
+					"schema_seq", e.schemaSeq, "op", op.Kind.String(), "err", err)
 			}
 			continue
 		}
@@ -271,12 +281,12 @@ func (b *Broker) ReconcileSchemaToSQLite(ctx context.Context) (int, error) {
 		if err := b.cfg.Catalog.Reload(); err != nil {
 			skipped++
 			b.log.Error("broker: reconcile catalog reload failed after repair",
-				"schema_seq", e.SchemaSeq, "err", err)
+				"schema_seq", e.schemaSeq, "err", err)
 			continue
 		}
 		repaired++
 		b.log.Warn("broker: reconciled schema skew; re-applied DDL absent from app.db",
-			"schema_seq", e.SchemaSeq, "op", op.Kind.String())
+			"schema_seq", e.schemaSeq, "op", op.Kind.String())
 	}
 	if skipped > 0 {
 		b.log.Info("broker: reconcile skipped events it could not decode or apply",
@@ -292,6 +302,97 @@ func (b *Broker) ReconcileSchemaToSQLite(ctx context.Context) (int, error) {
 		}
 	}
 	return repaired, nil
+}
+
+type reconcileSchemaEvent struct {
+	schemaSeq uint64
+	op        crdt.CatalogOp
+}
+
+type namedDDLKey struct {
+	objectType string
+	name       string
+}
+
+// terminalNamedDDLEvents removes historical named-object operations that a
+// later event superseded. Unlike tables and columns, opaque indexes, views,
+// virtual tables, and triggers are absent from the typed catalog, so their
+// final state must be derived from the applied event sequence itself.
+//
+// Keeping only the last operation for each object also preserves the last
+// CREATE's RawSQL when a name was dropped and reused. Otherwise a reconcile
+// could replay an old CREATE, replay the later DROP, and repeat that cycle on
+// every open while leaving the final schema unchanged.
+func terminalNamedDDLEvents(events []reconcileSchemaEvent) []reconcileSchemaEvent {
+	last := make(map[namedDDLKey]int)
+	ordinal := 0
+	for _, e := range events {
+		walkNamedDDLOps(e.op, func(key namedDDLKey) {
+			last[key] = ordinal
+			ordinal++
+		})
+	}
+
+	out := make([]reconcileSchemaEvent, 0, len(events))
+	ordinal = 0
+	for _, e := range events {
+		op, keep := filterTerminalNamedDDL(e.op, last, &ordinal)
+		if keep {
+			e.op = op
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func walkNamedDDLOps(op crdt.CatalogOp, visit func(namedDDLKey)) {
+	if op.Kind == crdt.OpBundle {
+		for _, sub := range op.SubOps {
+			walkNamedDDLOps(sub, visit)
+		}
+		return
+	}
+	if key, ok := namedDDLOpKey(op); ok {
+		visit(key)
+	}
+}
+
+func filterTerminalNamedDDL(op crdt.CatalogOp, last map[namedDDLKey]int, ordinal *int) (crdt.CatalogOp, bool) {
+	if op.Kind == crdt.OpBundle {
+		subOps := make([]crdt.CatalogOp, 0, len(op.SubOps))
+		for _, sub := range op.SubOps {
+			filtered, keep := filterTerminalNamedDDL(sub, last, ordinal)
+			if keep {
+				subOps = append(subOps, filtered)
+			}
+		}
+		op.SubOps = subOps
+		return op, len(subOps) > 0
+	}
+	key, named := namedDDLOpKey(op)
+	if !named {
+		return op, true
+	}
+	current := *ordinal
+	*ordinal++
+	return op, current == last[key]
+}
+
+func namedDDLOpKey(op crdt.CatalogOp) (namedDDLKey, bool) {
+	var objectType string
+	switch op.Kind {
+	case crdt.OpCreateIndex, crdt.OpDropIndex:
+		objectType = "index"
+	case crdt.OpCreateView, crdt.OpDropView:
+		objectType = "view"
+	case crdt.OpCreateVirtualTable, crdt.OpDropVirtualTable:
+		objectType = "table"
+	case crdt.OpCreateTrigger, crdt.OpDropTrigger:
+		objectType = "trigger"
+	default:
+		return namedDDLKey{}, false
+	}
+	return namedDDLKey{objectType: objectType, name: op.ObjectName}, true
 }
 
 // runSchemaCatchup reads events past meta.schema_seq and applies them.

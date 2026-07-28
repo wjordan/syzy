@@ -214,7 +214,21 @@ func opAlreadyAppliedInSQLite(op crdt.CatalogOp, app *sqlitebridge.Conn, cat cat
 		if !ok {
 			return false, nil
 		}
-		return sqlitebridge.ColumnExists(app, tab.Name, op.Columns[0].Name)
+		if tab.Dropped() {
+			return true, nil
+		}
+		col, ok := tab.ColumnByID(op.Columns[0].ID)
+		if !ok {
+			// A later DROP superseded this ADD. Historic identity proves
+			// the column did exist; an unknown identity is the catch-up
+			// crash window, where SQLite may already have the literal name
+			// even though the catalog has not recorded its identity yet.
+			if _, historic := tab.HistoricColumnByID(op.Columns[0].ID); historic {
+				return true, nil
+			}
+			return sqlitebridge.ColumnExists(app, tab.Name, op.Columns[0].Name)
+		}
+		return sqlitebridge.ColumnExists(app, tab.Name, col.Name)
 
 	case crdt.OpDropColumn:
 		tab, ok := cat.TableByID(op.TableID)
@@ -304,7 +318,7 @@ func structuralEffectMissing(op crdt.CatalogOp, app *sqlitebridge.Conn, cat *cat
 	if op.Kind == crdt.OpBundle {
 		final := bundleFinalState(cat, op.SubOps)
 		for _, sub := range op.SubOps {
-			applied, err := opAlreadyAppliedInSQLite(sub, app, final)
+			applied, err := reconcileOpAlreadyApplied(sub, app, final)
 			if err != nil {
 				return false, err
 			}
@@ -314,11 +328,40 @@ func structuralEffectMissing(op crdt.CatalogOp, app *sqlitebridge.Conn, cat *cat
 		}
 		return false, nil
 	}
-	applied, err := opAlreadyAppliedInSQLite(op, app, cat)
+	applied, err := reconcileOpAlreadyApplied(op, app, cat)
 	if err != nil {
 		return false, err
 	}
 	return !applied, nil
+}
+
+// reconcileOpAlreadyApplied judges historical rename operations by the final
+// typed catalog state. The ordinary apply precheck must use the op's literal
+// target while catching up, when the catalog still describes the prior state;
+// reconciliation instead runs after all events are catalog-applied, where an
+// earlier target may have been renamed or dropped away again.
+func reconcileOpAlreadyApplied(op crdt.CatalogOp, app *sqlitebridge.Conn, cat catalog.TableResolver) (bool, error) {
+	switch op.Kind {
+	case crdt.OpRenameTable:
+		tab, ok := cat.TableByID(op.TableID)
+		if !ok || tab.Dropped() {
+			return true, nil
+		}
+		return sqlitebridge.ObjectExists(app, "table", tab.Name)
+	case crdt.OpRenameColumn:
+		tab, ok := cat.TableByID(op.TableID)
+		if !ok || tab.Dropped() {
+			return true, nil
+		}
+		col, ok := tab.ColumnByID(op.ColumnID)
+		if !ok {
+			_, historic := tab.HistoricColumnByID(op.ColumnID)
+			return historic, nil
+		}
+		return sqlitebridge.ColumnExists(app, tab.Name, col.Name)
+	default:
+		return opAlreadyAppliedInSQLite(op, app, cat)
+	}
 }
 
 func pkColumnsFromOp(op crdt.CatalogOp) []string {

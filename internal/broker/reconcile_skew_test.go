@@ -43,6 +43,17 @@ func (f *catchupFixture) corruptSchemaEventOp(t *testing.T, schemaSeq uint64, ga
 	}
 }
 
+func (f *catchupFixture) appendCatalogOp(t *testing.T, parentSeq uint64, op crdt.CatalogOp) {
+	t.Helper()
+	encoded, err := crdt.EncodeCatalogOp(op)
+	if err != nil {
+		t.Fatalf("EncodeCatalogOp: %v", err)
+	}
+	if _, err := f.log.Append(context.Background(), parentSeq, encoded, ""); err != nil {
+		t.Fatalf("log.Append: %v", err)
+	}
+}
+
 // TestReconcileSchemaToSQLite_SkipsUndecodableEarlierOp reproduces the
 // production crash-loop: an applied event early in schema_seq order no longer
 // decodes (older catalog-op wire format), while a later applied ADD COLUMN is
@@ -427,5 +438,137 @@ func TestReconcileSchemaToSQLite_DoesNotResurrectDroppedTable(t *testing.T) {
 	}
 	if tableExistsInSQLite(t, f.app, "t") {
 		t.Error("reconcile resurrected the dropped table t")
+	}
+}
+
+func TestReconcileSchemaToSQLite_DoesNotCycleSupersededIndexHistory(t *testing.T) {
+	t.Parallel()
+	f := newCatchupFixture(t)
+	f.appendCreateTable(t, 0, "t")
+	f.appendCatalogOp(t, 1, crdt.CatalogOp{
+		Kind: crdt.OpCreateIndex, ObjectName: "idx_t_id",
+		RawSQL: "CREATE INDEX idx_t_id ON t(id)",
+	})
+	f.appendCatalogOp(t, 2, crdt.CatalogOp{
+		Kind: crdt.OpDropIndex, ObjectName: "idx_t_id",
+		RawSQL: "DROP INDEX idx_t_id",
+	})
+	if err := f.br.runSchemaCatchup(context.Background()); err != nil {
+		t.Fatalf("runSchemaCatchup: %v", err)
+	}
+
+	for pass := 1; pass <= 2; pass++ {
+		repaired, err := f.br.ReconcileSchemaToSQLite(context.Background())
+		if err != nil {
+			t.Fatalf("reconcile pass %d: %v", pass, err)
+		}
+		if repaired != 0 {
+			t.Fatalf("reconcile pass %d repaired = %d; want 0", pass, repaired)
+		}
+		if exists, err := sqlitebridge.ObjectExists(f.app, "index", "idx_t_id"); err != nil || exists {
+			t.Fatalf("pass %d left superseded index present (exists=%v err=%v)", pass, exists, err)
+		}
+	}
+}
+
+func TestReconcileSchemaToSQLite_ReplaysLastCreateForReusedIndexName(t *testing.T) {
+	t.Parallel()
+	f := newCatchupFixture(t)
+	f.appendCreateTable(t, 0, "t")
+	f.appendCatalogOp(t, 1, crdt.CatalogOp{
+		Kind: crdt.OpCreateIndex, ObjectName: "idx_t_id",
+		RawSQL: "CREATE INDEX idx_t_id ON t(id) WHERE id IS NOT NULL",
+	})
+	f.appendCatalogOp(t, 2, crdt.CatalogOp{
+		Kind: crdt.OpDropIndex, ObjectName: "idx_t_id",
+		RawSQL: "DROP INDEX idx_t_id",
+	})
+	const finalSQL = "CREATE INDEX idx_t_id ON t(id)"
+	f.appendCatalogOp(t, 3, crdt.CatalogOp{
+		Kind: crdt.OpCreateIndex, ObjectName: "idx_t_id",
+		RawSQL: finalSQL,
+	})
+	if err := f.br.runSchemaCatchup(context.Background()); err != nil {
+		t.Fatalf("runSchemaCatchup: %v", err)
+	}
+	if err := f.app.Exec("DROP INDEX idx_t_id"); err != nil {
+		t.Fatalf("stage skew: %v", err)
+	}
+
+	repaired, err := f.br.ReconcileSchemaToSQLite(context.Background())
+	if err != nil {
+		t.Fatalf("ReconcileSchemaToSQLite: %v", err)
+	}
+	if repaired != 1 {
+		t.Fatalf("repaired = %d; want 1", repaired)
+	}
+	stmt, _, err := f.app.Prepare(`SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = 'idx_t_id'`)
+	if err != nil {
+		t.Fatalf("prepare sqlite_schema query: %v", err)
+	}
+	defer stmt.Finalize()
+	hasRow, err := stmt.Step()
+	if err != nil {
+		t.Fatalf("query sqlite_schema: %v", err)
+	}
+	if !hasRow || stmt.ColumnText(0) != finalSQL {
+		t.Fatalf("replayed index SQL = %q (present=%v); want %q", stmt.ColumnText(0), hasRow, finalSQL)
+	}
+	repaired, err = f.br.ReconcileSchemaToSQLite(context.Background())
+	if err != nil || repaired != 0 {
+		t.Fatalf("second reconcile = (%d, %v); want (0, nil)", repaired, err)
+	}
+}
+
+func TestReconcileSchemaToSQLite_DoesNotReplaySupersededAddColumn(t *testing.T) {
+	t.Parallel()
+	f := newCatchupFixture(t)
+	tabID, _ := f.appendCreateTable(t, 0, "t")
+	colID := f.appendAddColumn(t, 1, tabID, "obsolete")
+	f.appendCatalogOp(t, 2, crdt.CatalogOp{
+		Kind: crdt.OpDropColumn, TableID: tabID, ColumnID: colID,
+	})
+	if err := f.br.runSchemaCatchup(context.Background()); err != nil {
+		t.Fatalf("runSchemaCatchup: %v", err)
+	}
+
+	repaired, err := f.br.ReconcileSchemaToSQLite(context.Background())
+	if err != nil {
+		t.Fatalf("ReconcileSchemaToSQLite: %v", err)
+	}
+	if repaired != 0 {
+		t.Fatalf("repaired = %d; want 0", repaired)
+	}
+	if exists, err := sqlitebridge.ColumnExists(f.app, "t", "obsolete"); err != nil || exists {
+		t.Fatalf("superseded column present (exists=%v err=%v)", exists, err)
+	}
+}
+
+func TestReconcileSchemaToSQLite_DoesNotReplayIntermediateRename(t *testing.T) {
+	t.Parallel()
+	f := newCatchupFixture(t)
+	tabID, _ := f.appendCreateTable(t, 0, "t")
+	f.appendCatalogOp(t, 1, crdt.CatalogOp{
+		Kind: crdt.OpRenameTable, TableID: tabID, TableName: "t2",
+	})
+	f.appendCatalogOp(t, 2, crdt.CatalogOp{
+		Kind: crdt.OpRenameTable, TableID: tabID, TableName: "t3",
+	})
+	if err := f.br.runSchemaCatchup(context.Background()); err != nil {
+		t.Fatalf("runSchemaCatchup: %v", err)
+	}
+
+	repaired, err := f.br.ReconcileSchemaToSQLite(context.Background())
+	if err != nil {
+		t.Fatalf("ReconcileSchemaToSQLite: %v", err)
+	}
+	if repaired != 0 {
+		t.Fatalf("repaired = %d; want 0", repaired)
+	}
+	if tableExistsInSQLite(t, f.app, "t") || tableExistsInSQLite(t, f.app, "t2") {
+		t.Fatal("reconcile resurrected an intermediate table name")
+	}
+	if !tableExistsInSQLite(t, f.app, "t3") {
+		t.Fatal("final table name t3 is missing")
 	}
 }
