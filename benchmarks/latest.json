@@ -1,0 +1,464 @@
+{
+  "version": 1,
+  "generated_at": "2026-07-11T08:10:03.868270715Z",
+  "benchtime": "50000x",
+  "count": 5,
+  "git_commit": "a16d19b",
+  "git_branch": "worktree-oss-cleanup",
+  "go_version": "go1.26.4",
+  "goos": "linux",
+  "goarch": "amd64",
+  "kernel_version": "6.17.0-22-generic",
+  "cpu_model": "AMD Ryzen 9 7900X 12-Core Processor",
+  "num_cpu": 2,
+  "scenarios": [
+    {
+      "name": "sqlite (single)",
+      "group": "Local",
+      "bench": "BenchmarkBaselineInsert",
+      "package": "./sqlitebridge",
+      "description": "Stock SQLite, no syzy hooks. Reference for what unmodified SQLite costs on this host."
+    },
+    {
+      "name": "syzy (single)",
+      "group": "Local",
+      "bench": "BenchmarkCommitInsert",
+      "package": "./internal/producer",
+      "description": "Same workload with syzy's preupdate touch journal + walhook + journal append wired in.",
+      "compare_with": "sqlite (single)"
+    },
+    {
+      "name": "sqlite (batch=8)",
+      "group": "Local",
+      "bench": "BenchmarkBaselineInsertBatched/batch=8",
+      "package": "./sqlitebridge"
+    },
+    {
+      "name": "syzy (batch=8)",
+      "group": "Local",
+      "bench": "BenchmarkCommitInsertBatched/batch=8",
+      "package": "./internal/producer",
+      "compare_with": "sqlite (batch=8)"
+    },
+    {
+      "name": "sqlite (batch=64)",
+      "group": "Local",
+      "bench": "BenchmarkBaselineInsertBatched/batch=64",
+      "package": "./sqlitebridge"
+    },
+    {
+      "name": "syzy (batch=64)",
+      "group": "Local",
+      "bench": "BenchmarkCommitInsertBatched/batch=64",
+      "package": "./internal/producer",
+      "compare_with": "sqlite (batch=64)"
+    },
+    {
+      "name": "sqlite (batch=512)",
+      "group": "Local",
+      "bench": "BenchmarkBaselineInsertBatched/batch=512",
+      "package": "./sqlitebridge",
+      "description": "At batch=512 per-row cost approaches what the SQLite vdbe alone costs."
+    },
+    {
+      "name": "syzy (batch=512)",
+      "group": "Local",
+      "bench": "BenchmarkCommitInsertBatched/batch=512",
+      "package": "./internal/producer",
+      "compare_with": "sqlite (batch=512)"
+    },
+    {
+      "name": "sqlite (single)",
+      "group": "Replication",
+      "bench": "BenchmarkBaselineInsert",
+      "package": "./sqlitebridge"
+    },
+    {
+      "name": "syzy round-trip (single)",
+      "group": "Replication",
+      "bench": "BenchmarkRoundTripInsert",
+      "package": "./internal/testcluster",
+      "description": "Per-row WaitApplied — A's commit blocks until B reports it applied. nodestate.Cache + per-origin journals + drainer-side broadcast via OnEncoded.",
+      "compare_with": "sqlite (single)"
+    },
+    {
+      "name": "syzy pipelined (single)",
+      "group": "Replication",
+      "bench": "BenchmarkPipelinedInsert",
+      "package": "./internal/testcluster",
+      "description": "All INSERTs back-to-back, one WaitApplied at the end. A's commit, drainer encode, and B's apply run concurrently.",
+      "compare_with": "sqlite (single)"
+    },
+    {
+      "name": "sqlite (batch=8)",
+      "group": "Replication",
+      "bench": "BenchmarkBaselineInsertBatched/batch=8",
+      "package": "./sqlitebridge"
+    },
+    {
+      "name": "syzy round-trip (batch=8)",
+      "group": "Replication",
+      "bench": "BenchmarkRoundTripInsertBatched/batch=8",
+      "package": "./internal/testcluster",
+      "compare_with": "sqlite (batch=8)"
+    },
+    {
+      "name": "syzy pipelined (batch=8)",
+      "group": "Replication",
+      "bench": "BenchmarkPipelinedInsertBatched/batch=8",
+      "package": "./internal/testcluster",
+      "compare_with": "sqlite (batch=8)"
+    },
+    {
+      "name": "sqlite (batch=64)",
+      "group": "Replication",
+      "bench": "BenchmarkBaselineInsertBatched/batch=64",
+      "package": "./sqlitebridge"
+    },
+    {
+      "name": "syzy round-trip (batch=64)",
+      "group": "Replication",
+      "bench": "BenchmarkRoundTripInsertBatched/batch=64",
+      "package": "./internal/testcluster",
+      "compare_with": "sqlite (batch=64)"
+    },
+    {
+      "name": "syzy pipelined (batch=64)",
+      "group": "Replication",
+      "bench": "BenchmarkPipelinedInsertBatched/batch=64",
+      "package": "./internal/testcluster",
+      "compare_with": "sqlite (batch=64)"
+    },
+    {
+      "name": "sqlite (batch=512)",
+      "group": "Replication",
+      "bench": "BenchmarkBaselineInsertBatched/batch=512",
+      "package": "./sqlitebridge"
+    },
+    {
+      "name": "syzy round-trip (batch=512)",
+      "group": "Replication",
+      "bench": "BenchmarkRoundTripInsertBatched/batch=512",
+      "package": "./internal/testcluster",
+      "compare_with": "sqlite (batch=512)"
+    },
+    {
+      "name": "syzy pipelined (batch=512)",
+      "group": "Replication",
+      "bench": "BenchmarkPipelinedInsertBatched/batch=512",
+      "package": "./internal/testcluster",
+      "compare_with": "sqlite (batch=512)"
+    },
+    {
+      "name": "Single-row INSERT (full pipeline)",
+      "group": "Producer commit-thread latency",
+      "bench": "BenchmarkCommitInsert",
+      "package": "./internal/producer",
+      "description": "Full producer hot path: preupdate touch journal, walHook, journal append. Drainer runs concurrently in its goroutine.",
+      "compare_with": "Fixture floor: INSERT (no-op walHook)"
+    },
+    {
+      "name": "Single-row UPDATE (full pipeline)",
+      "group": "Producer commit-thread latency",
+      "bench": "BenchmarkCommitUpdate",
+      "package": "./internal/producer",
+      "description": "UPDATE writes one fewer WAL frame than INSERT in the bench fixture, so the absolute time is lower.",
+      "compare_with": "Fixture floor: UPDATE (no-op walHook)"
+    },
+    {
+      "name": "Fixture floor: INSERT (no-op walHook)",
+      "group": "Producer commit-thread latency",
+      "bench": "BenchmarkHookFixtureNoOpInsert",
+      "package": "./internal/producer",
+      "description": "Touch journal + no-op walHook installed; no drainer, no journal append. Lower bound on syzy's commit-thread cost."
+    },
+    {
+      "name": "Fixture floor: UPDATE (no-op walHook)",
+      "group": "Producer commit-thread latency",
+      "bench": "BenchmarkHookFixtureNoOpUpdate",
+      "package": "./internal/producer"
+    },
+    {
+      "name": "Journal append (small payload)",
+      "group": "Components",
+      "bench": "BenchmarkAppend",
+      "package": "./internal/journal",
+      "description": "Single record append into the mmap journal segment, in isolation."
+    },
+    {
+      "name": "CRDT changeset build (INSERT)",
+      "group": "Components",
+      "bench": "BenchmarkBuildInsert",
+      "package": "./internal/crdt",
+      "description": "Encoding one Insert record into a Changeset. Runs on the drainer thread, off the commit-thread hot path."
+    },
+    {
+      "name": "CRDT changeset decode (INSERT)",
+      "group": "Components",
+      "bench": "BenchmarkDecodeInsert",
+      "package": "./internal/crdt",
+      "description": "Inverse of the build above. Runs on remote nodes when applying inbound changesets."
+    },
+    {
+      "name": "Broker apply: INSERT",
+      "group": "Components",
+      "bench": "BenchmarkApplyInsert",
+      "package": "./internal/broker",
+      "description": "Remote-side path: decoded changeset → SQL apply against a peer's app.db, including row_clock checks and conflict resolution."
+    }
+  ],
+  "results": [
+    {
+      "scenario": "sqlite (single)",
+      "group": "Local",
+      "ns_per_op": 8626,
+      "bytes_per_op": 8,
+      "allocs_per_op": 1,
+      "iterations": 50000,
+      "num_runs": 5
+    },
+    {
+      "scenario": "syzy (single)",
+      "group": "Local",
+      "ns_per_op": 10335,
+      "bytes_per_op": 1774,
+      "allocs_per_op": 18,
+      "iterations": 50000,
+      "num_runs": 5
+    },
+    {
+      "scenario": "sqlite (batch=8)",
+      "group": "Local",
+      "ns_per_op": 2530,
+      "bytes_per_op": 8,
+      "allocs_per_op": 1,
+      "iterations": 50000,
+      "num_runs": 5
+    },
+    {
+      "scenario": "syzy (batch=8)",
+      "group": "Local",
+      "ns_per_op": 3407,
+      "bytes_per_op": 1439,
+      "allocs_per_op": 9,
+      "iterations": 50000,
+      "num_runs": 5
+    },
+    {
+      "scenario": "sqlite (batch=64)",
+      "group": "Local",
+      "ns_per_op": 1565,
+      "bytes_per_op": 8,
+      "allocs_per_op": 1,
+      "iterations": 50000,
+      "num_runs": 5
+    },
+    {
+      "scenario": "syzy (batch=64)",
+      "group": "Local",
+      "ns_per_op": 2252,
+      "bytes_per_op": 1749,
+      "allocs_per_op": 8,
+      "iterations": 50000,
+      "num_runs": 5
+    },
+    {
+      "scenario": "sqlite (batch=512)",
+      "group": "Local",
+      "ns_per_op": 1046,
+      "bytes_per_op": 8,
+      "allocs_per_op": 1,
+      "iterations": 50000,
+      "num_runs": 5
+    },
+    {
+      "scenario": "syzy (batch=512)",
+      "group": "Local",
+      "ns_per_op": 1639,
+      "bytes_per_op": 1986,
+      "allocs_per_op": 8,
+      "iterations": 50000,
+      "num_runs": 5
+    },
+    {
+      "scenario": "sqlite (single)",
+      "group": "Replication",
+      "ns_per_op": 8590,
+      "bytes_per_op": 8,
+      "allocs_per_op": 1,
+      "iterations": 50000,
+      "num_runs": 5
+    },
+    {
+      "scenario": "syzy round-trip (single)",
+      "group": "Replication",
+      "ns_per_op": 34255,
+      "bytes_per_op": 4871,
+      "allocs_per_op": 50,
+      "iterations": 50000,
+      "num_runs": 5
+    },
+    {
+      "scenario": "syzy pipelined (single)",
+      "group": "Replication",
+      "ns_per_op": 19314,
+      "bytes_per_op": 4662,
+      "allocs_per_op": 43,
+      "iterations": 50000,
+      "num_runs": 5
+    },
+    {
+      "scenario": "sqlite (batch=8)",
+      "group": "Replication",
+      "ns_per_op": 2464,
+      "bytes_per_op": 8,
+      "allocs_per_op": 1,
+      "iterations": 50000,
+      "num_runs": 5
+    },
+    {
+      "scenario": "syzy round-trip (batch=8)",
+      "group": "Replication",
+      "ns_per_op": 9922,
+      "bytes_per_op": 3580,
+      "allocs_per_op": 22,
+      "iterations": 50000,
+      "num_runs": 5
+    },
+    {
+      "scenario": "syzy pipelined (batch=8)",
+      "group": "Replication",
+      "ns_per_op": 6246,
+      "bytes_per_op": 3593,
+      "allocs_per_op": 21,
+      "iterations": 50000,
+      "num_runs": 5
+    },
+    {
+      "scenario": "sqlite (batch=64)",
+      "group": "Replication",
+      "ns_per_op": 1716,
+      "bytes_per_op": 8,
+      "allocs_per_op": 1,
+      "iterations": 50000,
+      "num_runs": 5
+    },
+    {
+      "scenario": "syzy round-trip (batch=64)",
+      "group": "Replication",
+      "ns_per_op": 6165,
+      "bytes_per_op": 3744,
+      "allocs_per_op": 18,
+      "iterations": 50000,
+      "num_runs": 5
+    },
+    {
+      "scenario": "syzy pipelined (batch=64)",
+      "group": "Replication",
+      "ns_per_op": 3891,
+      "bytes_per_op": 3938,
+      "allocs_per_op": 17,
+      "iterations": 50000,
+      "num_runs": 5
+    },
+    {
+      "scenario": "sqlite (batch=512)",
+      "group": "Replication",
+      "ns_per_op": 1063,
+      "bytes_per_op": 8,
+      "allocs_per_op": 1,
+      "iterations": 50000,
+      "num_runs": 5
+    },
+    {
+      "scenario": "syzy round-trip (batch=512)",
+      "group": "Replication",
+      "ns_per_op": 4700,
+      "bytes_per_op": 3939,
+      "allocs_per_op": 17,
+      "iterations": 50000,
+      "num_runs": 5
+    },
+    {
+      "scenario": "syzy pipelined (batch=512)",
+      "group": "Replication",
+      "ns_per_op": 3295,
+      "bytes_per_op": 4374,
+      "allocs_per_op": 17,
+      "iterations": 50000,
+      "num_runs": 5
+    },
+    {
+      "scenario": "Single-row INSERT (full pipeline)",
+      "group": "Producer commit-thread latency",
+      "ns_per_op": 10349,
+      "bytes_per_op": 1775,
+      "allocs_per_op": 18,
+      "iterations": 50000,
+      "num_runs": 5
+    },
+    {
+      "scenario": "Single-row UPDATE (full pipeline)",
+      "group": "Producer commit-thread latency",
+      "ns_per_op": 7525,
+      "bytes_per_op": 1270,
+      "allocs_per_op": 20,
+      "iterations": 50000,
+      "num_runs": 5
+    },
+    {
+      "scenario": "Fixture floor: INSERT (no-op walHook)",
+      "group": "Producer commit-thread latency",
+      "ns_per_op": 8989,
+      "bytes_per_op": 15,
+      "allocs_per_op": 2,
+      "iterations": 50000,
+      "num_runs": 5
+    },
+    {
+      "scenario": "Fixture floor: UPDATE (no-op walHook)",
+      "group": "Producer commit-thread latency",
+      "ns_per_op": 6788,
+      "bytes_per_op": 23,
+      "allocs_per_op": 2,
+      "iterations": 50000,
+      "num_runs": 5
+    },
+    {
+      "scenario": "Journal append (small payload)",
+      "group": "Components",
+      "ns_per_op": 90.61,
+      "bytes_per_op": 0,
+      "allocs_per_op": 0,
+      "iterations": 50000,
+      "num_runs": 5
+    },
+    {
+      "scenario": "CRDT changeset build (INSERT)",
+      "group": "Components",
+      "ns_per_op": 246.2,
+      "bytes_per_op": 448,
+      "allocs_per_op": 6,
+      "iterations": 50000,
+      "num_runs": 5
+    },
+    {
+      "scenario": "CRDT changeset decode (INSERT)",
+      "group": "Components",
+      "ns_per_op": 231.6,
+      "bytes_per_op": 448,
+      "allocs_per_op": 5,
+      "iterations": 50000,
+      "num_runs": 5
+    },
+    {
+      "scenario": "Broker apply: INSERT",
+      "group": "Components",
+      "ns_per_op": 10260,
+      "bytes_per_op": 900,
+      "allocs_per_op": 8,
+      "iterations": 50000,
+      "num_runs": 5
+    }
+  ]
+}

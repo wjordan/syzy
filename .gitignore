@@ -1,0 +1,38 @@
+# Build output
+/bin/
+/dist/
+
+# Go
+*.test
+*.out
+coverage.out
+coverage.txt
+
+# IDE
+/.idea/
+*.swp
+
+# Test scratch databases
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+
+# Local cgo build cache (cgo doesn't write here, but prevents accidents)
+/.cache/
+
+AGENTS.md
+CLAUDE.md
+
+# Locally-built binaries (repo root and module roots)
+/syzy
+/syzy-dumpcs
+/jinspect
+/jprobe
+/sqlite/syzy
+/sqlite/syzy-ext
+/blockdev/syzy-blkd
+/blockdev/blkperf
+/syzyfs/syzyfsd
+examples/fly-demo/fly-demo
+examples/fly-demo/*.log

@@ -1,0 +1,110 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (must already exist)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 30
+    # Through the environment rather than ${{ }} inside run: — a tag name
+    # interpolated straight into a shell script is executed, not quoted.
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      TARGET_OS: ${{ matrix.goos }}
+      TARGET_ARCH: ${{ matrix.goarch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native runners throughout: both artifacts are cgo builds and
+          # the extension is -buildmode=c-shared, so cross-compiling
+          # would mean maintaining a C toolchain per target.
+          #
+          # ubuntu-22.04 rather than -latest deliberately: the .so gets
+          # dlopen'd into arbitrary host processes, and its glibc floor
+          # is inherited from whatever built it.
+          - {goos: linux, goarch: amd64, runs-on: ubuntu-22.04}
+          - {goos: linux, goarch: arm64, runs-on: ubuntu-22.04-arm}
+          - {goos: darwin, goarch: arm64, runs-on: macos-14}
+          - {goos: darwin, goarch: amd64, runs-on: macos-13}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: Build
+        run: make build ext VERSION="$TAG"
+
+      - name: Verify the pair reports one version
+        run: |
+          set -e
+          got=$(./bin/syzy version | head -1)
+          [ "$got" = "syzy $TAG" ] || { echo "CLI reports '$got', want 'syzy $TAG'"; exit 1; }
+          # The extension auto-spawns this CLI's daemon and the two
+          # refuse to talk across a version mismatch, so a release whose
+          # halves disagree is worse than no release.
+          grep -qa "$TAG" ext/syzy.so || { echo "extension is not stamped with $TAG"; exit 1; }
+
+      - name: Package
+        id: pkg
+        run: |
+          set -e
+          name="syzy_${TAG}_${TARGET_OS}_${TARGET_ARCH}"
+          mkdir -p "dist/$name"
+          cp bin/syzy LICENSE README.md "dist/$name/"
+          # `.load syzy` is a bare dlopen: SQLite retries the name with
+          # the platform's own suffix appended — "dylib" on darwin, "so"
+          # elsewhere — so the file has to carry that exact name or the
+          # one-liner in the README does not resolve.
+          if [ "$TARGET_OS" = darwin ]; then
+            cp ext/syzy.so "dist/$name/syzy.dylib"
+          else
+            cp ext/syzy.so "dist/$name/syzy.so"
+            # LD_PRELOAD auto-attach is a Linux mechanism; darwin's
+            # equivalent is a different interposer, so don't ship a
+            # file that cannot work there.
+            cp ext/syzy-shim.so "dist/$name/"
+          fi
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          ( cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256" )
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Collect checksums
+        run: cat dist/*.sha256 > dist/SHA256SUMS && rm -f dist/*.sha256
+      - name: Publish release
+        run: |
+          gh release create "$TAG" --title "$TAG" --generate-notes --draft \
+            dist/*.tar.gz dist/SHA256SUMS scripts/install.sh

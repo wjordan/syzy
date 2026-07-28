@@ -1,0 +1,27 @@
+# Excluded from the Docker build context for examples/fly-demo and
+# any future Dockerfile builds at the repo root.
+
+.git
+.gitignore
+.github
+.claude
+.idea
+.vscode
+*.swp
+*.swo
+
+# Build artifacts; the Dockerfile builds inside the container.
+fly-demo
+**/syzy-bench-*
+benchmarks/**/*.out
+benchmarks/**/*.csv
+benchmarks/**/*.png
+
+# Local test scratch.
+testdata-tmp
+*.test
+coverage.out
+
+# Editor / OS noise.
+.DS_Store
+Thumbs.db
