@@ -5,6 +5,7 @@
 package broker
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -392,7 +393,38 @@ func terminalCoordinatedKeys(events []reconcileSchemaEvent) map[coordinatedKeyRe
 	for _, event := range events {
 		applyTerminalCoordinatedKeyOp(active, event.schemaSeq, event.op)
 	}
-	return active
+	return canonicalCoordinatedKeys(active)
+}
+
+// canonicalCoordinatedKeys makes schema-log repair choose the same KeyID winner
+// as catalog repair when historical admission minted duplicate identities for
+// one definition. Without this reduction, each open would restore every loser
+// immediately before catalog repair tombstoned it again.
+func canonicalCoordinatedKeys(active map[coordinatedKeyRef]coordinatedKeyReplay) map[coordinatedKeyRef]coordinatedKeyReplay {
+	winners := make(map[string]coordinatedKeyRef)
+	for ref, replay := range active {
+		sig := coordinatedKeySignature(replay.op.Keys[0])
+		winner, ok := winners[sig]
+		if !ok || bytes.Compare(ref.keyID[:], winner.keyID[:]) < 0 {
+			winners[sig] = ref
+		}
+	}
+	out := make(map[coordinatedKeyRef]coordinatedKeyReplay, len(winners))
+	for _, ref := range winners {
+		out[ref] = active[ref]
+	}
+	return out
+}
+
+func coordinatedKeySignature(key crdt.CatalogKey) string {
+	predicate := crdt.EncodeUniquePredicate(key.Predicate)
+	buf := make([]byte, 1, 1+len(key.Members)*len(crdt.ColumnID{})+len(predicate))
+	buf[0] = byte(len(key.Members))
+	for _, member := range key.Members {
+		buf = append(buf, member.ColumnID[:]...)
+	}
+	buf = append(buf, predicate...)
+	return string(buf)
 }
 
 func applyTerminalCoordinatedKeyOp(active map[coordinatedKeyRef]coordinatedKeyReplay, schemaSeq uint64, op crdt.CatalogOp) {

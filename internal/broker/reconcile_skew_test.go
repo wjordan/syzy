@@ -160,6 +160,37 @@ func TestReconcileSchemaToSQLite_DoesNotRestoreDroppedCoordinatedKey(t *testing.
 	}
 }
 
+func TestTerminalCoordinatedKeys_ChoosesDeterministicDuplicateWinner(t *testing.T) {
+	t.Parallel()
+	tableID := crdt.TableID{1}
+	columnID := crdt.ColumnID{2}
+	lowID := crdt.KeyID{3}
+	highID := crdt.KeyID{4}
+	add := func(seq uint64, keyID crdt.KeyID) reconcileSchemaEvent {
+		return reconcileSchemaEvent{
+			schemaSeq: seq,
+			op: crdt.CatalogOp{
+				Kind: crdt.OpAddUniqueKey, TableID: tableID, KeyID: keyID,
+				Keys: []crdt.CatalogKey{{
+					KeyID: keyID, Coordinated: true,
+					Members: []crdt.CatalogKeyMember{{ColumnID: columnID}},
+				}},
+			},
+		}
+	}
+
+	got := terminalCoordinatedKeys([]reconcileSchemaEvent{
+		add(1, highID),
+		add(2, lowID),
+	})
+	if len(got) != 1 {
+		t.Fatalf("terminal keys = %d; want one duplicate winner", len(got))
+	}
+	if _, ok := got[coordinatedKeyRef{tableID: tableID, keyID: lowID}]; !ok {
+		t.Fatalf("terminal keys chose the wrong duplicate winner: %#v", got)
+	}
+}
+
 // TestReconcileSchemaToSQLite_SkipsUndecodableEarlierOp reproduces the
 // production crash-loop: an applied event early in schema_seq order no longer
 // decodes (older catalog-op wire format), while a later applied ADD COLUMN is

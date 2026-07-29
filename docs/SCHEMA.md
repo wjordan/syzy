@@ -98,8 +98,11 @@ as authoritative for coordinated unique keys. If a key's final decodable
 operation leaves it active while the local catalog has lost or tombstoned it,
 Syzy restores the key definition before coordination services start. A later
 drop of the key, one of its columns, or its table wins and must not be
-resurrected. This repair uses catalog operations only: coordinated keys have no
-native SQLite unique index from which their intended state could be inferred.
+resurrected. If historical admission defects left duplicate active identities
+for one key definition, reconciliation restores only the same deterministic
+winner retained by catalog repair. This repair uses catalog operations only:
+coordinated keys have no native SQLite unique index from which their intended
+state could be inferred.
 
 ## Runtime obligations
 
