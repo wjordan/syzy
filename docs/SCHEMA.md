@@ -93,6 +93,14 @@ DDL itself does not appear as a DML record. The SQLite broker fetches schema
 events, applies native structure before metadata, records the event, reloads the
 runtime catalog, and advances its local schema sequence.
 
+On open, reconciliation treats the terminal state of the applied schema chain
+as authoritative for coordinated unique keys. If a key's final decodable
+operation leaves it active while the local catalog has lost or tombstoned it,
+Syzy restores the key definition before coordination services start. A later
+drop of the key, one of its columns, or its table wins and must not be
+resurrected. This repair uses catalog operations only: coordinated keys have no
+native SQLite unique index from which their intended state could be inferred.
+
 ## Runtime obligations
 
 Syzy must:

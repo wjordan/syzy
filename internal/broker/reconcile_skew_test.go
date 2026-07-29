@@ -9,7 +9,9 @@ import (
 	"sync"
 	"testing"
 
+	corecatalog "github.com/wjordan/syzy/catalog"
 	"github.com/wjordan/syzy/crdt"
+	"github.com/wjordan/syzy/internal/metadata"
 	"github.com/wjordan/syzy/internal/nodestate"
 	"github.com/wjordan/syzy/internal/sqlitecatalog"
 	"github.com/wjordan/syzy/sqlitebridge"
@@ -51,6 +53,110 @@ func (f *catchupFixture) appendCatalogOp(t *testing.T, parentSeq uint64, op crdt
 	}
 	if _, err := f.log.Append(context.Background(), parentSeq, encoded, ""); err != nil {
 		t.Fatalf("log.Append: %v", err)
+	}
+}
+
+func seedCoordinatedKey(t *testing.T, f *catchupFixture) (crdt.TableID, crdt.KeyID) {
+	t.Helper()
+	tabID, _ := f.appendCreateTable(t, 0, "accounts")
+	emailID := f.appendAddColumn(t, 1, tabID, "email")
+	keyID := corecatalog.AllocKeyID()
+	f.appendCatalogOp(t, 2, crdt.CatalogOp{
+		Kind: crdt.OpAddUniqueKey, TableID: tabID, KeyID: keyID,
+		Keys: []crdt.CatalogKey{{
+			KeyID: keyID, Coordinated: true,
+			Members: []crdt.CatalogKeyMember{{ColumnID: emailID}},
+		}},
+	})
+	if err := f.br.runSchemaCatchup(context.Background()); err != nil {
+		t.Fatalf("seed schema catch-up: %v", err)
+	}
+	return tabID, keyID
+}
+
+func tombstoneCatalogKey(t *testing.T, f *catchupFixture, tableID crdt.TableID, keyID crdt.KeyID) {
+	t.Helper()
+	if err := f.sc.WithTx(func(tx *metadata.Tx) error {
+		return tx.UpsertKey(metadata.KeyEntry{
+			TableID: tableID, KeyID: keyID,
+			Ordinal: 0, State: metadata.StateDropped, DropSeq: 3,
+		})
+	}); err != nil {
+		t.Fatalf("tombstone key: %v", err)
+	}
+	if err := f.cat.Reload(); err != nil {
+		t.Fatalf("reload tombstoned catalog: %v", err)
+	}
+}
+
+func catalogKeyState(t *testing.T, f *catchupFixture, tableID crdt.TableID, keyID crdt.KeyID) (active, dropped int) {
+	t.Helper()
+	snap, err := f.sc.LoadCatalogSnapshot()
+	if err != nil {
+		t.Fatalf("LoadCatalogSnapshot: %v", err)
+	}
+	for _, key := range snap.Keys {
+		if key.TableID != tableID || key.KeyID != keyID {
+			continue
+		}
+		if key.State == metadata.StateDropped {
+			dropped++
+		} else if key.Coordinated {
+			active++
+		}
+	}
+	return active, dropped
+}
+
+// A historical repair pass could infer that a coordinated key was orphaned
+// because it deliberately has no native UNIQUE index, then overwrite ordinal
+// zero with a dropped marker. The applied schema event is the durable authority
+// that lets open-time reconciliation distinguish that damage from a real drop.
+func TestReconcileSchemaToSQLite_RestoresTombstonedCoordinatedKey(t *testing.T) {
+	t.Parallel()
+	f := newCatchupFixture(t)
+	tableID, keyID := seedCoordinatedKey(t, f)
+	tombstoneCatalogKey(t, f, tableID, keyID)
+
+	if active, dropped := catalogKeyState(t, f, tableID, keyID); active != 0 || dropped != 1 {
+		t.Fatalf("staged key state = (active=%d dropped=%d); want (0, 1)", active, dropped)
+	}
+	repaired, err := f.br.ReconcileSchemaToSQLite(context.Background())
+	if err != nil {
+		t.Fatalf("ReconcileSchemaToSQLite: %v", err)
+	}
+	if repaired != 0 {
+		t.Fatalf("structural repairs = %d; want 0 for catalog-only repair", repaired)
+	}
+	if active, dropped := catalogKeyState(t, f, tableID, keyID); active != 1 || dropped != 0 {
+		t.Fatalf("healed key state = (active=%d dropped=%d); want (1, 0)", active, dropped)
+	}
+	tab, ok := f.cat.TableByID(tableID)
+	if !ok || len(tab.UniqueKeys) != 1 || tab.UniqueKeys[0].KeyID != keyID || !tab.UniqueKeys[0].Coordinated {
+		t.Fatalf("runtime catalog did not reload restored coordinated key: %#v", tab)
+	}
+}
+
+func TestReconcileSchemaToSQLite_DoesNotRestoreDroppedCoordinatedKey(t *testing.T) {
+	t.Parallel()
+	f := newCatchupFixture(t)
+	tableID, keyID := seedCoordinatedKey(t, f)
+	f.appendCatalogOp(t, 3, crdt.CatalogOp{
+		Kind: crdt.OpDropUniqueKey, TableID: tableID, KeyID: keyID,
+	})
+	if err := f.br.runSchemaCatchup(context.Background()); err != nil {
+		t.Fatalf("drop schema catch-up: %v", err)
+	}
+
+	repaired, err := f.br.ReconcileSchemaToSQLite(context.Background())
+	if err != nil {
+		t.Fatalf("ReconcileSchemaToSQLite: %v", err)
+	}
+	if repaired != 0 {
+		t.Fatalf("structural repairs = %d; want 0", repaired)
+	}
+	if active, dropped := catalogKeyState(t, f, tableID, keyID); active != 0 || dropped != 1 {
+		t.Fatalf("dropped key state = (active=%d dropped=%d); want (0, 1)", active, dropped)
 	}
 }
 

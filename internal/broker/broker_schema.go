@@ -196,12 +196,14 @@ func (b *Broker) drainFailedLocalSchemaEvents() error {
 // inbound row-write touching the absent column is dropped, diverging
 // silently from the cluster.
 //
-// Reconciliation walks every applied syzy_schema_event in schema_seq order
-// and, for any whose effect is absent from app.db, re-applies it via
+// Reconciliation walks every applied syzy_schema_event in schema_seq order.
+// It first restores any coordinated key whose terminal schema operation is
+// active but whose local catalog row is missing or tombstoned. For a structural
+// effect absent from app.db, it then re-applies the event via
 // applyCatalogStructural, which renders the exact DDL from the catalog op
 // (including NOT NULL ... DEFAULT, required to ADD a NOT NULL column to a
 // non-empty table) and is internally idempotent. A healthy node applies
-// nothing. Returns the number of events repaired.
+// nothing. Returns the number of structural events repaired.
 //
 // Run synchronously on Open before the node starts serving, so a restored
 // or re-opened node never serves (or drops inbound writes) against a schema
@@ -240,6 +242,14 @@ func (b *Broker) ReconcileSchemaToSQLite(ctx context.Context) (int, error) {
 			continue
 		}
 		decoded = append(decoded, reconcileSchemaEvent{schemaSeq: e.SchemaSeq, op: op})
+	}
+	catalogRepaired, err := b.repairCoordinatedKeyCatalog(decoded)
+	if err != nil {
+		return repaired, err
+	}
+	if catalogRepaired > 0 {
+		b.log.Warn("broker: reconciled coordinated-key catalog from schema log",
+			"repaired", catalogRepaired)
 	}
 	for _, e := range terminalNamedDDLEvents(decoded) {
 		select {
@@ -307,6 +317,145 @@ func (b *Broker) ReconcileSchemaToSQLite(ctx context.Context) (int, error) {
 type reconcileSchemaEvent struct {
 	schemaSeq uint64
 	op        crdt.CatalogOp
+}
+
+type coordinatedKeyRef struct {
+	tableID crdt.TableID
+	keyID   crdt.KeyID
+}
+
+type coordinatedKeyReplay struct {
+	schemaSeq uint64
+	op        crdt.CatalogOp
+}
+
+// repairCoordinatedKeyCatalog restores active coordinated keys from the
+// already-decoded schema history. Coordinated keys deliberately have no native
+// UNIQUE index, so the schema chain is the only durable source that can
+// distinguish a legitimate drop from a stray local catalog tombstone.
+func (b *Broker) repairCoordinatedKeyCatalog(events []reconcileSchemaEvent) (int, error) {
+	expected := terminalCoordinatedKeys(events)
+	if len(expected) == 0 {
+		return 0, nil
+	}
+	snap, err := b.cfg.Meta.LoadCatalogSnapshot()
+	if err != nil {
+		return 0, fmt.Errorf("broker: load catalog for coordinated-key reconcile: %w", err)
+	}
+
+	active := make(map[coordinatedKeyRef]bool)
+	dropped := make(map[coordinatedKeyRef]bool)
+	for _, key := range snap.Keys {
+		if key.KeyID == metadata.PKKeyID {
+			continue
+		}
+		ref := coordinatedKeyRef{tableID: key.TableID, keyID: key.KeyID}
+		if key.State == metadata.StateDropped {
+			dropped[ref] = true
+		} else {
+			active[ref] = true
+		}
+	}
+	for ref := range dropped {
+		delete(active, ref)
+	}
+
+	var missing []coordinatedKeyReplay
+	for ref, replay := range expected {
+		if !active[ref] {
+			missing = append(missing, replay)
+		}
+	}
+	if len(missing) == 0 {
+		return 0, nil
+	}
+	if err := b.cfg.Meta.WithTx(func(tx *metadata.Tx) error {
+		for _, replay := range missing {
+			if err := tx.ApplyCatalogOp(replay.op, replay.schemaSeq); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return 0, fmt.Errorf("broker: restore coordinated-key catalog: %w", err)
+	}
+	if err := b.cfg.Catalog.Reload(); err != nil {
+		return 0, fmt.Errorf("broker: reload coordinated-key catalog: %w", err)
+	}
+	return len(missing), nil
+}
+
+// terminalCoordinatedKeys reduces the applied schema chain to coordinated keys
+// whose final operation leaves both the key and its dependencies active.
+func terminalCoordinatedKeys(events []reconcileSchemaEvent) map[coordinatedKeyRef]coordinatedKeyReplay {
+	active := make(map[coordinatedKeyRef]coordinatedKeyReplay)
+	for _, event := range events {
+		applyTerminalCoordinatedKeyOp(active, event.schemaSeq, event.op)
+	}
+	return active
+}
+
+func applyTerminalCoordinatedKeyOp(active map[coordinatedKeyRef]coordinatedKeyReplay, schemaSeq uint64, op crdt.CatalogOp) {
+	if op.Kind == crdt.OpBundle {
+		for _, sub := range op.SubOps {
+			applyTerminalCoordinatedKeyOp(active, schemaSeq, sub)
+		}
+		return
+	}
+	switch op.Kind {
+	case crdt.OpCreateTable:
+		removeTableCoordinatedKeys(active, op.TableID)
+		for _, key := range op.Keys {
+			setTerminalCoordinatedKey(active, schemaSeq, op.TableID, key)
+		}
+	case crdt.OpAddUniqueKey:
+		ref := coordinatedKeyRef{tableID: op.TableID, keyID: op.KeyID}
+		delete(active, ref)
+		if len(op.Keys) == 1 {
+			setTerminalCoordinatedKey(active, schemaSeq, op.TableID, op.Keys[0])
+		}
+	case crdt.OpDropUniqueKey:
+		delete(active, coordinatedKeyRef{tableID: op.TableID, keyID: op.KeyID})
+	case crdt.OpDropColumn:
+		for ref, replay := range active {
+			if ref.tableID == op.TableID && keyContainsColumn(replay.op.Keys[0], op.ColumnID) {
+				delete(active, ref)
+			}
+		}
+	case crdt.OpDropTable:
+		removeTableCoordinatedKeys(active, op.TableID)
+	}
+}
+
+func setTerminalCoordinatedKey(active map[coordinatedKeyRef]coordinatedKeyReplay, schemaSeq uint64, tableID crdt.TableID, key crdt.CatalogKey) {
+	if !key.Coordinated || key.KeyID == metadata.PKKeyID {
+		return
+	}
+	ref := coordinatedKeyRef{tableID: tableID, keyID: key.KeyID}
+	active[ref] = coordinatedKeyReplay{
+		schemaSeq: schemaSeq,
+		op: crdt.CatalogOp{
+			Kind: crdt.OpAddUniqueKey, TableID: tableID, KeyID: key.KeyID,
+			Keys: []crdt.CatalogKey{key},
+		},
+	}
+}
+
+func removeTableCoordinatedKeys(active map[coordinatedKeyRef]coordinatedKeyReplay, tableID crdt.TableID) {
+	for ref := range active {
+		if ref.tableID == tableID {
+			delete(active, ref)
+		}
+	}
+}
+
+func keyContainsColumn(key crdt.CatalogKey, columnID crdt.ColumnID) bool {
+	for _, member := range key.Members {
+		if member.ColumnID == columnID {
+			return true
+		}
+	}
+	return false
 }
 
 type namedDDLKey struct {
