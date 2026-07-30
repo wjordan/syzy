@@ -1218,24 +1218,40 @@ func (p *Publisher) allocBaselineTXID() uint64 {
 // than anything already shipped — even if a prior publisher crashed
 // without persisting any state.
 func (p *Publisher) seedTXIDCounters(ctx context.Context) error {
-	if err := seedFromBucket(ctx, p.cfg.Backend, objstore.DBPrefix, &p.lastBucketTXID); err != nil {
+	head, _, err := objstore.LoadHEAD(ctx, p.cfg.Backend)
+	if err != nil {
+		return fmt.Errorf("load HEAD: %w", err)
+	}
+	var appBaseline, metaBaseline uint64
+	if head.Baseline != nil {
+		appBaseline = head.Baseline.TXID
+	}
+	if head.MetaBaseline != nil {
+		metaBaseline = head.MetaBaseline.TXID
+	}
+	if err := seedFromBucket(ctx, p.cfg.Backend, objstore.DBPrefix, appBaseline, &p.lastBucketTXID); err != nil {
 		return fmt.Errorf("seed app TXID: %w", err)
 	}
-	if err := seedFromBucket(ctx, p.cfg.Backend, objstore.MetadataPrefix, &p.metaTXIDCounter); err != nil {
+	if err := seedFromBucket(ctx, p.cfg.Backend, objstore.MetadataPrefix, metaBaseline, &p.metaTXIDCounter); err != nil {
 		return fmt.Errorf("seed meta TXID: %w", err)
 	}
 	return nil
 }
 
-// seedFromBucket raises counter to max(counter, MaxLTXTXID(prefix,
-// all-levels)) so the next Add(1) is guaranteed past anything shipped.
-func seedFromBucket(ctx context.Context, be objectstore.Bucket, prefix string, counter *atomic.Uint64) error {
+// seedFromBucket raises counter to the active baseline and any immutable object
+// after it. Retained history below the baseline cannot affect the next TXID and
+// may contain hundreds of thousands of objects, so begin each level's listing
+// at the authoritative HEAD boundary.
+func seedFromBucket(ctx context.Context, be objectstore.Bucket, prefix string, baseline uint64, counter *atomic.Uint64) error {
+	bumpAtomic(counter, baseline)
 	for _, level := range []int{objstore.L0Level, objstore.L1Level, objstore.BaselineLevel} {
-		max, err := objstore.MaxLTXTXID(ctx, be, prefix, level)
+		files, err := objstore.ListLTXAfter(ctx, be, prefix, level, baseline)
 		if err != nil {
 			return err
 		}
-		bumpAtomic(counter, max)
+		for _, f := range files {
+			bumpAtomic(counter, f.MaxTXID)
+		}
 	}
 	return nil
 }

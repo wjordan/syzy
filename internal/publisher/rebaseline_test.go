@@ -168,6 +168,50 @@ func TestMaybeRebaseline_NoTriggerWhenSmall(t *testing.T) {
 	}
 }
 
+func TestSeedTXIDCountersStartsAfterActiveBaselines(t *testing.T) {
+	be, err := objectstore.OpenFS(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		prefix   string
+		baseline uint64
+		tip      uint64
+	}{
+		{prefix: objstore.DBPrefix, baseline: 100, tip: 103},
+		{prefix: objstore.MetadataPrefix, baseline: 200, tip: 204},
+	} {
+		if _, err := objstore.PublishLTX(ctx, be, tc.prefix, objstore.L0Level, 1, 1, rebTinyLTX(t, 1)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := objstore.PublishLTX(ctx, be, tc.prefix, objstore.L0Level, tc.tip, tc.tip, rebTinyLTX(t, tc.tip)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	head := &objstore.HEAD{
+		Version:      objstore.HEADVersion,
+		ClusterID:    "test",
+		Baseline:     &objstore.Baseline{TXID: 100},
+		MetaBaseline: &objstore.Baseline{TXID: 200},
+	}
+	if _, err := objstore.CASHead(ctx, be, head, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	p := &Publisher{cfg: Config{Backend: be}}
+	if err := p.seedTXIDCounters(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := p.lastBucketTXID.Load(); got != 103 {
+		t.Fatalf("app TXID = %d, want 103", got)
+	}
+	if got := p.metaTXIDCounter.Load(); got != 204 {
+		t.Fatalf("metadata TXID = %d, want 204", got)
+	}
+}
+
 // TestMaybeRebaseline_BaselineSkew: when the meta baseline races ahead of
 // the db baseline (the resume-path asymmetry) past the skew failsafe, a
 // coupled rebaseline re-couples the two streams even with no db chain.
