@@ -47,6 +47,7 @@ const (
 	ResultError      = int(C.SQLITE_ERROR)
 	ResultBusy       = int(C.SQLITE_BUSY)
 	ResultLocked     = int(C.SQLITE_LOCKED)
+	ResultFull       = int(C.SQLITE_FULL)
 	ResultMisuse     = int(C.SQLITE_MISUSE)
 	ResultConstraint = int(C.SQLITE_CONSTRAINT)
 	ResultRow        = int(C.SQLITE_ROW)

@@ -98,9 +98,14 @@ func (b *Broker) Apply(_ context.Context, cs *crdt.Changeset) error {
 // force, when true, skips the applied-idempotency short-circuit so the
 // quarantine re-apply drain can re-run the DML for a seq the frontier was
 // already advanced past at quarantine time (see RetryQuarantined).
-func (b *Broker) applyPayloadCache(cs *crdt.Changeset, payload []byte, force bool) error {
+func (b *Broker) applyPayloadCache(cs *crdt.Changeset, payload []byte, force bool) (err error) {
 	b.applyMu.Lock()
-	defer b.applyMu.Unlock()
+	defer func() {
+		if err != nil {
+			err = b.repairApplyFailure(err)
+		}
+		b.applyMu.Unlock()
+	}()
 	cache := b.cfg.Cache
 	// Producer-side commits don't flow through the apply path; if one
 	// somehow does (loopback transport bug) it would otherwise advance
@@ -659,35 +664,41 @@ type cellClockUpdate struct {
 	stamp crdt.Stamp
 }
 
-// beginApply / commitApply / rollbackApply run the transaction-control
-// statements against AppApply via cached *Stmt, lazy-built on first use.
+// Transaction control is deliberately uncached. sqlite3_reset returns the
+// previous sqlite3_step result, so caching these statements can turn an earlier
+// auto-rollback error into a later skipped ROLLBACK.
 func (b *Broker) beginApply() error {
-	return b.runTxStmt(&b.txBegin, "BEGIN IMMEDIATE")
+	return b.cfg.AppApply.Exec("BEGIN IMMEDIATE")
 }
 func (b *Broker) commitApply() error {
-	return b.runTxStmt(&b.txCommit, "COMMIT")
+	return b.cfg.AppApply.Exec("COMMIT")
 }
 func (b *Broker) rollbackApply() error {
-	return b.runTxStmt(&b.txRollback, "ROLLBACK")
+	if b.cfg.AppApply.InAutocommit() {
+		return nil
+	}
+	return b.cfg.AppApply.Exec("ROLLBACK")
 }
 
-func (b *Broker) runTxStmt(slot **sqlitebridge.Stmt, sql string) error {
-	b.stmtsMu.Lock()
-	if *slot == nil {
-		stmt, _, err := b.cfg.AppApply.Prepare(sql)
-		if err != nil {
-			b.stmtsMu.Unlock()
-			return err
+// repairApplyFailure clears any cached statement that retained a failed
+// sqlite3_step result and restores the connection's autocommit invariant.
+// Caller holds applyMu.
+func (b *Broker) repairApplyFailure(applyErr error) error {
+	var sqliteErr sqlitebridge.Error
+	if b.cfg.AppApply.InAutocommit() && !errors.As(applyErr, &sqliteErr) {
+		return applyErr
+	}
+	b.finalizeCachedStmts()
+	b.selfHeals.Add(1)
+	if !b.cfg.AppApply.InAutocommit() {
+		if err := b.cfg.AppApply.Exec("ROLLBACK"); err != nil {
+			applyErr = errors.Join(applyErr, fmt.Errorf("broker: rollback failed apply: %w", err))
 		}
-		*slot = stmt
 	}
-	stmt := *slot
-	b.stmtsMu.Unlock()
-	if err := stmt.Reset(); err != nil {
-		return err
+	if !b.cfg.AppApply.InAutocommit() {
+		applyErr = errors.Join(applyErr, errors.New("broker: apply connection left outside autocommit"))
 	}
-	_, err := stmt.Step()
-	return err
+	return applyErr
 }
 
 func (b *Broker) applyInsert(tab *catalog.Table, r crdt.Insert) error {

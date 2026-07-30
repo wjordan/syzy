@@ -57,6 +57,11 @@ One local SQLite transaction follows this ordering:
 Syzy pipelines these phases, but the ordering obligations are invariant. See
 [PROTOCOL.md](PROTOCOL.md) for wire and durability requirements.
 
+Inbound apply owns its SQLite transaction state: every success or failure must
+leave the apply connection in autocommit before another payload starts.
+Resource failures such as `SQLITE_FULL` are retained and retried after the
+connection is repaired; they never advance the frontier or drop the payload.
+
 ## Replica state
 
 Every replica tracks:

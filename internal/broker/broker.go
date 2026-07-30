@@ -138,8 +138,8 @@ type Broker struct {
 
 	// lockedStreak is the current consecutive "database is locked"
 	// retry count on the payload the apply-retry loop is holding; 0 when
-	// inbound apply is healthy. selfHeals counts selfHealApplyConn
-	// invocations. Both feed InboundHealth.
+	// inbound apply is healthy. selfHeals counts immediate and retry-threshold
+	// AppApply connection-state repairs. Both feed InboundHealth.
 	lockedStreak atomic.Int64
 	selfHeals    atomic.Uint64
 
@@ -172,13 +172,6 @@ type Broker struct {
 	// exist in app.db (counter applied-marker, sqlite/docs/DDL.md#counter-columns).
 	// Guarded by applyMu like every other AppApply access.
 	markerTableReady bool
-
-	// txStmts holds prepared BEGIN IMMEDIATE / COMMIT / ROLLBACK against
-	// AppApply, avoiding sqlite3_exec's reparse on every inbound apply.
-	// Lazy-built on first applyRecords call; finalized in Close.
-	txBegin    *sqlitebridge.Stmt
-	txCommit   *sqlitebridge.Stmt
-	txRollback *sqlitebridge.Stmt
 
 	// applyMu serializes every write through AppApply. The subscribe
 	// loop, the gap-fill fetcher loop, and the schema-catchup loop all
@@ -561,8 +554,8 @@ func (b *Broker) Close() error {
 }
 
 // finalizeCachedStmts finalizes every cached prepared statement (per-table
-// apply DML, unique-arbitration reads/writes, txn control) and empties the
-// caches so the next use re-prepares. Finalizing also implicitly resets a
+// apply DML and unique-arbitration reads/writes) and empties the caches so the
+// next use re-prepares. Finalizing also implicitly resets a
 // statement abandoned at SQLITE_ROW, releasing the read snapshot it pinned
 // on AppApply. Shared by Close and selfHealApplyConn.
 func (b *Broker) finalizeCachedStmts() {
@@ -587,12 +580,6 @@ func (b *Broker) finalizeCachedStmts() {
 	for k, stmt := range b.uniqReadStmts {
 		_ = stmt.Finalize()
 		delete(b.uniqReadStmts, k)
-	}
-	for _, s := range []**sqlitebridge.Stmt{&b.txBegin, &b.txCommit, &b.txRollback} {
-		if *s != nil {
-			_ = (*s).Finalize()
-			*s = nil
-		}
 	}
 }
 
@@ -772,6 +759,9 @@ func (b *Broker) applyPayloadWithRetry(ctx context.Context, payload []byte) erro
 
 func retryableApplyError(err error) bool {
 	if errors.Is(err, errSchemaBehind) {
+		return true
+	}
+	if sqlitebridge.IsCode(err, sqlitebridge.ResultFull) {
 		return true
 	}
 	s := err.Error()
