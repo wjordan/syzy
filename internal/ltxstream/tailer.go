@@ -290,8 +290,8 @@ func (t *Tailer) syncLocked(ctx context.Context) error {
 	// commit boundary and EOF belong to an in-progress tx and are
 	// truncated off `staged` before encoding.
 	type pending struct {
-		pgno   uint32
-		offset int64
+		pgno uint32
+		data []byte
 	}
 	var staged []pending
 
@@ -321,7 +321,11 @@ func (t *Tailer) syncLocked(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("read frame: %w", err)
 		}
-		staged = append(staged, pending{pgno: pgno, offset: r.Offset()})
+		// Keep the bytes from the checksum-verified read. Rereading this WAL
+		// offset after the scan is unsafe: another SQLite connection can
+		// recycle the WAL between scan and encode, making the same offset
+		// refer to a different generation.
+		staged = append(staged, pending{pgno: pgno, data: append([]byte(nil), pageBuf...)})
 		if commit != 0 {
 			commits++
 			committedFrames = len(staged)
@@ -335,13 +339,13 @@ func (t *Tailer) syncLocked(ctx context.Context) error {
 		return nil
 	}
 
-	// Build deduped page map across every committed frame in the
-	// batch; latest staged offset wins per pgno. Pages above the
+	// Build a deduped page map across every committed frame in the
+	// batch; latest verified bytes win per pgno. Pages above the
 	// final commit's db_size are dropped (DB shrunk and they're no
 	// longer addressable).
-	pageMap := make(map[uint32]int64, committedFrames)
+	pageMap := make(map[uint32][]byte, committedFrames)
 	for _, e := range staged[:committedFrames] {
-		pageMap[e.pgno] = e.offset
+		pageMap[e.pgno] = e.data
 	}
 	for p := range pageMap {
 		if p > lastCommit {
@@ -379,7 +383,7 @@ func (t *Tailer) syncLocked(ctx context.Context) error {
 		MaxTXID:   ltx.TXID(lastTXID),
 		Timestamp: time.Now().UnixMilli(),
 	}
-	if err := EncodeIncremental(ctx, &body, walFile, pageMap, pageSize, lastCommit, firstTXID, lastTXID); err != nil {
+	if err := EncodeIncremental(ctx, &body, pageMap, pageSize, lastCommit, firstTXID, lastTXID); err != nil {
 		return fmt.Errorf("encode ltx [%d..%d]: %w", firstTXID, lastTXID, err)
 	}
 	if err := t.cfg.OnLTX(ctx, hdr, body.Bytes()); err != nil {

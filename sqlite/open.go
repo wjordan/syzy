@@ -306,7 +306,7 @@ func (o *opener) openConns() error {
 		}
 	}
 
-	o.appApply, err = openAuxConn(o.cfg.Path, "apply", o.cfg.DisableMmap)
+	o.appApply, err = openAuxConn(o.cfg.Path, "apply", o.cfg.DisableMmap, o.cfg.ObjectBackend != nil)
 	if err != nil {
 		return err
 	}
@@ -321,7 +321,7 @@ func (o *opener) openConns() error {
 	// appHelper is only needed for DDL admission's cascade-trigger
 	// synthesis; skip the fd + cgo handle when DDL replication is off.
 	if o.cfg.SchemaLog != nil {
-		o.appHelper, err = openAuxConn(o.cfg.Path, "helper", o.cfg.DisableMmap)
+		o.appHelper, err = openAuxConn(o.cfg.Path, "helper", o.cfg.DisableMmap, o.cfg.ObjectBackend != nil)
 		if err != nil {
 			return err
 		}
@@ -331,7 +331,7 @@ func (o *opener) openConns() error {
 	// appBlobRead lets the producer's drainer read post-commit NEW blob
 	// bytes via sqlite3_blob_open so sqlite3_blob_write() captures
 	// materialize as compact blob_patch records (BLOB_PATCH.md).
-	o.appBlobRead, err = openAuxConn(o.cfg.Path, "blobread", o.cfg.DisableMmap)
+	o.appBlobRead, err = openAuxConn(o.cfg.Path, "blobread", o.cfg.DisableMmap, o.cfg.ObjectBackend != nil)
 	if err != nil {
 		return err
 	}
@@ -405,7 +405,7 @@ func (o *opener) loadState(ctx context.Context) error {
 // UNIQUE rejected at DDL.
 func (o *opener) initUnique() error {
 	if o.cfg.ObjectBackend != nil {
-		conn, err := openAuxConn(o.cfg.Path, "unique-read", o.cfg.DisableMmap)
+		conn, err := openAuxConn(o.cfg.Path, "unique-read", o.cfg.DisableMmap, o.cfg.ObjectBackend != nil)
 		if err != nil {
 			return err
 		}
@@ -470,7 +470,7 @@ func (o *opener) initUnique() error {
 		// MULTI-node cluster without a bucket has no shared registry, so
 		// leave uniqueReg nil — NOT NULL UNIQUE is then rejected at DDL
 		// rather than silently un-coordinated.
-		conn, err := openAuxConn(o.cfg.Path, "unique-read", o.cfg.DisableMmap)
+		conn, err := openAuxConn(o.cfg.Path, "unique-read", o.cfg.DisableMmap, o.cfg.ObjectBackend != nil)
 		if err != nil {
 			return err
 		}
@@ -846,7 +846,7 @@ func (o *opener) healCatalog(ctx context.Context) {
 	// degradation until the next open retries.
 	if !reconciled {
 		o.log.Warn("syzy: catalog repair skipped; schema reconcile did not complete", "path", o.cfg.Path)
-	} else if repairConn, err := openAuxConn(o.cfg.Path, "catalog-repair", o.cfg.DisableMmap); err != nil {
+	} else if repairConn, err := openAuxConn(o.cfg.Path, "catalog-repair", o.cfg.DisableMmap, o.cfg.ObjectBackend != nil); err != nil {
 		o.log.Error("syzy: catalog repair skipped; open conn failed", "err", err, "path", o.cfg.Path)
 	} else {
 		normalized := true
@@ -986,7 +986,7 @@ func connPragmas(noMmap bool) string {
 // and applies the standard PRAGMAs used by every aux conn (apply,
 // helper). The writer connection adds journal_mode=WAL on top and is
 // opened separately. role appears in the error message.
-func openAuxConn(path, role string, noMmap bool) (*sqlitebridge.Conn, error) {
+func openAuxConn(path, role string, noMmap, disableAutoCheckpoint bool) (*sqlitebridge.Conn, error) {
 	c, err := sqlitebridge.Open(path, 0)
 	if err != nil {
 		return nil, fmt.Errorf("syzy: open %s conn: %w", role, err)
@@ -994,6 +994,16 @@ func openAuxConn(path, role string, noMmap bool) (*sqlitebridge.Conn, error) {
 	if err := c.Exec(connPragmas(noMmap)); err != nil {
 		_ = c.Close()
 		return nil, fmt.Errorf("syzy: configure %s conn: %w", role, err)
+	}
+	// wal_autocheckpoint is connection-local. Disabling it only on appWrite
+	// leaves the inbound apply/helper connections free to recycle the WAL
+	// outside the physical publisher's tailer lock. Every connection sharing
+	// a publisher-owned WAL must defer recycling to the coordinated checkpoint.
+	if disableAutoCheckpoint {
+		if err := c.Exec(`PRAGMA wal_autocheckpoint = 0`); err != nil {
+			_ = c.Close()
+			return nil, fmt.Errorf("syzy: disable %s autocheckpoint: %w", role, err)
+		}
 	}
 	return c, nil
 }

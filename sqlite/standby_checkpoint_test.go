@@ -63,3 +63,26 @@ func TestStandbyWALCheckpointTruncates(t *testing.T) {
 		t.Fatalf("WAL did not shrink: before=%d after=%d", before, after)
 	}
 }
+
+func TestOpenAuxConnDisablesAutoCheckpointForPublisher(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.db")
+	conn, err := openAuxConn(path, "test", false, true)
+	if err != nil {
+		t.Fatalf("openAuxConn: %v", err)
+	}
+	defer conn.Close()
+
+	stmt, _, err := conn.Prepare(`PRAGMA wal_autocheckpoint`)
+	if err != nil {
+		t.Fatalf("prepare wal_autocheckpoint: %v", err)
+	}
+	defer stmt.Finalize()
+	if ok, err := stmt.Step(); err != nil {
+		t.Fatalf("step wal_autocheckpoint: %v", err)
+	} else if !ok {
+		t.Fatal("wal_autocheckpoint returned no row")
+	}
+	if got := stmt.ColumnInt64(0); got != 0 {
+		t.Fatalf("wal_autocheckpoint=%d, want 0", got)
+	}
+}

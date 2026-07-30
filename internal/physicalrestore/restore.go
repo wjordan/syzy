@@ -76,20 +76,21 @@ func MaterializeStream(ctx context.Context, be objectstore.Bucket, prefix string
 
 // chainTip returns max(L0 tip, L1 tip, baselineTXID) for one stream.
 func chainTip(ctx context.Context, be objectstore.Bucket, prefix string, baselineTXID uint64) (uint64, error) {
-	l0, err := objstore.MaxLTXTXID(ctx, be, prefix, objstore.L0Level)
+	l0Files, err := objstore.ListLTXAfter(ctx, be, prefix, objstore.L0Level, baselineTXID)
 	if err != nil {
 		return 0, fmt.Errorf("max L0 TXID: %w", err)
 	}
-	l1, err := objstore.MaxLTXTXID(ctx, be, prefix, objstore.L1Level)
+	l1Files, err := objstore.ListLTXAfter(ctx, be, prefix, objstore.L1Level, baselineTXID)
 	if err != nil {
 		return 0, fmt.Errorf("max L1 TXID: %w", err)
 	}
-	tip := l0
-	if l1 > tip {
-		tip = l1
-	}
-	if tip < baselineTXID {
-		tip = baselineTXID
+	tip := baselineTXID
+	for _, files := range [][]objstore.LTXFile{l0Files, l1Files} {
+		for _, f := range files {
+			if f.MaxTXID > tip {
+				tip = f.MaxTXID
+			}
+		}
 	}
 	return tip, nil
 }
@@ -248,11 +249,11 @@ func verifyMaterializedSize(path string, geo ltxGeometry) error {
 // them in ascending MinTXID order to dstPath. Returns the last applied
 // frame's geometry (zero when the chain is empty).
 func applyLTXChain(ctx context.Context, be objectstore.Bucket, streamPrefix string, after, through uint64, dstPath string) (int, int64, ltxGeometry, error) {
-	l0, err := objstore.ListLTX(ctx, be, streamPrefix, objstore.L0Level)
+	l0, err := objstore.ListLTXAfter(ctx, be, streamPrefix, objstore.L0Level, after)
 	if err != nil {
 		return 0, 0, ltxGeometry{}, err
 	}
-	l1, err := objstore.ListLTX(ctx, be, streamPrefix, objstore.L1Level)
+	l1, err := objstore.ListLTXAfter(ctx, be, streamPrefix, objstore.L1Level, after)
 	if err != nil {
 		return 0, 0, ltxGeometry{}, err
 	}

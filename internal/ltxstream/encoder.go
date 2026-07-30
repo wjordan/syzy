@@ -19,14 +19,14 @@ import (
 // integrity by SQLite's WAL checksum chain (validated by WALReader).
 //
 // pageSize and commit are the WAL's reported page size and post-commit
-// DB size in pages. walFile must be open (read-only); pageMap[pgno]
-// points at the start of the WAL frame (frame-header included; the
-// page payload starts at offset+WALFrameHeaderSize).
+// DB size in pages. pageMap contains page bytes copied while their WAL
+// frames were checksum-verified. Encoding must not reread live WAL
+// offsets: an uncoordinated checkpoint can recycle those offsets between
+// the scan and encode phases.
 func EncodeIncremental(
 	ctx context.Context,
 	w io.Writer,
-	walFile *os.File,
-	pageMap map[uint32]int64,
+	pageMap map[uint32][]byte,
 	pageSize uint32,
 	commit uint32,
 	minTXID, maxTXID uint64,
@@ -58,20 +58,17 @@ func EncodeIncremental(
 	}
 	slices.Sort(pgnos)
 
-	page := make([]byte, pageSize)
 	for _, pgno := range pgnos {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
-		off := pageMap[pgno]
-		if n, err := walFile.ReadAt(page, off+WALFrameHeaderSize); err != nil {
-			return fmt.Errorf("read page %d @ %d: %w", pgno, off, err)
-		} else if n != len(page) {
-			return fmt.Errorf("short read page %d @ %d", pgno, off)
+		data := pageMap[pgno]
+		if len(data) != int(pageSize) {
+			return fmt.Errorf("page %d has %d bytes, want %d", pgno, len(data), pageSize)
 		}
-		if err := enc.EncodePage(ltx.PageHeader{Pgno: pgno}, page); err != nil {
+		if err := enc.EncodePage(ltx.PageHeader{Pgno: pgno}, data); err != nil {
 			return fmt.Errorf("encode page %d: %w", pgno, err)
 		}
 	}

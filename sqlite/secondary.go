@@ -82,7 +82,7 @@ func (n *Node) scanSecondaries(parent context.Context, appPath string, log *slog
 		// One read-only conn per secondary so the drainer can
 		// materialize blob_patch records (BLOB_PATCH.md). Conn isn't
 		// safe for concurrent use across drainers, so don't share.
-		blobRead, err := openAuxConn(appPath, "blobread-"+layout.OriginHex(o), n.disableMmap)
+		blobRead, err := openAuxConn(appPath, "blobread-"+layout.OriginHex(o), n.disableMmap, n.objectBackend != nil)
 		if err != nil {
 			log.Warn("open blob-read conn for secondary", "origin", layout.OriginHex(o), "err", err)
 			continue
