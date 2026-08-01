@@ -82,12 +82,12 @@ Two modes, picked automatically by nullability:
   construction*. The value is reserved through a single global
   round-trip before the local commit, so the second writer to claim it
   never commits: the commit is vetoed and fails with
-  `SQLITE_CONSTRAINT_COMMITHOOK` (check with
-  `sqlite.IsCoordinatedCommitRejected`). Treat it as
-  retryable-off-the-writer: re-run the transaction — a genuine conflict
-  fails identically each time, while a brief unavailability during a
-  leader handover (which surfaces as the same commit rejection) heals
-  within a retry or two. This is the right default for user-supplied
+  `SQLITE_CONSTRAINT_COMMITHOOK`. Check
+  `sqlite.IsCoordinatedConflict` for a final duplicate and
+  `sqlite.IsCoordinatedUnavailable` for an operation that may be retried
+  off the writer after a brief leader handover or partition. Both retain
+  the SQLite commit-hook code, but Syzy preserves their distinct causes
+  in the Go error chain. This is the right default for user-supplied
   identifiers like an email address. The cost: one round-trip per
   write touching the column.
   A coordinated key may also be **partial** — `CREATE UNIQUE INDEX …

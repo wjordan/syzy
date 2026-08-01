@@ -38,8 +38,8 @@ const DefaultJournalSegmentSize = uint32(1 << 20)
 // full duration. So the in-lock budget only absorbs brief blips (a
 // graceful leaseholder handoff, a re-dial); anything longer — a
 // crash-failover drain, a partition — fails the commit with
-// SQLITE_CONSTRAINT_COMMITHOOK and the embedder retries the transaction
-// OFF the writer (the retryInsert pattern in coordinated_unique_test.go).
+// SQLITE_CONSTRAINT_COMMITHOOK wrapping unique.ErrUnavailable, and the
+// embedder retries that transaction off the writer.
 const defaultReserveRetryBudget = 2 * time.Second
 
 // hlcStamper is the only nodestate.Cache surface walHook needs.
@@ -223,8 +223,8 @@ type Config struct {
 	// commit. The retry blocks the single writer AND the broker's inbound
 	// apply (both need the app.db write lock), so keep it short: it should
 	// absorb a graceful handover blip, not a failover drain. Past the
-	// budget the commit fails (SQLITE_CONSTRAINT_COMMITHOOK) and the
-	// caller retries the transaction off the writer.
+	// budget the commit fails (SQLITE_CONSTRAINT_COMMITHOOK wrapping
+	// unique.ErrUnavailable) and the caller retries off the writer.
 	// 0 ⇒ defaultReserveRetryBudget.
 	ReserveRetryBudget time.Duration
 
@@ -526,6 +526,9 @@ func (p *Producer) schemaLog() schemalog.Log {
 // unreachable) — the COMMIT then fails and the transaction rolls back
 // with nothing replicated.
 func (p *Producer) commitHook() int {
+	// A wrapped rejection is consumed when SQLite returns from this commit.
+	// Clear first so non-coordination vetoes never inherit a stale cause.
+	p.app.SetCommitHookCause(nil)
 	// The coordinated gate does NOT depend on DDL admission: it is the
 	// only enforcement of a coordinated key, and a producer configured
 	// without a SchemaLog (p.ddl nil) still writes rows. Returning early
@@ -628,6 +631,9 @@ func (p *Producer) reserveCoordinated() int {
 		ok, conflict, retries, err := reserveWithRetry(p.bgCtx, p.reg, reserves, p.reserveRetryBudget, p.reserveBackoffSleep)
 		if err != nil {
 			syzylog.Printf("producer: coordinated reserve unavailable after %d retries: %v", retries, err)
+			if errors.Is(err, unique.ErrUnavailable) {
+				p.app.SetCommitHookCause(err)
+			}
 			return 1
 		}
 		if retries > 0 {
@@ -636,6 +642,7 @@ func (p *Producer) reserveCoordinated() int {
 		if !ok {
 			syzylog.Printf("producer: coordinated reserve conflict on table=%x key=%x",
 				conflict.Table, conflict.Key)
+			p.app.SetCommitHookCause(unique.ErrConflict)
 			return 1
 		}
 	}

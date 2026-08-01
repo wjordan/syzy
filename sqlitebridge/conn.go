@@ -169,7 +169,7 @@ func (c *Conn) Exec(sql string) error {
 			e.Msg = C.GoString(errmsg) // sx_exec's own message is per-statement; prefer it
 			C.sx_free(unsafe.Pointer(errmsg))
 		}
-		return e
+		return c.refineCommitHookError(e)
 	}
 	return nil
 }

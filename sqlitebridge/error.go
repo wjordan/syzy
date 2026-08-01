@@ -35,11 +35,23 @@ func IsCode(err error, code int) bool {
 	return errors.As(err, &e) && (e.Code == code || e.Extended == code)
 }
 
+func (c *Conn) refineCommitHookError(err error) error {
+	if c.state == nil || c.state.commitCause == nil {
+		return err
+	}
+	cause := c.state.commitCause
+	c.state.commitCause = nil
+	if !IsCode(err, ResultConstraintCommitHook) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", cause, err)
+}
+
 // ResultConstraintCommitHook is the extended code for a commit rejected by
 // the registered commit hook — for syzy, a coordinated-UNIQUE reservation
-// that conflicted or whose backend was unavailable. Callers should treat it
-// as retryable-off-the-writer: re-running the transaction re-attempts the
-// reservation (a genuine conflict fails again immediately).
+// that conflicted or whose backend was unavailable. Higher layers can attach
+// a distinct Go cause with SetCommitHookCause while retaining this SQLite
+// result code.
 const ResultConstraintCommitHook = int(C.SQLITE_CONSTRAINT_COMMITHOOK)
 
 const (

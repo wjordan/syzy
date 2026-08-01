@@ -58,8 +58,7 @@ func TestCoordinatedUnique_PartialSoftDelete(t *testing.T) {
 
 	// Soft-delete row 1: the predicate flips false, releasing 'a@x'. A new
 	// live row may then claim it — this only succeeds if the reservation was
-	// actually released (the physical index alone can't prove the point,
-	// but a stale reservation would make this INSERT fail).
+	// actually released; a stale reservation would make this INSERT fail.
 	mustExec(t, node, `UPDATE users SET deleted_at=100 WHERE id=1`)
 	mustExec(t, node, `INSERT INTO users(id,email,deleted_at) VALUES (3,'a@x',NULL)`)
 

@@ -85,6 +85,7 @@ type connState struct {
 	handle      cgo.Handle
 	cstate      *C.syzy_conn_state
 	commit      CommitHook
+	commitCause error
 	rollback    RollbackHook
 	preupdate   PreupdateHook
 	wal         WALHook
@@ -126,6 +127,14 @@ func (c *Conn) clearState() {
 func (c *Conn) SetCommitHook(fn CommitHook) {
 	c.ensureState().commit = fn
 	c.reinstallCommit()
+}
+
+// SetCommitHookCause attaches a Go cause to the next
+// SQLITE_CONSTRAINT_COMMITHOOK returned by this connection. A commit hook
+// that returns nonzero may call this first to preserve a distinction SQLite's
+// integer hook result cannot encode. Passing nil clears a pending cause.
+func (c *Conn) SetCommitHookCause(err error) {
+	c.ensureState().commitCause = err
 }
 
 // SetRollbackHook registers fn. Pass nil to clear.

@@ -2,12 +2,23 @@ package producer
 
 import (
 	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/wjordan/syzy/crdt"
 	"github.com/wjordan/syzy/internal/sqlitecatalog"
+	"github.com/wjordan/syzy/sqlitebridge"
 	"github.com/wjordan/syzy/unique"
 )
+
+type unavailableRegistry struct{}
+
+func (unavailableRegistry) Reserve(context.Context, []unique.Claim) (bool, *unique.Claim, error) {
+	return false, nil, unique.ErrUnavailable
+}
+
+func (unavailableRegistry) Release(context.Context, []unique.Claim) error { return nil }
 
 // encodeCoordValue builds the canonical reservation value for a single
 // text-column coordinated key, the same bytes the producer's commit-time
@@ -67,10 +78,17 @@ func TestProducer_ReserveRejectsRemoteConflict(t *testing.T) {
 		t.Fatalf("seed reserve: ok=%v err=%v", ok, err)
 	}
 
-	// Local SQLite has no such row, so its own UNIQUE index permits the
-	// insert; the reserve at commit must catch the cross-node conflict.
-	if err := f.app.Exec(`INSERT INTO u (id, email) VALUES (x'01', 'taken@x.com')`); err == nil {
+	// Local SQLite has no such row; the reserve at commit must still catch
+	// the remotely-owned value.
+	err = f.app.Exec(`INSERT INTO u (id, email) VALUES (x'01', 'taken@x.com')`)
+	if err == nil {
 		t.Fatal("INSERT of remotely-owned value accepted; want commit rejection")
+	}
+	if !errors.Is(err, unique.ErrConflict) || errors.Is(err, unique.ErrUnavailable) {
+		t.Fatalf("remote conflict classification = %v", err)
+	}
+	if !sqlitebridge.IsCode(err, sqlitebridge.ResultConstraintCommitHook) {
+		t.Fatalf("remote conflict lost commit-hook code: %v", err)
 	}
 	// A free value still commits.
 	if err := f.app.Exec(`INSERT INTO u (id, email) VALUES (x'02', 'free@x.com')`); err != nil {
@@ -80,6 +98,22 @@ func TestProducer_ReserveRejectsRemoteConflict(t *testing.T) {
 	freeVal := encodeCoordValue(t, tab, uk, "email", "free@x.com")
 	if o, held := reg.Owner(unique.Claim{Table: [16]byte(tab.ID), Key: [16]byte(uk.KeyID), Value: freeVal}); !held || len(o) == 0 {
 		t.Fatalf("free value not reserved after commit: held=%v", held)
+	}
+}
+
+func TestProducer_ReserveUnavailableIsDistinctFromConflict(t *testing.T) {
+	f := newDDLFixtureCfg(t, Config{
+		UniqueRegistry:     unavailableRegistry{},
+		ReserveRetryBudget: time.Nanosecond,
+	})
+	coordTable(t, f)
+
+	err := f.app.Exec(`INSERT INTO u (id, email) VALUES (x'01', 'free@x.com')`)
+	if !errors.Is(err, unique.ErrUnavailable) || errors.Is(err, unique.ErrConflict) {
+		t.Fatalf("unavailable classification = %v", err)
+	}
+	if !sqlitebridge.IsCode(err, sqlitebridge.ResultConstraintCommitHook) {
+		t.Fatalf("unavailable lost commit-hook code: %v", err)
 	}
 }
 
