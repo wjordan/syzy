@@ -10,9 +10,9 @@ import (
 )
 
 // TestClusterLWWLastWriterWins drives a clean LWW round: node 0 writes
-// PK=1 first, then after a pause node 1 writes PK=1. Both nodes converge
-// on node 1's value (strictly later wall-time stamp, so HLC arbitration
-// picks it unambiguously).
+// PK=1 first, waits until that write is idle everywhere, then node 1 writes
+// PK=1. Both nodes converge on node 1's value because its HLC has observed the
+// first write and therefore advances past it.
 //
 // The aggressive "both nodes hammer PK=1 simultaneously" case is the §9
 // stamp-inflation corner — it converges with winner-repair when a later
@@ -31,19 +31,19 @@ func TestClusterLWWLastWriterWins(t *testing.T) {
 	})
 	c.Start(ctx)
 
-	// Node 0 writes first; wait for node 1 to see it; then node 1 writes,
-	// strictly later in wall time.
+	// WaitIdle, rather than WaitConverge, also waits for the just-committed write
+	// to appear in the producer head; WaitConverge alone can return before the
+	// capture goroutine has decoded it under the race detector.
 	c.Nodes[0].AppExec(t, `INSERT INTO public.kv VALUES (1,'from-n0')
 		ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val`)
-	if err := c.WaitConverge(15 * time.Second); err != nil {
-		t.Fatalf("WaitConverge after n0 write: %v", err)
+	if err := c.WaitIdle(100*time.Millisecond, 15*time.Second); err != nil {
+		t.Fatalf("WaitIdle after n0 write: %v", err)
 	}
 
-	time.Sleep(50 * time.Millisecond) // ensure strictly-later wall clock
 	c.Nodes[1].AppExec(t, `INSERT INTO public.kv VALUES (1,'from-n1')
 		ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val`)
-	if err := c.WaitConverge(15 * time.Second); err != nil {
-		t.Fatalf("WaitConverge after n1 write: %v", err)
+	if err := c.WaitIdle(100*time.Millisecond, 15*time.Second); err != nil {
+		t.Fatalf("WaitIdle after n1 write: %v", err)
 	}
 
 	want := map[int64]string{1: "from-n1"}

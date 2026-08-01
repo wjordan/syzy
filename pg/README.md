@@ -29,11 +29,15 @@ are separate meshes. There is no mixed-engine replication.
   a sane floor.
 - A **superuser-adjacent role**: the sidecar installs event triggers, sets the
   replica role, and creates a replication slot.
+- The sidecar creates its publication automatically. If that name already
+  exists, it must cover all tables and publish inserts, updates, and deletes.
 - **Object storage** (`-bucket`). Formally optional, effectively required: it
   is how an offline peer catches up and how local journals stay bounded.
   Without it they grow without limit.
 
 One sidecar per database, one database per node.
+After first start, `-data-dir` is bound to its cluster ID and origin; startup
+refuses either flag if it no longer matches the stored identity.
 
 ## Try it
 

@@ -24,10 +24,8 @@ import (
 // Keys, so the builder folds it (skips the intent) rather than emitting a stray
 // CreateIndex.
 //
-// It mutates cat, so it runs only on the single orchestrator/capture goroutine
-// (the increment-1 single-writer model). Increment C covers CREATE TABLE and
-// DROP TABLE; other command tags return a clean admission error — the supported
-// surface widens in later increments.
+// It mutates cat, so it runs only on the single orchestrator/capture goroutine.
+// Unsupported command tags return a clean admission error.
 func buildCatalogOps(ctx context.Context, conn *pgx.Conn, cat *catalog, intents []ddlIntent) ([]crdt.CatalogOp, error) {
 	var ops []crdt.CatalogOp
 	for _, in := range intents {
@@ -98,8 +96,8 @@ func buildCatalogOps(ctx context.Context, conn *pgx.Conn, cat *catalog, intents 
 			// A serial/bigserial column's owned sequence is created (and OWNED BY'd)
 			// as its own ddl_command_end event; it is folded into the table's
 			// OpCreateTable — the column ships as a serial pseudo-type a follower
-			// re-creates locally. A standalone user CREATE SEQUENCE is a later
-			// increment.
+			// re-creates locally. A standalone sequence should not enter replicated
+			// DDL, so reject defensively if it does.
 			owned, err := isOwnedSequence(ctx, conn, in.objid)
 			if err != nil {
 				return nil, err
@@ -107,7 +105,7 @@ func buildCatalogOps(ctx context.Context, conn *pgx.Conn, cat *catalog, intents 
 			if owned {
 				continue
 			}
-			return nil, unsupportedDDLf("postgres: DDL %q not yet supported (increment C)", in.commandTag)
+			return nil, unsupportedDDLf("postgres: DDL %q is not supported", in.commandTag)
 		case in.commandTag == "CREATE TRIGGER", in.objectType == "trigger":
 			// User triggers are intentionally not replicated. A trigger's EFFECTS
 			// already converge — the originator's trigger fires, its row changes are
@@ -125,7 +123,7 @@ func buildCatalogOps(ctx context.Context, conn *pgx.Conn, cat *catalog, intents 
 			// node. Reject rather than risk a default that evaluates differently.
 			return nil, unsupportedDDLf("postgres: %q is not replicated (function determinism/side-effects not yet modeled)", in.commandTag)
 		default:
-			return nil, unsupportedDDLf("postgres: DDL %q not yet supported (increment C)", in.commandTag)
+			return nil, unsupportedDDLf("postgres: DDL %q is not supported", in.commandTag)
 		}
 	}
 	return ops, nil
@@ -140,7 +138,7 @@ func buildCatalogOps(ctx context.Context, conn *pgx.Conn, cat *catalog, intents 
 // DDL txn drops or alters the table within the same capture-lag window, the
 // introspection here sees the post-mutation state (or no rows at all). The live
 // path keeps capture within ~one txn of head, and the DDL lease + ddl_command_start
-// gate (increment E) make this exact — a node's own pending DDL is appended
+// gate make this exact — a node's own pending DDL is appended
 // before its next DDL txn proceeds. DropTable does not read the catalog (it
 // resolves the prior mapping), so only the create path is timing-sensitive.
 func buildCreateTableOp(ctx context.Context, conn *pgx.Conn, cat *catalog, in ddlIntent) ([]crdt.CatalogOp, error) {
@@ -224,7 +222,7 @@ func buildCreateTableOp(ctx context.Context, conn *pgx.Conn, cat *catalog, in dd
 // rejected here with a clean error rather than silently dropped (which would
 // diverge). Because capture is post-commit the ALTER has already committed
 // locally, so this halts capture (schema-unhealthy) — the proper admission-time
-// rejection (the ddl_command_start gate RAISEs before commit) is increment G.
+// rejection raises from an event trigger before commit.
 //
 // Beyond columns + relname this also diffs the table's non-PK unique keys (§5,
 // diffUniqueKeys) so ADD/DROP CONSTRAINT UNIQUE replicates as OpAddUniqueKey /

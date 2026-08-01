@@ -10,7 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// Advisory-lock keys for the DDL gate (§6 increment E). They are per-database
+// Advisory-lock keys for the DDL gate (§6). They are per-database
 // (each node's Postgres is independent), so fixed constants are safe; both are
 // < 2^31 so a 1-arg bigint advisory lock records them in pg_locks as
 // classid=0, objid=key, objsubid=1 (the bigint splits key>>32 into classid,
@@ -67,7 +67,7 @@ func installDDLGate(ctx context.Context, conn *pgx.Conn) error {
 	return execErr
 }
 
-// gateManager is the sidecar half of the DDL lease (§6 increment E). On a
+// gateManager is the sidecar half of the DDL lease (§6). On a
 // dedicated connection it holds GATE_KEY ("gate closed"); when a local DDL
 // backend blocks on GATE_KEY (the ddl_command_start trigger), the watcher
 // acquires the cluster lease, has the orchestrator apply pending peer DDL, then

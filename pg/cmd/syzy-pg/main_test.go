@@ -13,10 +13,76 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/wjordan/syzy/crdt"
+	"github.com/wjordan/syzy/internal/metadata"
 	"github.com/wjordan/syzy/pg/internal/pgtest"
 )
 
 const testClusterID = "ccccccccccccccccccccccccccccccdd"
+
+func TestParseFlagsRequiresCompleteMTLSFiles(t *testing.T) {
+	base := []string{
+		"-conn", "postgres://localhost/app",
+		"-origin", "1",
+		"-cluster-id", testClusterID,
+		"-data-dir", t.TempDir(),
+		"-tables", "public.kv",
+	}
+	cases := []struct {
+		name  string
+		flags []string
+		ok    bool
+	}{
+		{name: "none", ok: true},
+		{name: "cert and key", flags: []string{"-tls-cert", "cert.pem", "-tls-key", "key.pem"}},
+		{name: "CA only", flags: []string{"-tls-ca", "ca.pem"}},
+		{name: "complete", flags: []string{"-tls-cert", "cert.pem", "-tls-key", "key.pem", "-tls-ca", "ca.pem"}, ok: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseFlags(append(base, tc.flags...))
+			if tc.ok && err != nil {
+				t.Fatalf("parseFlags: %v", err)
+			}
+			if !tc.ok && err == nil {
+				t.Fatal("parseFlags accepted an incomplete mTLS configuration")
+			}
+		})
+	}
+}
+
+func TestBuildTLSRejectsIncompleteMTLSFiles(t *testing.T) {
+	if _, err := buildTLS(&sidecarConfig{tlsCert: "cert.pem", tlsKey: "key.pem"}); err == nil {
+		t.Fatal("buildTLS accepted an incomplete mTLS configuration")
+	}
+}
+
+func TestBindMetadataIdentity(t *testing.T) {
+	meta, err := metadata.Open(filepath.Join(t.TempDir(), "meta.db"))
+	if err != nil {
+		t.Fatalf("metadata.Open: %v", err)
+	}
+	defer meta.Close()
+	cluster := crdt.ClusterID{1, 2, 3}
+	if err := bindMetadataIdentity(meta, cluster, 7); err != nil {
+		t.Fatalf("first bind: %v", err)
+	}
+	if err := bindMetadataIdentity(meta, cluster, 7); err != nil {
+		t.Fatalf("same identity: %v", err)
+	}
+	if err := bindMetadataIdentity(meta, crdt.ClusterID{9}, 7); err == nil {
+		t.Fatal("cluster mismatch was accepted")
+	}
+	if err := bindMetadataIdentity(meta, cluster, 8); err == nil {
+		t.Fatal("origin mismatch was accepted")
+	}
+	if got, ok, err := meta.GetClusterID(); err != nil || !ok || got != cluster {
+		t.Fatalf("stored cluster = %x, %v, %v; want %x, true, nil", got, ok, err, cluster)
+	}
+	if got, ok, err := meta.GetNodeID(); err != nil || !ok || got != 7 {
+		t.Fatalf("stored origin = %d, %v, %v; want 7, true, nil", got, ok, err)
+	}
+}
 
 // TestTwoSidecarsConverge spawns two syzy-pg subprocesses against the
 // shared test PG container, connected via TCP. Node 0 INSERTs a row; the

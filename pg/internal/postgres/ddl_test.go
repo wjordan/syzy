@@ -17,7 +17,7 @@ import (
 	"github.com/wjordan/syzy/schemalog"
 )
 
-// openDDLEngine opens an engine with DDL capture enabled (§6 increment A): the
+// openDDLEngine opens an engine with DDL capture enabled (§6): the
 // syzy_ddl_intent spool + ddl_command_end/sql_drop triggers are installed, so
 // ordinary DDL run after Open writes structured intent rows.
 func openDDLEngine(t *testing.T, ctx context.Context, db string, origin crdt.Origin, cluster crdt.ClusterID) *Engine {
@@ -42,8 +42,8 @@ func openDDLEngine(t *testing.T, ctx context.Context, db string, origin crdt.Ori
 	return e
 }
 
-// openDDLEngineLog opens a DDL engine wired to a shared schema log (§6
-// increment D): captured DDL is appended as Bundles and a follower applies log
+// openDDLEngineLog opens a DDL engine wired to a shared schema log (§6):
+// captured DDL is appended as Bundles and a follower applies log
 // events via catchUpSchema.
 func openDDLEngineLog(t *testing.T, ctx context.Context, db string, origin crdt.Origin, cluster crdt.ClusterID, ordinal uint16, log schemalog.Log) *Engine {
 	return openDDLEngineLogMeta(t, ctx, db, origin, cluster, ordinal, log, nil)
@@ -77,7 +77,7 @@ func openDDLEngineLogMeta(t *testing.T, ctx context.Context, db string, origin c
 }
 
 // openLeaseEngine opens a DDL engine wired to a shared schema log AND a shared
-// DDL lease (§6 increment E): the ddl_command_start gate serializes cross-node
+// DDL lease (§6): the ddl_command_start gate serializes cross-node
 // DDL so multiple originators' appends never conflict.
 func openLeaseEngine(t *testing.T, ctx context.Context, db string, origin crdt.Origin, cluster crdt.ClusterID, log schemalog.Log, lease Lease) *Engine {
 	t.Helper()
@@ -143,7 +143,7 @@ func ddlIntentRows(t *testing.T, db string) []intentRow {
 // per top-level DDL command, and sql_drop records the directly-dropped object.
 // NB: PostgreSQL reports a PRIMARY KEY as its own implicit CREATE INDEX
 // command-end event, distinct from the CREATE TABLE — load-bearing for the
-// CatalogOp build (increment C must fold the implicit PK index into the table).
+// CatalogOp build must fold the implicit PK index into the table operation.
 func TestDDLIntentRowsWritten(t *testing.T) {
 	requirePG(t)
 	ctx := context.Background()
@@ -276,7 +276,7 @@ func TestDDLIntentCapturedAndPruned(t *testing.T) {
 }
 
 // TestBuildCatalogOpCreateDropTable: capture builds a typed CatalogOp from
-// pg_catalog (increment C). CREATE TABLE … PRIMARY KEY allocates a fresh stable
+// pg_catalog. CREATE TABLE … PRIMARY KEY allocates a fresh stable
 // TableID/ColumnIDs and folds the implicit PK index into the one OpCreateTable
 // (no stray CreateIndex); DROP TABLE resolves the same allocated TableID back
 // through the OID⇄ID map.
@@ -363,7 +363,7 @@ func TestBuildCatalogOpCreateDropTable(t *testing.T) {
 }
 
 // catalogOpCollector wires onDDLIntents to build CatalogOps from each captured
-// DDL txn (increment C), appending them to *ops and recording the first build
+// DDL transaction, appending them to *ops and recording the first build
 // error in *firstErr (returning nil so capture does not halt — the test asserts
 // the error instead).
 func catalogOpCollector(t *testing.T, ctx context.Context, e *Engine, db string, ops *[]crdt.CatalogOp, firstErr *error) {
@@ -542,6 +542,43 @@ func TestBuildCatalogOpAlterRejectsUnsupported(t *testing.T) {
 	}
 }
 
+func TestDDLRejectsTruncateBeforeCommit(t *testing.T) {
+	requirePG(t)
+	ctx := context.Background()
+	e := openDDLEngine(t, ctx, "syzy_ddl_truncate", 126, crdt.ClusterID{0xfe})
+	defer closeEngine(t, ctx, e)
+
+	appExec(t, "syzy_ddl_truncate", `INSERT INTO public.kv VALUES (1, 'kept')`)
+	if err := appExecErr(t, "syzy_ddl_truncate", `TRUNCATE public.kv`); err == nil {
+		t.Fatal("TRUNCATE committed on a replicated table")
+	}
+
+	conn, err := pgx.Connect(ctx, dbURL("syzy_ddl_truncate"))
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer conn.Close(ctx)
+	var count int
+	if err := conn.QueryRow(ctx, `SELECT count(*) FROM public.kv`).Scan(&count); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("row count after rejected TRUNCATE = %d, want 1", count)
+	}
+}
+
+func TestTablesModeRejectsTruncateBeforeCommit(t *testing.T) {
+	requirePG(t)
+	ctx := context.Background()
+	e := newTestEngine(t, ctx, "syzy_tables_truncate", 127, crdt.ClusterID{0xff})
+	defer closeEngine(t, ctx, e)
+
+	appExec(t, "syzy_tables_truncate", `INSERT INTO public.kv VALUES (1, 'kept')`)
+	if err := appExecErr(t, "syzy_tables_truncate", `TRUNCATE public.kv`); err == nil {
+		t.Fatal("TRUNCATE committed on a replicated table in explicit-tables mode")
+	}
+}
+
 // TestBuildCatalogOpRejectsNonPKGeneratedAlwaysIdentity: a GENERATED ALWAYS AS
 // IDENTITY column that is not the PK mints node-local values and cannot be
 // UPDATEd, so concurrent same-PK inserts would diverge on it — buildCatalogOps
@@ -606,7 +643,7 @@ func TestBuildCatalogOpOwnedSequenceNotSerial(t *testing.T) {
 
 // TestSchemaLogReplication: a DDL transaction on the originator becomes a Bundle
 // in the shared schema log, and the follower converges by applying log events
-// (§6 increment D). Exercises the full append→read→apply round-trip.
+// (§6). Exercises the full append→read→apply round-trip.
 func TestSchemaLogReplication(t *testing.T) {
 	requirePG(t)
 	ctx := context.Background()
@@ -666,7 +703,7 @@ func TestSchemaLogReplication(t *testing.T) {
 // capture resolves DML on the new table through the OID⇄ID map (its id is
 // allocated, not name-derived) and stamps the changeset's Deps[SchemaChain] with
 // the schema event the table was created under — the dependency a follower's
-// gate (a later increment) holds the DML on.
+// gate holds the DML until the schema dependency is present.
 func TestDMLOnDDLCreatedTableCarriesSchemaDep(t *testing.T) {
 	requirePG(t)
 	ctx := context.Background()
@@ -789,7 +826,7 @@ func TestLiveIdentityDDLConvergence(t *testing.T) {
 	assertAutoIDConverged(t, ra, rb)
 }
 
-// twoNodeAutoID runs the §6 increment-B auto-increment convergence scenario for a
+// twoNodeAutoID runs the §6 auto-increment convergence scenario for a
 // public.t (id <auto> PRIMARY KEY, msg text) table created by createDDL: A
 // (ordinal 1) runs the DDL and inserts 3 rows without ids; once B converges (so
 // B applied the CREATE and partitioned its sequence) B inserts 2 more; A then
@@ -1050,7 +1087,7 @@ func pgColumnNames(t *testing.T, db, table string) []string {
 }
 
 // TestApplyCatalogOpRoundTrip: ops built on node A from real DDL apply on a
-// fresh node B (increment D, single node). B's physical schema converges and its
+// fresh node B. B's physical schema converges and its
 // OID⇄ID map binds B's local OID/columns to A's allocated stable ids — the #4
 // foundation's apply half.
 func TestApplyCatalogOpRoundTrip(t *testing.T) {
@@ -1531,7 +1568,7 @@ func TestSchemaCatchUpAtStartup(t *testing.T) {
 // introspectCatalog re-adds it under its name-derived id AND restore binds the
 // allocated id to the same OID. The stale derived id must be evicted so the
 // relation maps to a single id — else a delayed peer changeset under the old id
-// would silently write to the new table (codex F-review finding 1).
+// would silently write to the new table.
 func TestBootstrapTableDropRecreateRestart(t *testing.T) {
 	requirePG(t)
 	ctx := context.Background()
@@ -1613,7 +1650,7 @@ func TestBootstrapTableDropRecreateRestart(t *testing.T) {
 // TestSchemaRestoreToleratesCrashMidDDL: Postgres commits a DDL transaction
 // BEFORE the sidecar appends/persists its schema event, so a crash in that window
 // leaves the physical schema AHEAD of the recorded catalog (a RENAME's new name,
-// a DROPped column/table). Two properties must hold (codex F-review finding 2):
+// a DROPped column/table). Two properties must hold:
 //
 //  1. Open must not fail — restore binds by oid (rename-invariant), so a
 //     since-renamed/dropped relation never blocks it; AND it must reflect the
@@ -2074,7 +2111,7 @@ func TestBuildCatalogOpRejectsNotNullUnique(t *testing.T) {
 	_ = captureAllWithin(t, ctx, e, 800*time.Millisecond)
 
 	if buildErr == nil {
-		t.Fatalf("expected NOT NULL UNIQUE to be rejected (§5 phase 2), got none (ops=%+v)", ops)
+		t.Fatalf("expected NOT NULL UNIQUE to be rejected (§7), got none (ops=%+v)", ops)
 	}
 	if !errors.Is(buildErr, errUnsupportedDDL) {
 		t.Fatalf("NOT NULL UNIQUE rejected with non-admission error: %v", buildErr)
@@ -2654,7 +2691,7 @@ func acctRows3(t *testing.T, db string) map[int64]acctRow {
 	return out
 }
 
-// TestUniqueArbitrationWinnerRefreshesStaleCell (codex finding 2): after a steal
+// TestUniqueArbitrationWinnerRefreshesStaleCell verifies that after a steal
 // leaves a cell_clock override on a loser's key column, a later WINNING write to
 // that column must clear the stale override so the column's effective stamp
 // follows the new value. Otherwise a third writer with a stamp between the steal
@@ -2708,7 +2745,7 @@ func TestUniqueArbitrationWinnerRefreshesStaleCell(t *testing.T) {
 	}
 }
 
-// TestBuildCatalogOpRejectsPartialUnique (codex finding 4): a partial UNIQUE
+// TestBuildCatalogOpRejectsPartialUnique verifies that a partial UNIQUE
 // index cannot replicate (its predicate truth varies across replicas), so the
 // op-builder rejects it rather than silently skipping — which would leave the
 // originator's physical constraint with no replicated counterpart.

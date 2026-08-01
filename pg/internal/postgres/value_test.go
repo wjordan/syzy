@@ -71,6 +71,57 @@ func TestPKBlobMatchesSQLiteCatalog(t *testing.T) {
 	}
 }
 
+func TestValidatePKBlob(t *testing.T) {
+	idCol := &colInfo{name: "id", typeName: "bigint", cid: crdt.ColumnID{1}}
+	nameCol := &colInfo{name: "name", typeName: "text", cid: crdt.ColumnID{2}}
+	ti := &tableInfo{name: "items", pk: []*colInfo{idCol, nameCol}}
+	id, err := encodeColValue(idCol.cid, idCol.typeName, []byte("42"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	name, err := encodeColValue(nameCol.cid, nameCol.typeName, []byte("alpha"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid, err := pkBlobTyped([]crdt.ColValue{id, name})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name string
+		pk   crdt.PKBlob
+		ok   bool
+	}{
+		{name: "valid", pk: valid, ok: true},
+		{name: "truncated", pk: valid[:len(valid)-1]},
+		{name: "missing member", pk: mustPKBlob(t, id)},
+		{name: "wrong order", pk: mustPKBlob(t, name, id)},
+		{name: "extra member", pk: mustPKBlob(t, id, name, name)},
+		{name: "wrong type", pk: mustPKBlob(t, crdt.ColValue{Column: idCol.cid, TypeTag: crdt.ColText, Bytes: []byte("42")}, name)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validatePKBlob(ti, tc.pk)
+			if tc.ok && err != nil {
+				t.Fatalf("validatePKBlob: %v", err)
+			}
+			if !tc.ok && err == nil {
+				t.Fatal("validatePKBlob accepted malformed input")
+			}
+		})
+	}
+}
+
+func mustPKBlob(t testing.TB, values ...crdt.ColValue) crdt.PKBlob {
+	t.Helper()
+	pk, err := pkBlobTyped(values)
+	if err != nil {
+		t.Fatalf("pkBlobTyped: %v", err)
+	}
+	return pk
+}
+
 // TestColValueRoundTrip: text → canonical typed → text survives per class.
 func TestColValueRoundTrip(t *testing.T) {
 	cid := crdt.ColumnID{1}

@@ -149,8 +149,8 @@ func run(args []string) error {
 		return fmt.Errorf("metadata open: %w", err)
 	}
 	defer meta.Close()
-	if err := meta.SetClusterID(cfg.clusterID); err != nil {
-		return fmt.Errorf("set cluster id: %w", err)
+	if err := bindMetadataIdentity(meta, cfg.clusterID, cfg.origin); err != nil {
+		return err
 	}
 
 	mgr, err := mirror.New(mirror.Config{Root: filepath.Join(cfg.dataDir, "mirror")})
@@ -373,6 +373,35 @@ func run(args []string) error {
 	return nil
 }
 
+func bindMetadataIdentity(meta *metadata.Store, cluster crdt.ClusterID, origin crdt.Origin) error {
+	storedCluster, ok, err := meta.GetClusterID()
+	if err != nil {
+		return fmt.Errorf("read stored cluster id: %w", err)
+	}
+	if ok && storedCluster != cluster {
+		return fmt.Errorf("data-dir belongs to cluster %x, not %x", storedCluster, cluster)
+	}
+	if !ok {
+		if err := meta.SetClusterID(cluster); err != nil {
+			return fmt.Errorf("store cluster id: %w", err)
+		}
+	}
+
+	storedOrigin, ok, err := meta.GetNodeID()
+	if err != nil {
+		return fmt.Errorf("read stored origin: %w", err)
+	}
+	if ok && storedOrigin != origin {
+		return fmt.Errorf("data-dir belongs to origin %d, not %d", storedOrigin, origin)
+	}
+	if !ok {
+		if err := meta.SetNodeID(origin); err != nil {
+			return fmt.Errorf("store origin: %w", err)
+		}
+	}
+	return nil
+}
+
 type sidecarConfig struct {
 	connURL         string
 	replConnURL     string
@@ -514,10 +543,23 @@ func parseFlags(args []string) (*sidecarConfig, error) {
 		tlsKey:          *tlsKey,
 		tlsCA:           *tlsCA,
 	}
-	if (cfg.tlsCert == "") != (cfg.tlsKey == "") {
-		return nil, errors.New("-tls-cert and -tls-key must be set together")
+	if err := validateTLSFiles(cfg); err != nil {
+		return nil, err
 	}
 	return cfg, nil
+}
+
+func validateTLSFiles(cfg *sidecarConfig) error {
+	set := 0
+	for _, path := range []string{cfg.tlsCert, cfg.tlsKey, cfg.tlsCA} {
+		if path != "" {
+			set++
+		}
+	}
+	if set != 0 && set != 3 {
+		return errors.New("-tls-cert, -tls-key, and -tls-ca must be set together")
+	}
+	return nil
 }
 
 // extractDBName pulls the database name from a Postgres URL's path.
@@ -610,6 +652,9 @@ func genClusterID() (string, error) {
 // key for both listeners and outbound dials, and the cluster CA for verifying
 // peers in both directions. nil (plaintext) when no flags are given.
 func buildTLS(cfg *sidecarConfig) (*tls.Config, error) {
+	if err := validateTLSFiles(cfg); err != nil {
+		return nil, err
+	}
 	if cfg.tlsCert == "" && cfg.tlsCA == "" {
 		return nil, nil
 	}

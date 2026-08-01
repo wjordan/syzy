@@ -122,6 +122,41 @@ func openEngine(t *testing.T, ctx context.Context, db string, origin crdt.Origin
 	return e
 }
 
+func TestEnsurePublicationValidatesExistingConfiguration(t *testing.T) {
+	requirePG(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	const db = "syzy_publication_validation"
+	createTestDB(t, ctx, db, schemaKV)
+	conn, err := pgx.Connect(ctx, dbURL(db))
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer conn.Close(ctx)
+
+	if _, err := conn.Exec(ctx, `CREATE PUBLICATION syzy_pub FOR TABLE public.kv`); err != nil {
+		t.Fatalf("create limited publication: %v", err)
+	}
+	if err := ensurePublication(ctx, conn, "syzy_pub"); err == nil {
+		t.Fatal("ensurePublication accepted a publication that does not cover all tables")
+	}
+	if _, err := conn.Exec(ctx, `DROP PUBLICATION syzy_pub`); err != nil {
+		t.Fatalf("drop limited publication: %v", err)
+	}
+	if _, err := conn.Exec(ctx, `CREATE PUBLICATION syzy_pub FOR ALL TABLES WITH (publish = 'insert')`); err != nil {
+		t.Fatalf("create insert-only publication: %v", err)
+	}
+	if err := ensurePublication(ctx, conn, "syzy_pub"); err == nil {
+		t.Fatal("ensurePublication accepted a publication missing updates and deletes")
+	}
+	if _, err := conn.Exec(ctx, `ALTER PUBLICATION syzy_pub SET (publish = 'insert, update, delete')`); err != nil {
+		t.Fatalf("repair publication: %v", err)
+	}
+	if err := ensurePublication(ctx, conn, "syzy_pub"); err != nil {
+		t.Fatalf("ensurePublication rejected a valid publication: %v", err)
+	}
+}
+
 // closeEngine is test teardown. Engine.Close intentionally keeps the slot and
 // origin (the durable resume position) in production, but both count against
 // max_replication_slots, so tests must drop them or they accumulate across
@@ -355,9 +390,8 @@ func applyAll(t *testing.T, ctx context.Context, e *Engine, css []*crdt.Changese
 
 // TestConvergence: two databases converge on independent inserts and on a
 // same-PK conflict resolved identically by (CL, Stamp) LWW. Each node's
-// backlog is captured into its Cache before cross-applying — modelling the
-// steady state where local capture is caught up (see .claude/BUGS.md for the
-// concurrent capture-vs-apply race this deliberately avoids).
+// backlog is captured into its Cache before cross-applying, modelling the
+// steady state where local capture is caught up.
 func TestConvergence(t *testing.T) {
 	requirePG(t)
 	ctx := context.Background()
@@ -455,6 +489,43 @@ func TestIdempotency(t *testing.T) {
 	}
 	if got := dumpKV(t, "syzy_dst"); len(got) != 1 || got[1] != "hello" {
 		t.Fatalf("idempotent re-apply changed state: %v", got)
+	}
+}
+
+func TestApplyRejectsMalformedPKWithoutAdvancingFrontier(t *testing.T) {
+	requirePG(t)
+	ctx := context.Background()
+	cluster := crdt.ClusterID{0xba, 0xdd}
+	e := newTestEngine(t, ctx, "syzy_bad_pk", 1, cluster)
+	defer closeEngine(t, ctx, e)
+
+	var tableID crdt.TableID
+	for id, ti := range e.cat.byID {
+		if ti.name == "kv" {
+			tableID = id
+			break
+		}
+	}
+	if tableID == (crdt.TableID{}) {
+		t.Fatal("kv table missing from catalog")
+	}
+	valid := typedPK(t, e, "kv", "42")
+	dot := crdt.Dot{Origin: 2, Seq: 1}
+	cs := &crdt.Changeset{
+		ClusterID: cluster,
+		Dot:       dot,
+		Stamp:     crdt.Stamp{Origin: dot.Origin},
+		Records: []crdt.Record{crdt.Delete{
+			Table: tableID,
+			PK:    valid[:len(valid)-1],
+			CL:    2,
+		}},
+	}
+	if err := e.Applier().Apply(ctx, cs); err == nil || !strings.Contains(err.Error(), "invalid PK") {
+		t.Fatalf("apply malformed PK error = %v, want invalid PK", err)
+	}
+	if e.cfg.Cache.IsAppliedRemote(dot.Origin, dot.Seq) {
+		t.Fatal("malformed PK advanced the remote frontier")
 	}
 }
 

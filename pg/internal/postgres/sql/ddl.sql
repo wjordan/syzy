@@ -1,4 +1,4 @@
--- DDL replication support (§6), increment A: the syzy_ddl_intent spool + the
+-- DDL replication support (§6): the syzy_ddl_intent spool and the
 -- event triggers that fill it. DDL leaves no decodable trace of its own (logical
 -- decoding is DML-only), so the trigger persists the full structured descriptor
 -- of each command INSIDE the user's transaction — co-transactional, so a
@@ -48,7 +48,7 @@ BEGIN
     RETURN n;
 END $$;
 
--- Admission (§6 G) needs the column shape the ALTER started from, and
+-- Admission (§11) needs the column shape the ALTER started from, and
 -- ddl_command_end sees only the finished catalog. So a ddl_command_start
 -- trigger — which runs before the command touches anything — records the
 -- pre-command shape of every replicated table in this backend's slot of
@@ -536,7 +536,7 @@ BEGIN
            OR (persist IS NOT NULL AND persist <> 'p') THEN
             CONTINUE;
         END IF;
-        -- Admission (§6 G): a permanent CREATE TABLE AS / SELECT INTO / MATERIALIZED
+        -- Admission (§11): a permanent CREATE TABLE AS / SELECT INTO / MATERIALIZED
         -- VIEW in the replicated schema materializes a node-local query result that
         -- cannot replicate. Reject it PRE-COMMIT so the user txn rolls back cleanly,
         -- instead of committing and forcing the sidecar to halt schema-unhealthy
@@ -549,11 +549,12 @@ BEGIN
         IF r.command_tag NOT IN ('CREATE TABLE', 'ALTER TABLE', 'CREATE INDEX', 'CREATE VIEW') THEN
             CONTINUE;
         END IF;
-        -- Admission (§6 G): shapes that cannot replicate at all, and column
+        -- Admission (§11): shapes that cannot replicate at all, and column
         -- changes that RESTRICT the table (judged against the pre-command
         -- snapshot) — both rejected before they can commit.
         IF r.command_tag = 'CREATE TABLE' THEN
             PERFORM syzy_ddl_admit_table(r.objid);
+            PERFORM syzy_install_truncate_guard(r.objid);
         END IF;
         IF r.command_tag = 'ALTER TABLE' AND r.object_type = 'table' THEN
             PERFORM syzy_ddl_admit_alter(r.objid);

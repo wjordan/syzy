@@ -1,8 +1,6 @@
-// Package engine defines the narrow ports between syzy's engine-neutral core
-// (crdt, nodestate, transport, schemalog, metadata, …) and a concrete
-// database adapter (SQLite or Postgres). Dependencies point inward: adapters
-// import core; core never imports an adapter. See
-// .claude/plans/postgres-engine.md §9.
+// Package engine defines narrow ports between Syzy's engine-neutral core and a
+// concrete database adapter. Dependencies point inward: adapters import the
+// core, while the core never imports an adapter.
 //
 // Two seams carry the replication traffic:
 //
@@ -19,10 +17,7 @@
 // replication checkpoint (a SQLite app_txid, a Postgres confirmed_flush LSN).
 // Splitting Dot/Stamp assignment into the orchestrator would let a crash
 // reorder them against the checkpoint and re-derive a different Seq for a
-// redelivered transaction. The spike's Seq/HLC-determinism test proved this.
-//
-// Deferred seams (declared when their phase lands, per §9/§11): Schema (DDL
-// replication, phase 3) and Snapshotter (bootstrap / lazy restore, phase 5).
+// redelivered transaction.
 package engine
 
 import (

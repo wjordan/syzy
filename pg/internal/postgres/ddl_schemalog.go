@@ -26,17 +26,17 @@ const schemaCatchUpBatch = 128
 // catchUpSchema skips the event it just wrote (its seq is now schemaSeq).
 //
 // A pure-DDL or net-empty transaction that yields no ops appends nothing.
-// Cross-node append contention (ErrHeadMoved) is surfaced loudly; serializing
-// concurrent originators behind the DDL lease is a later increment.
+// Cross-node append contention (ErrHeadMoved) is surfaced loudly; the DDL lease
+// serializes concurrent originators in multi-writer deployments.
 func (e *Engine) appendDDLBundle(ctx context.Context, intents []ddlIntent) error {
 	ops, err := buildCatalogOps(ctx, e.maint, e.cat, intents)
 	if err != nil {
 		if errors.Is(err, errUnsupportedDDL) {
 			// The node committed a DDL it cannot put on the chain: its schema has
-			// diverged. Record it durably and halt loudly (syzy_clone repairs) —
+			// diverged. Record it durably and halt loudly (a fresh clone repairs) —
 			// never silently skip, which would leave the local schema ahead of the
-			// cluster. (Increment G's admission gate rejects these pre-commit, so
-			// this post-commit halt becomes unreachable once it lands.)
+			// cluster. Admission rejects supported unsafe shapes before commit;
+			// this remains the fail-closed backstop.
 			e.markSchemaUnhealthy(err.Error())
 			return fmt.Errorf("%w: %s", ErrSchemaUnhealthy, err.Error())
 		}
@@ -78,8 +78,8 @@ func (e *Engine) appendDDLBundle(ctx context.Context, intents []ddlIntent) error
 		// committing (a partition outlasted the lease TTL, or no lease serializes
 		// this cluster). Our DDL committed locally but the parent it was built on is
 		// no longer head, and we do NOT rebase it (no commutativity check) — so this
-		// node has diverged. Halt schema-unhealthy (§6 F, syzy_clone). The DDL lease
-		// (§6 E) makes this rare; the parent-CAS already prevents SILENT divergence
+		// node has diverged. Halt schema-unhealthy (§10). The DDL lease (§6) makes
+		// this rare; the parent-CAS already prevents SILENT divergence
 		// (every node converges on the CAS winner's event, this loser halts loudly).
 		// A fencing epoch that would pin the loss on a zombie holder rather than a
 		// racing healthy peer is a follow-up — it changes only WHO halts, not whether
@@ -160,7 +160,7 @@ func (e *Engine) catchUpSchema(ctx context.Context) error {
 		if errors.Is(err, schemalog.ErrBelowHorizon) {
 			// This node fell behind the log's retention window — the events it needs
 			// to catch up were compacted away. It cannot reconcile locally; the
-			// universal repair is syzy_clone. Halt schema-unhealthy (§6 F).
+			// universal repair is a fresh clone. Halt schema-unhealthy (§10).
 			reason := fmt.Sprintf("schema_seq %d below the log retention horizon", from)
 			e.markSchemaUnhealthy(reason)
 			return fmt.Errorf("%w: %s", ErrSchemaUnhealthy, reason)
@@ -179,8 +179,8 @@ func (e *Engine) catchUpSchema(ctx context.Context) error {
 			if err := applyCatalogOp(ctx, e.appl.conn, e.cat, op, e.cfg.NodeOrdinal); err != nil {
 				// A SQL-level failure to apply a SUPPORTED cluster DDL means this
 				// node's physical schema cannot track the chain — a divergence.
-				// Record the event failed_local and halt schema-unhealthy (syzy_clone,
-				// §6 F). A transient (connection/ctx) error is NOT terminal: surface it
+				// Record the event failed_local and halt schema-unhealthy (§10). A
+				// transient connection or context error is NOT terminal: surface it
 				// so the caller retries on the next catch-up rather than poisoning the
 				// durable marker.
 				var pgErr *pgconn.PgError
@@ -201,7 +201,7 @@ func (e *Engine) catchUpSchema(ctx context.Context) error {
 }
 
 // recordFailedLocal durably records a schema event this node could not apply,
-// in apply_state='failed_local' (§6 F / Schema Health). It is a diagnostic
+// in apply_state='failed_local' (§10). It is a diagnostic
 // record of WHICH event diverged; the authoritative runtime/restart signal is
 // the schema_unhealthy marker markSchemaUnhealthy writes alongside it. Best-effort
 // (no-op without Meta); the in-memory + marker halt is what actually stops the node.

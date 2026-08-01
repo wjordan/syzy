@@ -177,7 +177,7 @@ func applyColAttrs(ti *tableInfo, attrs map[crdt.ColumnID]colAttrs) {
 
 // restoreSchemaCatalog rebuilds the in-memory OID⇄stable-ID map for
 // DDL-created tables from the durable metadata catalog and restores schema_seq
-// (§6 F), so a restart resumes from the persisted schema head rather than
+// (§10), so a restart resumes from the persisted schema head rather than
 // replaying the whole schema log from 0. The bootstrap tables (Config.Tables)
 // are already in the catalog from introspectCatalog; this adds the DDL-created
 // delta that persistSchemaEvent recorded.
@@ -391,8 +391,8 @@ func (e *Engine) bindRestoredTable(ctx context.Context, te metadata.TableEntry, 
 	// already bound this oid to its name-derived id; the recreate's allocated id
 	// is the cluster-authoritative one. Evict the stale entry so the relation
 	// maps to a SINGLE id — otherwise a delayed peer changeset addressed to the
-	// old id would still resolve (by id) and write to the new table: silent
-	// divergence (codex F-review finding 1).
+	// old id would still resolve (by id) and write to the new table, causing
+	// silent divergence.
 	if old := e.cat.byOID[oid]; old != nil && old.tid != ti.tid {
 		delete(e.cat.byID, old.tid)
 	}

@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	_ "embed"
+	"fmt"
 	"strconv"
 
 	"github.com/jackc/pglogrepl"
@@ -21,6 +22,9 @@ var counterSQL string
 //go:embed sql/conflicts.sql
 var conflictsSQL string
 
+//go:embed sql/truncate.sql
+var truncateSQL string
+
 // installSidecarTables creates the node-local support objects every engine has,
 // with or without DDL replication: the syzy_counter domain and syzy_applied
 // marker (§8) and the syzy_conflicts audit table (§9). Unconditional — a
@@ -35,10 +39,22 @@ func installSidecarTables(ctx context.Context, conn *pgx.Conn) error {
 	if execErr == nil {
 		_, execErr = conn.Exec(ctx, conflictsSQL)
 	}
+	if execErr == nil {
+		_, execErr = conn.Exec(ctx, truncateSQL)
+	}
 	if _, err := conn.Exec(ctx, `SET syzy.internal = 'off'`); err != nil && execErr == nil {
 		execErr = err
 	}
 	return execErr
+}
+
+func installTruncateGuards(ctx context.Context, conn *pgx.Conn, cat *catalog) error {
+	for _, ti := range cat.byID {
+		if _, err := conn.Exec(ctx, `SELECT public.syzy_install_truncate_guard($1)`, ti.oid); err != nil {
+			return fmt.Errorf("install truncate guard on %s: %w", tableRef(ti), err)
+		}
+	}
+	return nil
 }
 
 // ddlIntentTableName is the decodable spool the event triggers write to (§6).
@@ -51,7 +67,7 @@ const ddlIntentTableName = "syzy_ddl_intent"
 // ddl_command_end / sql_drop trigger persisted for a single DDL command. It is
 // the unambiguous catalog key — (classid, objid, objsubid) — plus the command
 // tag and grouping keys; the typed CatalogOp is built from the catalog against
-// this key in a later increment, never parsed from auditQuery.
+// this key, never parsed from auditQuery.
 type ddlIntent struct {
 	seq            int64  // syzy_ddl_intent.seq, for high-water-mark pruning
 	txid           int64  // groups one transaction's commands

@@ -217,8 +217,8 @@ func waitUntil(t *testing.T, d time.Duration, cond func() bool) {
 	}
 }
 
-// TestPublisherShipsUnbroadcastOnRestart is the durability crux the self-log
-// exists for (codex review area 1/3/5): entries that are in the log but were
+// TestPublisherShipsUnbroadcastOnRestart covers the durability crux the self-log
+// exists for: entries that are in the log but were
 // never broadcast — a crash between fold's append+fsync and delivery — must be
 // shipped by the publisher when it (re)starts. Here the entries are appended
 // directly (simulating a prior run's folds) and a fresh publisher delivers them

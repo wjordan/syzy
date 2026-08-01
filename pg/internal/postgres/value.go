@@ -137,3 +137,31 @@ func decodePKBlobTyped(pk crdt.PKBlob) []crdt.ColValue {
 	})
 	return out
 }
+
+func validatePKBlob(ti *tableInfo, pk crdt.PKBlob) error {
+	count := 0
+	err := corecatalog.RangeTuple(pk, func(cv crdt.ColValue) error {
+		if count >= len(ti.pk) {
+			return fmt.Errorf("too many members")
+		}
+		col := ti.pk[count]
+		if cv.Column != col.cid {
+			return fmt.Errorf("member %d column %x, want %x", count, cv.Column, col.cid)
+		}
+		if want := sqliteClass(col.typeName); cv.TypeTag != want {
+			return fmt.Errorf("member %d type %d, want %d", count, cv.TypeTag, want)
+		}
+		if _, err := colValueText(cv); err != nil {
+			return fmt.Errorf("member %d: %w", count, err)
+		}
+		count++
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("postgres: invalid PK for %s: %w", ti.name, err)
+	}
+	if count != len(ti.pk) {
+		return fmt.Errorf("postgres: invalid PK for %s: %d members, want %d", ti.name, count, len(ti.pk))
+	}
+	return nil
+}

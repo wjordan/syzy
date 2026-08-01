@@ -24,9 +24,8 @@ import (
 // ordinal is this node's id slice (§6); a follower partitions a freshly-applied
 // serial/bigserial PK sequence to it (0 disables, matching the bootstrap path).
 //
-// Increment D/B (single node): CREATE / ADD COLUMN / DROP COLUMN / RENAME column
-// or table / DROP TABLE, plus Bundle, with serial/bigserial sequence recreation +
-// follower-side partitioning. Indexes/views/triggers are later increments.
+// Supported operations include table and column changes, indexes, views,
+// unique keys, clock groups, bundles, and follower-side sequence partitioning.
 func applyCatalogOp(ctx context.Context, conn *pgx.Conn, cat *catalog, op crdt.CatalogOp, ordinal uint16) error {
 	// Partial (WHERE-predicate) unique keys are a SQLite-originated shape this
 	// engine cannot enforce (its arbitration is over total keys). Refusing the
@@ -132,6 +131,9 @@ func applyCreateTable(ctx context.Context, conn *pgx.Conn, cat *catalog, op crdt
 	oid, err := relationOID(ctx, conn, appliedSchema, op.TableName)
 	if err != nil {
 		return err
+	}
+	if _, err := conn.Exec(ctx, `SELECT public.syzy_install_truncate_guard($1)`, oid); err != nil {
+		return fmt.Errorf("apply create table %s: install truncate guard: %w", op.TableName, err)
 	}
 	pgcols, err := introspectColumns(ctx, conn, oid)
 	if err != nil {

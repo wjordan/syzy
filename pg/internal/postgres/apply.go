@@ -28,14 +28,14 @@ type applier struct {
 	cat  *catalog
 	conn *pgx.Conn
 
-	// winners is the engine's shared winner-repair stash (§9 Option A,
+	// winners is the engine's shared winner-repair stash (§9,
 	// winners.go), populated here at apply and consumed by the fold path.
 	winners *winnerStash
 
 	// schemaSeq is the node's schema head (§6), shared with the engine. The gate
 	// refuses a changeset whose Deps[SchemaChain] exceeds it; the orchestrator
 	// catches the schema log up before calling Apply, so a met dep passes. nil
-	// in the pre-DDL phase (no schema log) — then any Deps>0 is unsatisfiable.
+	// without a schema log — then any Deps>0 is unsatisfiable.
 	schemaSeq *atomic.Uint64
 
 	// skew caps how far a peer's clock can drag this node's HLC (skew.go).
@@ -60,7 +60,7 @@ func (a *applier) apply(ctx context.Context, cs *crdt.Changeset, force bool) err
 	// Schema-catchup gate (§6): refuse the DML unless the local catalog has
 	// reached the changeset's Deps[SchemaChain]. The orchestrator catches the
 	// schema log up (catchUpSchema) before calling Apply, so a met dep passes;
-	// this is the defense-in-depth backstop. PK-only phase ships seq 0.
+	// this is the defense-in-depth backstop. Fixed-schema mode ships seq 0.
 	if reqSeq, ok := cs.Deps[crdt.SchemaChain]; ok && reqSeq > 0 {
 		var local uint64
 		if a.schemaSeq != nil {
@@ -68,6 +68,19 @@ func (a *applier) apply(ctx context.Context, cs *crdt.Changeset, force bool) err
 		}
 		if uint64(reqSeq) > local {
 			return fmt.Errorf("postgres: schema dep %d exceeds local schema head %d", reqSeq, local)
+		}
+	}
+	for _, r := range cs.Records {
+		h := r.Header()
+		ti := a.cat.table(h.Table)
+		if ti == nil {
+			return fmt.Errorf("postgres: changeset references unknown table %x", h.Table[:8])
+		}
+		if _, ok := r.(crdt.BlobPatch); ok {
+			return fmt.Errorf("%w (table %x)", errBlobPatchUnsupported, h.Table[:8])
+		}
+		if err := validatePKBlob(ti, h.PK); err != nil {
+			return err
 		}
 	}
 
@@ -103,7 +116,7 @@ func (a *applier) apply(ctx context.Context, cs *crdt.Changeset, force bool) err
 	// Image directly; for Update we read the full post-UPSERT row inside the
 	// apply tx (the changeset carried only Changed columns). A later local fold
 	// checks the stash and self-corrects when it loses LWW to this stamp —
-	// winner-repair Option A, docs/postgres.md §9.
+	// winner repair in docs/postgres.md §9.
 	type pendingWinner struct {
 		tid   crdt.TableID
 		pk    crdt.PKBlob
@@ -124,20 +137,6 @@ func (a *applier) apply(ctx context.Context, cs *crdt.Changeset, force bool) err
 	for _, r := range records {
 		h := r.Header()
 		ti := a.cat.table(h.Table)
-		if ti == nil {
-			// Unknown table: do NOT silently skip and then MarkApplied — that
-			// would lose the record permanently. Fail so it is retried once
-			// the schema/catalog catches up (load-bearing under DDL, phase 3).
-			return fmt.Errorf("postgres: changeset references unknown table %x", h.Table[:8])
-		}
-		if _, ok := r.(crdt.BlobPatch); ok {
-			// Large-object byte-range patches were cut from this engine (v1
-			// documents bytea columns instead). FAIL CLOSED — a deterministic
-			// error, so the changeset quarantines rather than pinning the
-			// origin's frontier — never silently skip: skipping would
-			// MarkApplied a record whose bytes were never written.
-			return fmt.Errorf("%w (table %x)", errBlobPatchUnsupported, h.Table[:8])
-		}
 		rs := cache.RowState(h.Table, h.PK)
 		prevCL := rs.CL
 		// Conflict audit (§9): only a row another origin has written can lose
@@ -213,10 +212,10 @@ func (a *applier) apply(ctx context.Context, cs *crdt.Changeset, force bool) err
 		genBumped := prevCL > 0 && h.CL > prevCL
 		var w rowWrite
 		// winnerInsertImg / winnerUpdate gate the winner-repair stash for this
-		// record. Both are zeroed and assigned per-iteration; the stash is pushed
-		// only AFTER the empty-render and exec guards pass (Defect 1 burndown),
-		// and an Update's full post-UPSERT image is then read in-tx (Defect 3 /
-		// slice 2 — changeset Update carries only Changed columns).
+		// record. Both are zeroed and assigned per iteration; the stash is pushed
+		// only after actual DML succeeds, and an Update's full post-UPSERT image is
+		// then read in the transaction because the changeset carries only Changed
+		// columns.
 		var winnerInsertImg []crdt.ColValue
 		var winnerUpdate bool
 		switch rec := r.(type) {
@@ -310,7 +309,7 @@ func (a *applier) apply(ctx context.Context, cs *crdt.Changeset, force bool) err
 			cache.ClearCellsForRow(d.tid, d.pk)
 		}
 	}
-	// Winner-repair (§9 Option A): stash each winning record's post-DML image so
+	// Winner repair (§9): stash each winning record's post-DML image so
 	// a later local fold that loses LWW to this stamp can self-correct rather
 	// than ship a loser. Done AFTER PutRowState so the stash and the row state
 	// it relates to land together.
@@ -350,8 +349,8 @@ func (a *applier) currentWALLSN(ctx context.Context) (pglogrepl.LSN, error) {
 	return pglogrepl.ParseLSN(lsnStr)
 }
 
-// applySelfCorrect runs the winner-repair writes the fold path deferred (§9
-// Option A): an UPSERT of the row's repaired image, or a DELETE when the row is
+// applySelfCorrect runs the winner-repair writes the fold path deferred (§9):
+// an UPSERT of the row's repaired image, or a DELETE when the row is
 // not to survive. The apply conn is the same one the orchestrator owns, so this
 // runs serialized with the rest of the actor and — being origin-tagged — is
 // filtered out of the capture stream, so a repair never folds back as a fresh

@@ -557,6 +557,7 @@ node stays healthy.
 
 | Statement | Why |
 |---|---|
+| `TRUNCATE` on a replicated table | It has no row-level changes to merge; use `DELETE` so tombstones replicate |
 | `CREATE TABLE` without a `PRIMARY KEY` | Rows are identified by it; without one no write could be merged |
 | `CREATE TABLE … PARTITION BY` / a partition | Not supported in v1 |
 | A column of a user-defined type (enum, domain, composite, extension type) | Would replicate as text into a type the receiver may not have; an enum that gains a value on one node only would fail apply there forever. `public.syzy_counter` is exempt — the sidecar creates it on every node (§8) |
@@ -658,6 +659,11 @@ schema-unhealthy, which is the outcome the first layer exists to prevent.
   whole values.
 - **Postgres 17+**, one sidecar per database, and a superuser-adjacent
   install (event triggers, replica role, replication slot).
+- **A data directory belongs to one cluster and origin.** First startup records
+  both identities; later startup refuses mismatched flags.
+- **The publication must cover all tables** and publish inserts, updates, and
+  deletes. Startup creates it when absent and refuses a misconfigured existing
+  publication.
 - **A bucket is effectively required** in production: without one, journals
   grow unboundedly (§5).
 - **A large transaction is buffered whole.** Postgres does not stream a

@@ -2,11 +2,9 @@
 // ports over stock Postgres 17+ logical decoding (pgoutput) and pgx, with no
 // server fork or extension. See docs/postgres.md.
 //
-// Scope (phase 2, per §11): PK-only DML, text-format values, capture+apply
-// over the shared nodestate.Cache. Secondary-UNIQUE / NOT NULL UNIQUE
-// arbitration (§5), DDL replication (§6), and lazy restore (§8) are later
-// phases. Stable table/column IDs are introspected from pg_catalog here; the
-// schema-log catalog replaces that under DDL replication.
+// It captures committed WAL transactions, applies canonical changesets under
+// the shared CRDT model, and realizes Postgres-specific DDL, uniqueness, cell,
+// counter, and recovery behavior.
 package postgres
 
 import (
@@ -76,7 +74,7 @@ type Config struct {
 	Slot        string
 	OriginName  string
 
-	Tables []string // schema-qualified replicated set (PK-only phase)
+	Tables []string // schema-qualified replicated set when DDL replication is disabled
 
 	// MaxClockSkew bounds how far ahead of this node a peer's clock may drag the
 	// local HLC (skew.go). 0 ⇒ 30s; negative disables the cap.
@@ -111,7 +109,7 @@ type Config struct {
 	// JournalDir, when set (and Meta is set), enables the self-origin log: the
 	// live orchestrator appends each shipped local changeset's exact bytes here
 	// and fsyncs before the slot's confirmed_flush advances past that commit
-	// (pg-coordination-model §3). It is the durability boundary for live mode —
+	// It is the durability boundary for live mode —
 	// recovery replays these exact bytes rather than re-deriving Dot/Stamp, which
 	// is what keeps a node convergent with peers across a restart when its local
 	// folds interleaved with remote applies. Without it the live loop runs noAck
@@ -120,20 +118,18 @@ type Config struct {
 
 	// DDL, when set, installs the syzy_ddl_intent spool + ddl_command_end /
 	// sql_drop event triggers so ordinary CREATE/ALTER/DROP is captured for
-	// replication (§6). Off by default while the DDL surface is built in
-	// increments (the gate/lease/schema-log append are later steps).
+	// replication (§6). Off by default for deployments with a fixed schema.
 	DDL bool
 
 	// SchemaLog, when set (with DDL), is the cluster schema-event log (§6): a
 	// captured DDL transaction is built into one Bundle CatalogOp and appended
 	// here, and a follower applies events read from it (catchUpSchema). nil ⇒
-	// DDL is captured into typed ops but neither appended nor cross-node applied
-	// (the increment-C local-build surface). Cross-node serialization (the lease)
-	// is a later increment; until then SchemaLog must have a single originator.
+	// DDL is captured into typed ops but neither appended nor cross-node applied.
+	// Without Lease, SchemaLog must have a single originator.
 	SchemaLog schemalog.Log
 
-	// Lease, when set (with DDL + SchemaLog), serializes DDL cluster-wide (§6
-	// increment E) so multiple nodes can originate schema changes safely. A
+	// Lease, when set with DDL and SchemaLog, serializes DDL cluster-wide (§6) so
+	// multiple nodes can originate schema changes safely. A
 	// ddl_command_start gate blocks the first DDL of a transaction until this
 	// node holds the lease and has applied pending peer DDL, so appends never
 	// conflict. nil ⇒ single-originator (a concurrent peer DDL would surface
@@ -216,7 +212,7 @@ type Engine struct {
 	pendingAdopt []*crdt.Changeset
 	adoptedRows  int
 
-	// winners is the runtime-only winner-repair stash (§9 Option A,
+	// winners is the runtime-only winner-repair stash (§9,
 	// winners.go), shared by the apply path (writer) and the fold path
 	// (reader) — both on the orchestrator goroutine.
 	winners *winnerStash
@@ -237,8 +233,8 @@ type Engine struct {
 	schemaSeq atomic.Uint64
 
 	// schemaUnhealthy is set when this node committed a DDL it cannot put on the
-	// schema chain (§6 F): its physical schema has diverged and the only repair
-	// is syzy_clone. Once set the orchestrator halts and Open refuses to resume.
+	// schema chain (§10): its physical schema has diverged and the only repair
+	// is a fresh clone. Once set the orchestrator halts and Open refuses to resume.
 	schemaUnhealthy atomic.Bool
 }
 
@@ -300,6 +296,10 @@ func Open(ctx context.Context, cfg Config) (*Engine, error) {
 	}
 	e.cat = cat
 	cat.coordUnique = cfg.CoordinatedUnique
+	if err := installTruncateGuards(ctx, apply, cat); err != nil {
+		e.Close()
+		return nil, err
+	}
 	if cfg.CoordinatedUnique {
 		if err := e.startReservationEndpoint(ctx, cat); err != nil {
 			e.Close()
@@ -349,7 +349,7 @@ func Open(ctx context.Context, cfg Config) (*Engine, error) {
 			e.orch.catchUp = e.catchUpSchema
 			e.appl.schemaSeq = &e.schemaSeq
 
-			// DDL lease gate (§6 E): serialize cross-node DDL. The gate trigger
+			// DDL lease gate (§6): serialize cross-node DDL. The gate trigger
 			// blocks the first DDL of a txn until this node holds the lease and is
 			// caught up; a watcher on its own connection drives it (Run starts it).
 			if cfg.Lease != nil {
@@ -456,9 +456,9 @@ func Open(ctx context.Context, cfg Config) (*Engine, error) {
 		e.orch.shipped.Store(uint64(head))
 	}
 
-	// Refuse to resume a node that durably recorded a schema divergence (§6 F):
+	// Refuse to resume a node that durably recorded a schema divergence (§10):
 	// it committed a DDL it cannot put on the chain, so its catalog is unsafe and
-	// the repair is syzy_clone. Resuming would only re-hit the same rejection.
+	// the repair is a fresh clone. Resuming would only re-hit the same rejection.
 	if reason, unhealthy, err := loadSchemaHealth(cfg.Meta); err != nil {
 		e.Close()
 		return nil, fmt.Errorf("load schema health: %w", err)
@@ -468,7 +468,7 @@ func Open(ctx context.Context, cfg Config) (*Engine, error) {
 	}
 
 	// Rebuild the DDL-created-table catalog + schema_seq from the durable
-	// metadata catalog (§6 F), so a restart resumes at the persisted schema head
+	// metadata catalog (§10), so a restart resumes at the persisted schema head
 	// instead of replaying the whole schema log. No-op without Meta/SchemaLog.
 	if err := e.restoreSchemaCatalog(ctx); err != nil {
 		e.Close()
@@ -600,12 +600,19 @@ func pinCanonicalGUCs(exec func(string) error) error {
 }
 
 func ensurePublication(ctx context.Context, conn *pgx.Conn, name string) error {
-	var exists bool
-	if err := conn.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_publication WHERE pubname=$1)`, name).Scan(&exists); err != nil {
-		return err
-	}
-	if exists {
+	var allTables, inserts, updates, deletes bool
+	err := conn.QueryRow(ctx, `
+		SELECT puballtables, pubinsert, pubupdate, pubdelete
+		FROM pg_publication
+		WHERE pubname=$1`, name).Scan(&allTables, &inserts, &updates, &deletes)
+	if err == nil {
+		if !allTables || !inserts || !updates || !deletes {
+			return fmt.Errorf("publication %q must be FOR ALL TABLES and publish insert, update, delete", name)
+		}
 		return nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return err
 	}
 	// FOR ALL TABLES: a table created+inserted in one txn is captured, and
 	// CREATE TABLE needs no publication-membership step (§3).

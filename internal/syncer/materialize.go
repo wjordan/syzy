@@ -803,4 +803,3 @@ const (
 	syzyBlobWrite  = 5
 	syzyBlobIntent = 6
 )
-

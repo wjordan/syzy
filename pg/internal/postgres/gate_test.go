@@ -21,8 +21,8 @@ func enqueueDrain(t *testing.T, ctx context.Context, e *Engine) {
 	}
 }
 
-// TestGateInterleavingFoldsBeforeApply forces the drainToWALTarget interleaving
-// TestLiveConvergence can't make deterministic (the codex finding-7 gap): a peer
+// TestGateInterleavingFoldsBeforeApply forces a drainToWALTarget interleaving
+// that the live convergence test cannot make deterministic: a peer
 // changeset for PK k arrives while this node's OWN write to k is decoded and
 // enqueued as a draft but not yet folded. The gate must fold the pending local
 // draft into the Cache before arbitrating the remote, so both nodes converge on

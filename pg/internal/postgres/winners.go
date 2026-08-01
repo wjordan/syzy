@@ -6,7 +6,7 @@ import (
 	"github.com/wjordan/syzy/crdt"
 )
 
-// Winner-repair stash (§9 Option A in docs/postgres.md). It stashes the
+// Winner-repair stash (§9 in docs/postgres.md). It stashes the
 // post-arbitration full image of the latest peer-applied write that won LWW on
 // each contended row. The local fold checks this on each per-record build:
 // when its (CL, Stamp) loses to the stashed winner the row is repaired to the

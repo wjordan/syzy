@@ -9,7 +9,7 @@ import (
 )
 
 // TestWinnerRepairApplyStashesInsert verifies the apply-side half of
-// winner-repair (§9 Option A slice 1): a winning Insert is stashed in the
+// winner repair (§9): a winning Insert is stashed in the
 // engine's winnerStash with its post-arbitration image, so a later local fold
 // can detect a loss and self-correct against it.
 func TestWinnerRepairApplyStashesInsert(t *testing.T) {
@@ -109,7 +109,7 @@ func TestWinnerRepairApplyStashesUpdate(t *testing.T) {
 }
 
 // TestWinnerRepairFoldSelfCorrects verifies the fold-side half of
-// winner-repair (§9 Option A slice 1): when a local fold's (CL, Stamp) loses
+// winner repair (§9): when a local fold's (CL, Stamp) loses
 // to a stashed winner, the fold drops the loser from the outbound changeset
 // and the orchestrator UPSERTs the winner's image back to the local table.
 //

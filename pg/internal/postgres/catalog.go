@@ -78,7 +78,7 @@ type colInfo struct {
 	attnum    int    // PG physical column number; the rename-stable diff key (§6)
 	notNull   bool   // replicated column attributes, carried so the ALTER catalog
 	def       string // diff (§6) can detect — and cleanly reject — an attribute-only
-	generated bool   // change it cannot yet represent as a typed op (increment G).
+	generated bool   // change it cannot yet represent as a typed catalog operation.
 	identity  uint8  // attidentity: 0/'a'/'d'; 'a' (GENERATED ALWAYS) needs OVERRIDING SYSTEM VALUE on apply.
 	counter   bool   // declared syzy_counter: the cell merges by summation (cell.go).
 }

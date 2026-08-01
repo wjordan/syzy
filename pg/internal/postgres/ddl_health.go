@@ -9,10 +9,10 @@ import (
 
 // ErrSchemaUnhealthy is returned by Open (and by the orchestrator's Run loop)
 // when this node has committed a DDL it cannot replicate: its physical schema
-// has diverged from the cluster chain and the only repair is syzy_clone (§6 F,
+// has diverged from the cluster chain and the only repair is a fresh clone (§10,
 // the failed_local shape). Once durably marked, a restart refuses to resume
 // rather than crash-looping on the same divergence.
-var ErrSchemaUnhealthy = errors.New("postgres: schema unhealthy; run syzy_clone to repair")
+var ErrSchemaUnhealthy = errors.New("postgres: schema unhealthy; re-clone this node to repair")
 
 // errUnsupportedDDL tags a DDL rejection as admission-class — the command
 // committed locally but syzy cannot put it on the schema chain (an unsupported
@@ -37,7 +37,7 @@ func unsupportedDDLf(format string, a ...any) error {
 
 // metaSchemaUnhealthyKey holds the durable schema-unhealthy marker (its value is
 // the human-readable reason). Set when a local DDL diverges this node; read at
-// Open to refuse resuming until syzy_clone clears it.
+// Open to refuse resuming until the node is re-cloned.
 const metaSchemaUnhealthyKey = "schema_unhealthy"
 
 // markSchemaUnhealthy records that this node has diverged: it sets the in-memory
@@ -55,7 +55,7 @@ func (e *Engine) markSchemaUnhealthy(reason string) {
 }
 
 // loadSchemaHealth reads the durable schema-unhealthy marker. ok is true when a
-// non-empty reason is recorded, meaning the node must be repaired (syzy_clone)
+// non-empty reason is recorded, meaning the node must be re-cloned
 // before it can resume.
 func loadSchemaHealth(meta *metadata.Store) (reason string, unhealthy bool, err error) {
 	if meta == nil {

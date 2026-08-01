@@ -40,7 +40,7 @@ type capturer struct {
 	cat  *catalog
 	prog *progress
 
-	// winners is the engine's shared winner-repair stash (§9 Option A,
+	// winners is the engine's shared winner-repair stash (§9,
 	// winners.go): apply records each peer-applied LWW winner here and the
 	// fold checks it so a losing local write self-corrects instead of
 	// shipping. nil-safe (a nil stash never reports a winner).
@@ -66,7 +66,7 @@ type capturer struct {
 	// schemaSeq, when set, is the node's current schema-log head; foldCommit
 	// stamps it as a built changeset's Deps[SchemaChain] so a follower holds the
 	// DML until its catalog has caught up to that schema event (§6). nil ⇒ 0
-	// (the pre-DDL phase, where every node shares a static bootstrap schema).
+	// when every node shares a static bootstrap schema.
 	schemaSeq *atomic.Uint64
 
 	mu        sync.Mutex
@@ -163,7 +163,7 @@ func (c *capturer) checkpoint(lsn pglogrepl.LSN) error {
 // relEntry is a cached pgoutput Relation. For a user table it carries only the
 // relation OID and the tuple column names — NOT a resolved tableInfo: capture
 // (the decode goroutine) must not read the catalog, because the orchestrator
-// mutates it on DDL (§6 D4 resolution-at-fold). foldCommit resolves the OID →
+// mutates it on DDL (§6). foldCommit resolves the OID →
 // tableInfo and the names → columns on the orchestrator goroutine, in commit
 // order, so a CREATE is folded (table added) before the DML that depends on it.
 // The intent relation (syzy_ddl_intent, §6) is still recognized by name here
@@ -626,7 +626,7 @@ type localFold struct {
 	// the apply conn after this fold: for each entry, UPSERT the winner image
 	// to the local table so the row converges to the cluster's known winner.
 	// Populated when a local record's (CL, Stamp) lost LWW against a stash
-	// from Cache.Winner — winner-repair Option A, docs/postgres.md §9. The
+	// from Cache.Winner — winner repair in docs/postgres.md §9. The
 	// corresponding record is dropped from the outbound changeset and its
 	// RowState is not staged (the winner's stamp stays in the Cache).
 	selfCorrect []selfCorrectOp
@@ -662,7 +662,7 @@ type selfCorrectOp struct {
 func (c *capturer) foldCommit(t *txnAccum) (*crdt.Changeset, *localFold, error) {
 	// Resolve the raw user-table ops against the catalog and collapse them into
 	// the net per-row effect (order/rows). This is the catalog read deferred from
-	// decode (§6 D4): it runs here on the single fold goroutine, after any DDL in
+	// decode (§6): it runs here on the single fold goroutine, after any DDL in
 	// this txn has been applied to the catalog, so a row on a just-created table
 	// resolves. A relation not (yet) in the catalog is skipped — not replicated.
 	for _, raw := range t.rawOps {
@@ -788,7 +788,7 @@ func (c *capturer) foldCommit(t *txnAccum) (*crdt.Changeset, *localFold, error) 
 			cl = rs.NextLiveCL()
 			rec = crdt.Insert{Table: a.tid, PK: a.pk, CL: cl, Image: a.image}
 		}
-		// Winner-repair (§9 Option A). A stash means a peer's apply physically
+		// Winner repair (§9). A stash means a peer's apply physically
 		// wrote this row here since the last local fold of it, so this record and
 		// the local table can disagree in EITHER direction, and the fold has to
 		// reconcile them: losing to the stash means the cluster's winner is in our
@@ -950,9 +950,8 @@ func (c *capturer) commitTxn(ctx context.Context, sink engine.Sink, t *txnAccum)
 	// because a schema change logically precedes the DML that targets it (mixed
 	// DDL+DML lands as schema-then-DML). A pure-DDL transaction produces no
 	// changeset but still carries intent rows; prune is self-healing (a missed
-	// prune only leaves dead rows). (True mixed-txn atomicity — one Bundle + one
-	// changeset as a unit — is increment D's job in the live path; this
-	// deterministic path is tests.)
+	// prune only leaves dead rows). The live path publishes a mixed transaction's
+	// Bundle and changeset as one unit; this deterministic path supports tests.
 	if len(t.ddlIntents) > 0 {
 		if c.onDDLIntents != nil {
 			if err := c.onDDLIntents(ctx, t.ddlIntents); err != nil {

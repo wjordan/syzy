@@ -13,8 +13,8 @@ import (
 	"github.com/wjordan/syzy/internal/nodestate"
 )
 
-// The self-origin log makes the exact changeset bytes the durability boundary
-// (pg-coordination-model.md §3). After folding a local commit the orchestrator
+// The self-origin log makes the exact changeset bytes the durability boundary.
+// After folding a local commit the orchestrator
 // appends the built changeset here and fsyncs it BEFORE the slot's
 // confirmed_flush is allowed past that commit, so a crash never forgets a
 // shipped commit's exact bytes. Recovery replays those bytes verbatim — never

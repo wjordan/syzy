@@ -40,7 +40,7 @@ var (
 	broadcastBackoff = 100 * time.Millisecond
 )
 
-// orchestrator is the single serialized actor (§9 / pg-coordination-model §2):
+// orchestrator is the single serialized actor (§9):
 // the one goroutine that mutates the Cache. Capture decodes the WAL
 // concurrently and only enqueues drafts; the orchestrator folds those local
 // drafts (alloc Dot/HLC/CL, build changeset, persist row state, broadcast) and
@@ -54,7 +54,7 @@ type orchestrator struct {
 	prog   *progress
 	drafts chan *txnAccum
 
-	// Self-origin durability (pg-coordination-model §3), nil when disabled
+	// Self-origin durability, nil when disabled
 	// (no Meta/JournalDir). selfLog holds the exact bytes of every folded local
 	// changeset; shipped is the highest commit LSN whose changeset is fsynced
 	// there (capture reports it as confirmed_flush); skipThrough is the self-log
@@ -82,7 +82,7 @@ type orchestrator struct {
 	schemaSeq *atomic.Uint64
 	catchUp   func(context.Context) error
 
-	// DDL lease gate (§6 increment E), nil when no Lease is configured. The gate
+	// DDL lease gate (§6), nil when no Lease is configured. The gate
 	// manager runs on its own goroutine and serializes cross-node DDL; it requests
 	// schema catch-up over catchUpReq so catchUpSchema still runs only here (the
 	// sole catalog writer). gate is started/stopped by Run.
@@ -158,7 +158,7 @@ func (o *orchestrator) Run(ctx context.Context, inbox <-chan *crdt.Changeset, br
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// DDL lease gate (§6 E): close the gate and start the watcher before capture,
+	// DDL lease gate (§6): close the gate and start the watcher before capture,
 	// so a user DDL that arrives the instant we start is serialized, not admitted
 	// ungated. Stopped (lease + gate released, conn closed) on Run exit.
 	if o.gate != nil {
@@ -308,8 +308,8 @@ func (o *orchestrator) fold(ctx context.Context, t *txnAccum, broadcast engine.S
 	// foldCommit resolves any DML on it (schema-then-DML, even mixed in one txn),
 	// and foldCommit stamps the now-advanced schemaSeq as the changeset's
 	// Deps[SchemaChain]. Safe on this goroutine because capture no longer reads
-	// the catalog (D4). (Restart idempotency of the append — a crash between
-	// append and prune — is increment F's batch_id.)
+	// the catalog. batch_id makes the append idempotent across a crash between
+	// append and prune.
 	if len(t.ddlIntents) > 0 && o.capt.onDDLIntents != nil {
 		if err := o.capt.onDDLIntents(ctx, t.ddlIntents); err != nil {
 			return err
@@ -320,7 +320,7 @@ func (o *orchestrator) fold(ctx context.Context, t *txnAccum, broadcast engine.S
 	if err != nil {
 		return err
 	}
-	// Winner-repair (§9 Option A): execute any pending self-correct UPSERTs that
+	// Winner repair (§9): execute any pending self-correct UPSERTs that
 	// foldCommit deferred when a local record's (CL, Stamp) lost to a stashed
 	// peer winner. Runs on the apply conn (same goroutine), before broadcasting
 	// the changeset. Capture decodes the UPSERTed bytes on a later WAL pass and
@@ -347,7 +347,7 @@ func (o *orchestrator) fold(ctx context.Context, t *txnAccum, broadcast engine.S
 	return o.maybeCheckpoint()
 }
 
-// publish is the async self-log publisher (pg-coordination-model §2/§3). It
+// publish is the async self-log publisher. It
 // tails the self-log and broadcasts each local changeset to the transport,
 // off the actor's goroutine. delivered advances only after the transport
 // durably accepts an entry (broadcast returned nil), and checkpoint retention
