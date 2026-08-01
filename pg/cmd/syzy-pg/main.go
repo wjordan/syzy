@@ -30,6 +30,7 @@ import (
 
 	"github.com/wjordan/objectstore"
 	"github.com/wjordan/syzy/crdt"
+	"github.com/wjordan/syzy/internal/buildinfo"
 	"github.com/wjordan/syzy/internal/gapfillerchain"
 	"github.com/wjordan/syzy/internal/metadata"
 	"github.com/wjordan/syzy/internal/mirror"
@@ -47,6 +48,7 @@ const usage = `syzy-pg — Postgres sidecar for the syzy CRDT engine
 
 Usage:
   syzy-pg [-flags]
+  syzy-pg version
 
 Required:
   -conn URL          Postgres connection URL (e.g. postgres://user:pw@host:5432/db)
@@ -72,11 +74,10 @@ Postgres requirements: wal_level=logical, and max_replication_slots /
 max_wal_senders sized for the cluster (one slot per sidecar; the PG default
 of 10 is too low for real fleets — 64 is a sane floor).
 
-Object storage (optional but recommended for production):
+Object storage (required with -ddl; otherwise recommended for production):
   -bucket URL        blobstore URL (s3://... or file://...) this node seals its
                      changeset history to. Enables offline-peer catch-up from
-                     the bucket and bounded local journals (self-log + mirror
-                     GC follow the sealed tip).
+                     the bucket, bounded local journals, and the DDL lease.
 
 Replication scope:
   -tables T1,T2      schema-qualified replicated set (e.g. public.kv,public.items)
@@ -112,6 +113,9 @@ func main() {
 	// One-shot subcommands dispatch before the daemon flag parse.
 	if len(os.Args) >= 2 {
 		switch os.Args[1] {
+		case "version":
+			fmt.Print(buildinfo.FullFor("syzy-pg"))
+			return
 		case "status":
 			if err := runStatus(os.Args[2:]); err != nil {
 				fmt.Fprintf(os.Stderr, "syzy-pg: %v\n", err)
@@ -244,7 +248,15 @@ func run(args []string) error {
 	var eng *postgres.Engine
 	var uniqueReg unique.Registry
 	var leaseholder *unique.Leaseholder
+	var ddlLease postgres.Lease
 	if coordBucket != nil {
+		if cfg.ddl {
+			ddlLease = postgres.NewBucketLease(
+				coordBucket,
+				fmt.Sprintf("ddl/%x/lease", cfg.clusterID),
+				10*time.Second,
+			)
+		}
 		leaseStore := unique.OpenLease(coordBucket, "unique/lease")
 		leaseholder = unique.NewLeaseholder(unique.LeaseholderConfig{
 			Store: leaseStore,
@@ -302,6 +314,7 @@ func run(args []string) error {
 		// node that created a table through replicated DDL).
 		NodeOrdinal:     uint16(cfg.origin),
 		SchemaLog:       schemaLog,
+		Lease:           ddlLease,
 		CheckpointEvery: cfg.checkpointEvery,
 	})
 	if err != nil {
@@ -498,6 +511,9 @@ func parseFlags(args []string) (*sidecarConfig, error) {
 		}
 		if *schemaLogListen != "" && *schemaLog == "" {
 			return nil, errors.New("-schema-log-listen requires -schema-log (only a local file backend can be hosted)")
+		}
+		if *bucketURL == "" {
+			return nil, errors.New("-ddl requires -bucket for the distributed DDL lease")
 		}
 	} else if schemaSources > 0 || *schemaLogListen != "" {
 		return nil, errors.New("schema-log flags require -ddl")

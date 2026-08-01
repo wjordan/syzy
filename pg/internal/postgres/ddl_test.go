@@ -112,6 +112,65 @@ type intentRow struct {
 	isDrop     bool
 }
 
+type countingSchemaLog struct {
+	schemalog.Log
+	mu            sync.Mutex
+	reads         int
+	blockFirst    chan struct{}
+	appendStarted chan struct{}
+	blockOnce     sync.Once
+}
+
+func (l *countingSchemaLog) Append(ctx context.Context, parent uint64, op []byte, raw string) (uint64, error) {
+	first := false
+	if l.blockFirst != nil {
+		l.blockOnce.Do(func() {
+			first = true
+			close(l.appendStarted)
+		})
+	}
+	if first {
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-l.blockFirst:
+		}
+	}
+	return l.Log.Append(ctx, parent, op, raw)
+}
+
+func (l *countingSchemaLog) Read(ctx context.Context, from uint64, limit int) ([]schemalog.Event, error) {
+	l.mu.Lock()
+	l.reads++
+	l.mu.Unlock()
+	return l.Log.Read(ctx, from, limit)
+}
+
+func (l *countingSchemaLog) readCount() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.reads
+}
+
+type countingLease struct {
+	Lease
+	mu       sync.Mutex
+	acquires int
+}
+
+func (l *countingLease) Acquire(ctx context.Context, holder string) (uint64, error) {
+	l.mu.Lock()
+	l.acquires++
+	l.mu.Unlock()
+	return l.Lease.Acquire(ctx, holder)
+}
+
+func (l *countingLease) acquireCount() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.acquires
+}
+
 // ddlIntentRows reads syzy_ddl_intent directly (ordered by seq), so a test can
 // assert what the triggers wrote without driving capture.
 func ddlIntentRows(t *testing.T, db string) []intentRow {
@@ -934,6 +993,88 @@ func TestDDLGateAdmitsAndReleases(t *testing.T) {
 	}
 	if holder() != "" {
 		t.Fatalf("lease not released after gated DDL appended: holder=%q", holder())
+	}
+}
+
+func TestDDLGateReusesLeaseAcrossAutocommitBurst(t *testing.T) {
+	requirePG(t)
+	ctx := context.Background()
+	appendGate := make(chan struct{})
+	log := &countingSchemaLog{
+		Log:           schemalog.NewLocal(),
+		blockFirst:    appendGate,
+		appendStarted: make(chan struct{}),
+	}
+	appendReleased := false
+	releaseAppend := func() {
+		if !appendReleased {
+			close(appendGate)
+			appendReleased = true
+		}
+	}
+	defer releaseAppend()
+	lease := &countingLease{Lease: NewMemLease(30 * time.Second)}
+	a := openLeaseEngine(t, ctx, "syzy_gate_burst", 127, crdt.ClusterID{0xf1}, log, lease)
+	defer closeEngine(t, ctx, a)
+	startupReads := log.readCount()
+	a.orch.gate.idleFor = 10 * time.Second
+
+	runCtx, cancel := context.WithCancel(ctx)
+	var wg sync.WaitGroup
+	defer func() { cancel(); wg.Wait() }()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := a.Run(runCtx, make(chan *crdt.Changeset), func(context.Context, *crdt.Changeset) error { return nil }); err != nil && runCtx.Err() == nil {
+			t.Errorf("orch: %v", err)
+		}
+	}()
+
+	appExec(t, "syzy_gate_burst", `CREATE TABLE public.burst_a (id bigint PRIMARY KEY)`)
+	select {
+	case <-log.appendStarted:
+	case <-time.After(2 * time.Second):
+		releaseAppend()
+		t.Fatal("first schema append did not start")
+	}
+	secondDone := make(chan error, 1)
+	go func() {
+		ddlCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		conn, err := pgx.Connect(ddlCtx, dbURL("syzy_gate_burst"))
+		if err == nil {
+			_, err = conn.Exec(ddlCtx, `CREATE TABLE public.burst_b (id bigint PRIMARY KEY)`)
+			_ = conn.Close(ddlCtx)
+		}
+		secondDone <- err
+	}()
+	select {
+	case err := <-secondDone:
+		if err != nil {
+			releaseAppend()
+			t.Fatalf("second autocommit DDL: %v", err)
+		}
+	case <-time.After(time.Second):
+		releaseAppend()
+		t.Fatal("second autocommit DDL waited for the first schema-log append")
+	}
+	releaseAppend()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		head, err := log.Head(ctx)
+		if err == nil && head == 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if head, err := log.Head(ctx); err != nil || head != 2 {
+		t.Fatalf("schema log head=%d err=%v, want 2", head, err)
+	}
+	if got := lease.acquireCount(); got != 1 {
+		t.Fatalf("lease acquisitions=%d, want 1 for the burst", got)
+	}
+	if got := log.readCount() - startupReads; got != 1 {
+		t.Fatalf("gate catch-ups=%d, want 1 for the burst", got)
 	}
 }
 

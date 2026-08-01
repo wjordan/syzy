@@ -167,7 +167,7 @@ object-storage-backed, lets an offline or brand-new peer converge from the
 bucket, and gives journal GC its safety predicate: retention follows the
 **sealed** tip, never mere delivery. Without a bucket both journals are
 retained unboundedly, because truncating would strand an offline peer —
-so a bucket is effectively required in production.
+so a bucket is effectively required in production and mandatory with `-ddl`.
 
 **Peer catch-up and anti-entropy.** The engine serves any (origin, seq) it
 produced or applied — own bytes from the self-log, peer bytes from the mirror
@@ -186,8 +186,11 @@ event-trigger spool. A `ddl_command_end` event trigger writes a **structured
 descriptor** — read from `pg_catalog`, never parsed from SQL text — into a
 spool table in the same transaction as the DDL itself. Capture decodes those
 spool rows, and the orchestrator turns them into typed `crdt.CatalogOp`s
-appended to the ordered schema log under a DDL lease and a parent-CAS.
-Receivers apply the typed op, never the originator's SQL.
+appended to the ordered schema log under a DDL lease and a parent-CAS. Each
+committed transaction becomes one Bundle and one append. The lease is retained
+briefly across an autocommit burst, so only its first transaction needs lease
+acquisition and schema catch-up. Receivers apply the typed op, never the
+originator's SQL.
 
 Unsupported DDL is rejected **before commit** — a migration typo fails the
 migration instead of halting the node — and DDL that is simply out of scope
@@ -222,7 +225,9 @@ one deferred constraint trigger makes a single batched reservation call at
 commit. The call reaches the sidecar over `dblink` — the trigger's only way
 out of its own transaction — so the sidecar answers as a Postgres server for
 exactly one verb. A denial raises `23505` and aborts, which is precisely what
-a `UNIQUE` index would have done.
+a `UNIQUE` index would have done. Its `-data-dir/reserve` socket must be visible
+to Postgres at the same path; the directory permissions are its local trust
+boundary.
 
 The batch carries the transaction's **net** effect. A value inserted and then
 deleted in one transaction is never reserved; a value moved between rows
@@ -436,7 +441,9 @@ what `TestClusterLWWAgreement` in `pg/internal/pgtestcluster` asserts against.
 
 Joining an **empty** node is deliberately boring: take a physical base backup
 from a peer (or restore from the bucket), create the slot, initialize the
-frontier.
+frontier. With a fixed `-tables` schema, a bigint auto-ID primary-key sequence
+must be pristine or already partitioned for this node; startup rejects a used
+unpartitioned sequence.
 
 ### Adopting an existing database
 
@@ -607,8 +614,9 @@ invariant enforceable from one node's snapshot. Enforce those rules in the
 application, where they can be checked against the state the writer has.
 
 The gate only runs under `-ddl`. With an explicit `-tables` set the schema is
-yours to manage, and a constraint you keep identical on every node is your
-call — the hazards above are unchanged, and quarantined writes are the cost.
+yours to keep identical; an unknown incoming column fails apply rather than
+being treated as a DDL-dropped column. Constraint hazards and quarantine remain
+your responsibility.
 
 Two layers enforce this. A `ddl_command_start` trigger records the
 pre-command column shape and constraint set; `ddl_command_end` diffs the

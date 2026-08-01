@@ -79,6 +79,9 @@ func (a *applier) apply(ctx context.Context, cs *crdt.Changeset, force bool) err
 		if _, ok := r.(crdt.BlobPatch); ok {
 			return fmt.Errorf("%w (table %x)", errBlobPatchUnsupported, h.Table[:8])
 		}
+		if err := validateRecordColumns(ti, r, a.cfg.DDL); err != nil {
+			return err
+		}
 		if err := validatePKBlob(ti, h.PK); err != nil {
 			return err
 		}
@@ -334,6 +337,29 @@ func (a *applier) apply(ctx context.Context, cs *crdt.Changeset, force bool) err
 	// The applied frontier and the local HLC take the changeset's clock only up
 	// to the skew bound (skew.go): a peer's broken clock must not become ours.
 	cache.MarkApplied(cs.Dot.Origin, cs.Dot.Seq, a.skew.admit(cs.Dot.Origin, cs.Stamp.Clock))
+	return nil
+}
+
+// validateRecordColumns distinguishes a DDL tombstone from fixed-schema drift.
+// DDL mode may receive an older event that still names a deliberately dropped
+// column; a fixed -tables catalog has no such history, so an unknown ID means
+// the peer schemas disagree and must fail before the apply transaction begins.
+func validateRecordColumns(ti *tableInfo, rec crdt.Record, ddl bool) error {
+	if ddl {
+		return nil
+	}
+	var values []crdt.ColValue
+	switch r := rec.(type) {
+	case crdt.Insert:
+		values = r.Image
+	case crdt.Update:
+		values = r.Changed
+	}
+	for _, v := range values {
+		if ti.colByID(v.Column) == nil {
+			return fmt.Errorf("postgres: changeset references unknown column %x in fixed-schema table %s.%s", v.Column[:8], ti.schema, ti.name)
+		}
+	}
 	return nil
 }
 

@@ -27,13 +27,13 @@ are separate meshes. There is no mixed-engine replication.
 - `max_replication_slots` and `max_wal_senders` sized for the cluster — one
   slot per sidecar. Postgres's default of 10 is too low for a real fleet; 64 is
   a sane floor.
-- A **superuser-adjacent role**: the sidecar installs event triggers, sets the
-  replica role, and creates a replication slot.
+- A **superuser-adjacent role**: the sidecar installs event triggers and
+  `dblink`, sets the replica role, and creates a replication slot.
 - The sidecar creates its publication automatically. If that name already
   exists, it must cover all tables and publish inserts, updates, and deletes.
-- **Object storage** (`-bucket`). Formally optional, effectively required: it
-  is how an offline peer catches up and how local journals stay bounded.
-  Without it they grow without limit.
+- **Object storage** (`-bucket`). Required with `-ddl`, and effectively required
+  otherwise: it is how an offline peer catches up and local journals stay
+  bounded. Without it they grow without limit.
 
 One sidecar per database, one database per node.
 After first start, `-data-dir` is bound to its cluster ID and origin; startup
@@ -117,7 +117,7 @@ cloned would republish a stale database into a live cluster.
 `CREATE` / `ALTER` / `DROP` themselves, with tables created by cluster DDL —
 see the [allow/reject matrix](../docs/postgres.md#11-ddl-allowreject-matrix)
 for exactly which statements are admitted, and why a schema change may only
-ever relax the schema.
+ever relax the schema. It requires a shared `-bucket` for the DDL lease.
 
 Only the `public` schema replicates.
 

@@ -196,7 +196,7 @@ func applyCreateTable(ctx context.Context, conn *pgx.Conn, cat *catalog, op crdt
 	// table was just created and no local insert has run), so RESTART is safe.
 	if ordinal != 0 {
 		lo, hi := idSlice(ordinal)
-		if err := partitionTable(ctx, conn, ti, lo, hi); err != nil {
+		if err := partitionTable(ctx, conn, ti, lo, hi, true); err != nil {
 			return fmt.Errorf("partition %s: %w", op.TableName, err)
 		}
 	}

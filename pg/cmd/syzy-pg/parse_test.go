@@ -24,10 +24,10 @@ func TestParseFlags_Valid(t *testing.T) {
 		args []string
 	}{
 		{"tables", base("-tables", "public.kv")},
-		{"ddl file", base("-ddl", "-schema-log", "/tmp/s.db")},
-		{"ddl dial", base("-ddl", "-schema-log-dial", "127.0.0.1:7100")},
-		{"ddl s3", base("-ddl", "-schema-log-s3", "https://b.s3.us-east-1.amazonaws.com?region=us-east-1")},
-		{"ddl file+listen", base("-ddl", "-schema-log", "/tmp/s.db", "-schema-log-listen", ":7100")},
+		{"ddl file", base("-ddl", "-schema-log", "/tmp/s.db", "-bucket", "file:///tmp/b")},
+		{"ddl dial", base("-ddl", "-schema-log-dial", "127.0.0.1:7100", "-bucket", "file:///tmp/b")},
+		{"ddl s3", base("-ddl", "-schema-log-s3", "https://b.s3.us-east-1.amazonaws.com?region=us-east-1", "-bucket", "file:///tmp/b")},
+		{"ddl file+listen", base("-ddl", "-schema-log", "/tmp/s.db", "-schema-log-listen", ":7100", "-bucket", "file:///tmp/b")},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -54,6 +54,7 @@ func TestParseFlags_Errors(t *testing.T) {
 		{"ddl no source", base("-ddl"), "one of -schema-log"},
 		{"ddl two sources", base("-ddl", "-schema-log", "/tmp/s.db", "-schema-log-s3", "https://b/x"), "at most one"},
 		{"listen needs file", base("-ddl", "-schema-log-dial", "127.0.0.1:7100", "-schema-log-listen", ":7100"), "requires -schema-log"},
+		{"ddl no bucket", base("-ddl", "-schema-log", "/tmp/s.db"), "requires -bucket"},
 		{"schema flag without ddl", base("-tables", "public.kv", "-schema-log", "/tmp/s.db"), "require -ddl"},
 	}
 	for _, c := range cases {

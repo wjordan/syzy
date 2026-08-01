@@ -48,18 +48,18 @@ type pgQuerier interface {
 //     high-bit-partition, and a slice (ordinal << 47) overflows anything
 //     narrower; an int4 serial is left alone (the step/offset fallback, which
 //     caps node count, is a later mode — bigint is recommended).
-//   - pristine (never advanced) means enabling syzy on a populated table never
-//     rewinds a live sequence and mints duplicate PKs; that case is the
-//     existing-database migration (RESTART above the current max), not here.
+//   - with a fixed schema, a used unpartitioned sequence is rejected rather
+//     than rewound. DDL-originated tables retain the reserved low-range sequence
+//     on their originator; followers are partitioned as the CREATE is applied.
 //
 // ordinal 0 disables partitioning (single-node / opt-out).
-func partitionSequences(ctx context.Context, conn *pgx.Conn, cat *catalog, ordinal uint16) error {
+func partitionSequences(ctx context.Context, conn *pgx.Conn, cat *catalog, ordinal uint16, rejectUsed bool) error {
 	if ordinal == 0 {
 		return nil
 	}
 	lo, hi := idSlice(ordinal)
 	for _, ti := range cat.byID {
-		if err := partitionTable(ctx, conn, ti, lo, hi); err != nil {
+		if err := partitionTable(ctx, conn, ti, lo, hi, rejectUsed); err != nil {
 			return err
 		}
 	}
@@ -73,8 +73,8 @@ func partitionSequences(ctx context.Context, conn *pgx.Conn, cat *catalog, ordin
 // a table lock, re-checks pristine under it, then RESTARTs. EXCLUSIVE blocks
 // writers (INSERT's ROW EXCLUSIVE conflicts) but not readers, and releases at
 // commit — a brief, bootstrap-time pause.
-func partitionTable(ctx context.Context, conn *pgx.Conn, ti *tableInfo, lo, hi uint64) error {
-	var seqs []string // PK sequences that look pristine + bigint
+func partitionTable(ctx context.Context, conn *pgx.Conn, ti *tableInfo, lo, hi uint64, rejectUsed bool) error {
+	var cols []string // PK columns with pristine, unpartitioned bigint sequences
 	for _, pk := range ti.pk {
 		// The PK *column* must be bigint, not just its sequence: a high-bit
 		// slice (ordinal << 47) overflows a narrower column. This rejects a
@@ -83,15 +83,22 @@ func partitionTable(ctx context.Context, conn *pgx.Conn, ti *tableInfo, lo, hi u
 		if pk.typeName != "bigint" {
 			continue
 		}
-		seq, dataType, pristine, ok, err := pkSequence(ctx, conn, ti, pk.name)
+		seq, ok, err := pkSequence(ctx, conn, ti, pk.name)
 		if err != nil {
 			return err
 		}
-		if ok && dataType == "bigint" && pristine {
-			seqs = append(seqs, seq)
+		if !ok || seq.dataType != "bigint" || seq.partitioned(lo, hi) {
+			continue
 		}
+		if !seq.pristine {
+			if rejectUsed {
+				return fmt.Errorf("%s.%s auto-ID sequence %s was used before node partitioning", ti.schema, ti.name, seq.name)
+			}
+			continue
+		}
+		cols = append(cols, pk.name)
 	}
-	if len(seqs) == 0 {
+	if len(cols) == 0 {
 		return nil // nothing to partition — no lock taken
 	}
 
@@ -104,48 +111,66 @@ func partitionTable(ctx context.Context, conn *pgx.Conn, ti *tableInfo, lo, hi u
 	if _, err := tx.Exec(ctx, fmt.Sprintf(`LOCK TABLE %s IN EXCLUSIVE MODE`, qtable)); err != nil {
 		return fmt.Errorf("lock %s: %w", qtable, err)
 	}
-	for _, seq := range seqs {
+	for _, col := range cols {
 		// Re-check under the lock: an INSERT that committed between phase 1 and
 		// the lock may have advanced the sequence. Once we hold the lock no new
 		// writer can, so a still-pristine sequence is safe to RESTART.
-		var isCalled bool
-		if err := tx.QueryRow(ctx, fmt.Sprintf(`SELECT is_called FROM %s`, seq)).Scan(&isCalled); err != nil {
-			return fmt.Errorf("recheck %s: %w", seq, err)
+		seq, ok, err := pkSequence(ctx, tx, ti, col)
+		if err != nil {
+			return fmt.Errorf("recheck %s.%s: %w", qtable, col, err)
 		}
-		if isCalled {
-			continue // advanced before we locked — leave it (populated-DB path)
+		if !ok || seq.dataType != "bigint" || seq.partitioned(lo, hi) {
+			continue
+		}
+		if !seq.pristine {
+			if rejectUsed {
+				return fmt.Errorf("%s.%s auto-ID sequence %s was used before node partitioning", ti.schema, ti.name, seq.name)
+			}
+			continue
 		}
 		// START must move with MINVALUE: ALTER validates the (unchanged) START
 		// against the new MINVALUE, so setting MINVALUE alone on a START=1
 		// sequence errors. RESTART sets the next value handed out.
 		if _, err := tx.Exec(ctx, fmt.Sprintf(
 			`ALTER SEQUENCE %s START %d MINVALUE %d MAXVALUE %d RESTART %d INCREMENT 1`,
-			seq, lo, lo, hi, lo)); err != nil {
-			return fmt.Errorf("alter sequence %s: %w", seq, err)
+			seq.name, lo, lo, hi, lo)); err != nil {
+			return fmt.Errorf("alter sequence %s: %w", seq.name, err)
 		}
 	}
 	return tx.Commit(ctx)
 }
 
-// pkSequence resolves the sequence backing column col of table ti and reports
-// its data type and whether it is still pristine (never handed out a value).
-// ok is false when the column has no owned sequence (a plain key, uuid, etc.).
-func pkSequence(ctx context.Context, q pgQuerier, ti *tableInfo, col string) (seq, dataType string, pristine, ok bool, err error) {
+type sequenceInfo struct {
+	name                       string
+	dataType                   string
+	start, min, max, increment int64
+	pristine                   bool
+}
+
+func (s sequenceInfo) partitioned(lo, hi uint64) bool {
+	return s.start == int64(lo) && s.min == int64(lo) && s.max == int64(hi) && s.increment == 1
+}
+
+// pkSequence resolves the sequence backing column col of table ti. ok is false
+// when the column has no owned sequence (a plain key, uuid, etc.).
+func pkSequence(ctx context.Context, q pgQuerier, ti *tableInfo, col string) (info sequenceInfo, ok bool, err error) {
 	qtable := quoteIdent(ti.schema) + "." + quoteIdent(ti.name)
 	var seqName *string
 	if err = q.QueryRow(ctx, `SELECT pg_get_serial_sequence($1, $2)`, qtable, col).Scan(&seqName); err != nil {
-		return "", "", false, false, err
+		return sequenceInfo{}, false, err
 	}
 	if seqName == nil {
-		return "", "", false, false, nil
+		return sequenceInfo{}, false, nil
 	}
-	// data type from the sequence catalog; pristine = the sequence has not been
-	// read yet (is_called false). Reading is_called does not advance it.
+	info.name = *seqName
 	var isCalled bool
 	if err = q.QueryRow(ctx, fmt.Sprintf(
-		`SELECT (SELECT seqtypid::regtype::text FROM pg_sequence WHERE seqrelid = $1::regclass),
-		        (SELECT is_called FROM %s)`, *seqName), *seqName).Scan(&dataType, &isCalled); err != nil {
-		return "", "", false, false, err
+		`SELECT seqtypid::regtype::text, seqstart, seqmin, seqmax, seqincrement,
+		        (SELECT is_called FROM %s)
+		 FROM pg_sequence WHERE seqrelid = $1::regclass`, *seqName), *seqName).
+		Scan(&info.dataType, &info.start, &info.min, &info.max, &info.increment, &isCalled); err != nil {
+		return sequenceInfo{}, false, err
 	}
-	return *seqName, dataType, !isCalled, true, nil
+	info.pristine = !isCalled
+	return info, true, nil
 }

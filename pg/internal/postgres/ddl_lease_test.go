@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/wjordan/objectstore"
 )
 
 // TestMemLease exercises the in-memory lease's TTL + fencing-epoch semantics: a
@@ -62,6 +64,43 @@ func TestMemLease(t *testing.T) {
 	}
 	// Now free → A acquires, epoch bumps to 3.
 	if ep, err := l.Acquire(ctx, "A"); err != nil || ep != 3 {
+		t.Fatalf("A acquire after release: epoch=%d err=%v, want 3,nil", ep, err)
+	}
+}
+
+func TestBucketLease(t *testing.T) {
+	ctx := context.Background()
+	bucket, err := objectstore.OpenFS(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenFS: %v", err)
+	}
+	now := time.Unix(1000, 0)
+	a := NewBucketLease(bucket, "ddl/lease", 10*time.Second).(*bucketLease)
+	b := NewBucketLease(bucket, "ddl/lease", 10*time.Second).(*bucketLease)
+	a.now = func() time.Time { return now }
+	b.now = func() time.Time { return now }
+
+	if ep, err := a.Acquire(ctx, "A"); err != nil || ep != 1 {
+		t.Fatalf("A acquire: epoch=%d err=%v, want 1,nil", ep, err)
+	}
+	if ep, err := a.Acquire(ctx, "A"); err != nil || ep != 1 {
+		t.Fatalf("A reacquire: epoch=%d err=%v, want 1,nil", ep, err)
+	}
+	if _, err := b.Acquire(ctx, "B"); !errors.Is(err, ErrLeaseHeld) {
+		t.Fatalf("B acquire while A live: err=%v, want ErrLeaseHeld", err)
+	}
+
+	now = now.Add(11 * time.Second)
+	if ep, err := b.Acquire(ctx, "B"); err != nil || ep != 2 {
+		t.Fatalf("B takeover: epoch=%d err=%v, want 2,nil", ep, err)
+	}
+	if _, err := a.Heartbeat(ctx, "A"); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("A heartbeat after takeover: err=%v, want ErrLeaseLost", err)
+	}
+	if err := b.Release(ctx, "B"); err != nil {
+		t.Fatalf("B release: %v", err)
+	}
+	if ep, err := a.Acquire(ctx, "A"); err != nil || ep != 3 {
 		t.Fatalf("A acquire after release: epoch=%d err=%v, want 3,nil", ep, err)
 	}
 }

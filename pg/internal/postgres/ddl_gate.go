@@ -23,11 +23,13 @@ const (
 )
 
 // ddlGatePoll is how often the watcher polls pg_locks for a waiting DDL backend;
-// ddlGateHeartbeat is how often it renews the lease while holding it. Vars so
-// tests can shrink them for faster, tighter timing.
+// ddlGateHeartbeat is how often it renews the lease while holding it; and
+// ddlGateIdle is how long an idle holder retains the lease to amortize an
+// autocommit DDL burst. Vars so tests can shrink them for tighter timing.
 var (
 	ddlGatePoll      = 25 * time.Millisecond
 	ddlGateHeartbeat = 2 * time.Second
+	ddlGateIdle      = 250 * time.Millisecond
 )
 
 // gateTriggerSQL builds the ddl_command_start gate trigger from the lock-key
@@ -92,14 +94,17 @@ type gateManager struct {
 	catchUpReq chan chan error
 	poll       time.Duration
 	hbEvery    time.Duration
+	idleFor    time.Duration
 
-	holds   bool      // do we currently hold the cluster lease?
-	lastHB  time.Time // last lease heartbeat, to throttle Heartbeat calls
-	wg      sync.WaitGroup
-	cancel  context.CancelFunc
-	closed  bool // GATE_KEY held (gate shut)
-	started bool // watcher goroutine launched
-	stopped bool
+	holds     bool      // do we currently hold the cluster lease?
+	caughtUp  bool      // caught up since acquiring the uninterrupted lease grant?
+	lastHB    time.Time // last lease heartbeat, to throttle Heartbeat calls
+	idleSince time.Time // spool first observed empty with no local waiter
+	wg        sync.WaitGroup
+	cancel    context.CancelFunc
+	closed    bool // GATE_KEY held (gate shut)
+	started   bool // watcher goroutine launched
+	stopped   bool
 }
 
 // closeGate acquires GATE_KEY so the gate is shut the moment Open returns —
@@ -167,6 +172,7 @@ func (g *gateManager) watch(ctx context.Context) {
 			continue       // otherwise transient (e.g. ctx race); retry next tick
 		}
 		if n > 0 {
+			g.idleSince = time.Time{}
 			g.admitOne(ctx)
 			continue
 		}
@@ -175,9 +181,19 @@ func (g *gateManager) watch(ctx context.Context) {
 		// it alive while a committed-but-unappended DDL is pending.
 		if g.holds {
 			if empty, err := g.intentEmpty(ctx); err == nil && empty {
-				_ = g.lease.Release(ctx, g.holder)
-				g.holds = false
+				if g.idleSince.IsZero() {
+					g.idleSince = time.Now()
+				}
+				if time.Since(g.idleSince) >= g.idleFor {
+					_ = g.lease.Release(ctx, g.holder)
+					g.holds = false
+					g.caughtUp = false
+					g.idleSince = time.Time{}
+				} else {
+					g.heartbeat(ctx)
+				}
 			} else {
+				g.idleSince = time.Time{}
 				g.heartbeat(ctx)
 			}
 		}
@@ -186,26 +202,51 @@ func (g *gateManager) watch(ctx context.Context) {
 
 // admitOne lets exactly one waiting DDL transaction through: hold the cluster
 // lease, have the orchestrator apply pending peer DDL, open the gate, wait until
-// the waiter has acquired it, then re-close (which blocks until the admitted txn
-// ends — commit or rollback).
+// the waiter has acquired it, then re-close after the admitted txn ends.
 func (g *gateManager) admitOne(ctx context.Context) {
 	if !g.holds {
 		if _, err := g.lease.Acquire(ctx, g.holder); err != nil {
 			return // a peer holds the lease; leave the waiter blocked, retry next tick
 		}
 		g.holds = true
+		g.caughtUp = false
 		g.lastHB = time.Now()
-	} else {
-		g.heartbeat(ctx)
+	} else if !g.heartbeat(ctx) {
+		return
 	}
-	if !g.requestCatchUp(ctx) {
-		return // catch-up failed/cancelled; keep the gate closed, retry next tick
+	if !g.caughtUp {
+		if !g.requestCatchUp(ctx) {
+			return // catch-up failed/cancelled; keep the gate closed, retry next tick
+		}
+		g.caughtUp = true
 	}
 	if _, err := g.conn.Exec(ctx, `SELECT pg_advisory_unlock($1)`, ddlGateLockKey); err != nil {
 		return
 	}
+	g.closed = false
 	g.awaitUserHolds(ctx)
-	_, _ = g.conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, ddlGateLockKey)
+	g.recloseGate(ctx)
+}
+
+// recloseGate polls instead of blocking in pg_advisory_lock so a long-running
+// DDL transaction cannot prevent lease heartbeats while it holds GATE_KEY.
+func (g *gateManager) recloseGate(ctx context.Context) {
+	for {
+		var locked bool
+		if err := g.conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, ddlGateLockKey).Scan(&locked); err != nil {
+			return
+		}
+		if locked {
+			g.closed = true
+			return
+		}
+		if g.holds {
+			g.heartbeat(ctx)
+		}
+		if !g.waitPoll(ctx) {
+			return
+		}
+	}
 }
 
 // recover re-closes the gate after its connection dies. A session advisory lock
@@ -269,23 +310,43 @@ func (g *gateManager) awaitUserHolds(ctx context.Context) {
 		if err != nil || heldByOther > 0 || waiting == 0 {
 			return
 		}
-		time.Sleep(g.poll)
+		if !g.heartbeat(ctx) || !g.waitPoll(ctx) {
+			return
+		}
 	}
 }
 
-func (g *gateManager) heartbeat(ctx context.Context) {
+func (g *gateManager) waitPoll(ctx context.Context) bool {
+	t := time.NewTimer(g.poll)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+func (g *gateManager) heartbeat(ctx context.Context) bool {
 	if time.Since(g.lastHB) < g.hbEvery {
-		return
+		return true
 	}
 	switch _, err := g.lease.Heartbeat(ctx, g.holder); {
 	case err == nil:
 		g.lastHB = time.Now()
+		return true
 	case errors.Is(err, ErrLeaseLost):
 		// A partition let our TTL lapse and a peer took the lease. Drop ownership
 		// so the next admit re-Acquires (bumping the fencing epoch) instead of
 		// admitting DDL while believing we still hold it. The gate stays closed
 		// meanwhile, so no DDL slips through ungated.
 		g.holds = false
+		g.caughtUp = false
+		return false
+	default:
+		// A lease-store error makes ownership unverifiable. Keep the gate shut and
+		// retry; admitting DDL is safe only after a successful heartbeat.
+		return false
 	}
 }
 

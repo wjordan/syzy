@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 
 	"github.com/wjordan/syzy/crdt"
@@ -35,6 +36,18 @@ func typedPK(t testing.TB, e *Engine, table string, texts ...string) crdt.PKBlob
 	}
 	t.Fatalf("typedPK: table %s not in catalog", table)
 	return nil
+}
+
+func TestValidateRecordColumnsFixedSchema(t *testing.T) {
+	known := &colInfo{name: "id", cid: crdt.ColumnID{1}}
+	ti := &tableInfo{schema: "public", name: "items", cols: []*colInfo{known}}
+	rec := crdt.Update{Changed: []crdt.ColValue{{Column: crdt.ColumnID{9}}}}
+	if err := validateRecordColumns(ti, rec, false); err == nil || !strings.Contains(err.Error(), "unknown column") {
+		t.Fatalf("fixed-schema validation error = %v, want unknown column", err)
+	}
+	if err := validateRecordColumns(ti, rec, true); err != nil {
+		t.Fatalf("DDL mode rejected a dropped column: %v", err)
+	}
 }
 
 // TestPKBlobMatchesSQLiteCatalog pins the cross-engine identity contract: the

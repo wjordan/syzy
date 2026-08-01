@@ -325,7 +325,7 @@ func Open(ctx context.Context, cfg Config) (*Engine, error) {
 	// Node-disjoint auto-increment (§6): partition this node's PK sequences so
 	// bigserial/IDENTITY ids don't collide across masters. Sequence changes are
 	// not logically decoded, so this stays local (never replicated).
-	if err := partitionSequences(ctx, apply, cat, cfg.NodeOrdinal); err != nil {
+	if err := partitionSequences(ctx, apply, cat, cfg.NodeOrdinal, !cfg.DDL); err != nil {
 		e.Close()
 		return nil, fmt.Errorf("partition sequences: %w", err)
 	}
@@ -370,6 +370,7 @@ func Open(ctx context.Context, cfg Config) (*Engine, error) {
 					catchUpReq: e.orch.catchUpReq, // route catch-up to the sole catalog writer
 					poll:       ddlGatePoll,
 					hbEvery:    ddlGateHeartbeat,
+					idleFor:    ddlGateIdle,
 				}
 				// Shut the gate now, before Open returns, so no DDL runs ungated in
 				// the window before Run starts the watcher.

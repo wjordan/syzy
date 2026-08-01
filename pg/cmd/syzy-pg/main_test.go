@@ -181,6 +181,7 @@ func TestTwoSidecarsConvergeDDLOverTCP(t *testing.T) {
 	addr0 := fmt.Sprintf("127.0.0.1:%d", port0)
 	addr1 := fmt.Sprintf("127.0.0.1:%d", port1)
 	slAddr := fmt.Sprintf("127.0.0.1:%d", slPort)
+	bucket := "file://" + filepath.Join(tmp, "bucket")
 
 	startCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -189,6 +190,7 @@ func TestTwoSidecarsConvergeDDLOverTCP(t *testing.T) {
 	p0 := startSidecar(t, startCtx, binPath, sidecarArgs{
 		db: db0, origin: 1, listen: addr0, seeds: []string{addr1},
 		dataDir:         filepath.Join(tmp, "n0"),
+		bucket:          bucket,
 		ddl:             true,
 		schemaLog:       filepath.Join(tmp, "schema.db"),
 		schemaLogListen: slAddr,
@@ -197,6 +199,7 @@ func TestTwoSidecarsConvergeDDLOverTCP(t *testing.T) {
 	p1 := startSidecar(t, startCtx, binPath, sidecarArgs{
 		db: db1, origin: 2, listen: addr1, seeds: []string{addr0},
 		dataDir:       filepath.Join(tmp, "n1"),
+		bucket:        bucket,
 		ddl:           true,
 		schemaLogDial: slAddr,
 	})
@@ -326,6 +329,7 @@ type sidecarArgs struct {
 	listen  string
 	seeds   []string
 	dataDir string
+	bucket  string
 
 	// DDL mode: when set, the sidecar runs with -ddl (no -tables) and the
 	// schema-log flags below instead of the static public.kv replicated set.
@@ -357,6 +361,9 @@ func startSidecar(t *testing.T, ctx context.Context, bin string, a sidecarArgs) 
 		"-cluster-id", testClusterID,
 		"-data-dir", a.dataDir,
 		"-listen", a.listen,
+	}
+	if a.bucket != "" {
+		args = append(args, "-bucket", a.bucket)
 	}
 	if a.ddl {
 		args = append(args, "-ddl")

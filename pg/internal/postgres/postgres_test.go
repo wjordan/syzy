@@ -909,6 +909,9 @@ func TestAutoIncrementPartition(t *testing.T) {
 	// Each node inserts with a DEFAULT id from its own partitioned sequence.
 	appExec(t, "syzy_pa", `INSERT INTO public.items (name) VALUES ('from-a')`)
 	appExec(t, "syzy_pb", `INSERT INTO public.items (name) VALUES ('from-b')`)
+	if err := partitionSequences(ctx, a.appl.conn, a.cat, 1, true); err != nil {
+		t.Fatalf("recheck partitioned sequence: %v", err)
+	}
 
 	slice := int64(1) << idPartitionBits
 	if idA := onlyKey(t, dumpItems(t, "syzy_pa")); idA != 1*slice {
@@ -928,6 +931,33 @@ func TestAutoIncrementPartition(t *testing.T) {
 	}
 	if len(da) != 2 {
 		t.Fatalf("expected 2 rows, got %d: %v", len(da), da)
+	}
+}
+
+func TestPartitionRejectsUsedUnpartitionedSequence(t *testing.T) {
+	requirePG(t)
+	ctx := context.Background()
+	const db = "syzy_used_seq"
+	createTestDB(t, ctx, db, `CREATE TABLE public.items (id bigserial PRIMARY KEY, name text);
+		INSERT INTO public.items (name) VALUES ('existing')`)
+	e, err := Open(ctx, Config{
+		Name:        pgDB(db),
+		Origin:      62,
+		Cluster:     crdt.ClusterID{0x79},
+		Cache:       nodestate.New(62),
+		ConnURL:     dbURL(db),
+		ReplConnURL: replURL(db),
+		Publication: "syzy_pub",
+		Slot:        slotName(db),
+		OriginName:  originName(db),
+		Tables:      []string{"public.items"},
+		NodeOrdinal: 1,
+	})
+	if e != nil {
+		closeEngine(t, ctx, e)
+	}
+	if err == nil || !strings.Contains(err.Error(), "used before node partitioning") {
+		t.Fatalf("Open error = %v, want used-sequence rejection", err)
 	}
 }
 

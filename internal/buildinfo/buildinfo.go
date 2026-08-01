@@ -60,8 +60,11 @@ var Version = sync.OnceValue(func() string {
 	return "devel+" + rev[:min(12, len(rev))] + dirty
 })
 
-// Full returns the multi-line form printed by `syzy version`.
-func Full() string {
-	return fmt.Sprintf("syzy %s\n%s %s/%s\n",
+// FullFor returns the multi-line version report for command.
+func FullFor(command string) string {
+	return fmt.Sprintf("%s %s\n%s %s/%s\n", command,
 		Version(), runtime.Version(), runtime.GOOS, runtime.GOARCH)
 }
+
+// Full returns the multi-line form printed by `syzy version`.
+func Full() string { return FullFor("syzy") }
