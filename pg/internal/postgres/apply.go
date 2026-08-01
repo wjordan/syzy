@@ -111,6 +111,10 @@ func (a *applier) apply(ctx context.Context, cs *crdt.Changeset, force bool) err
 	// applied to the Cache only after the apply tx commits, so a rolled-back
 	// apply leaves no stamp the loser-null UPDATE didn't also undo.
 	var cellStamps []cellStamp
+	// conflicts accumulates the arbitrations that discarded committed values, in
+	// either direction; they are written to the audit table (§9) in this same
+	// transaction, so the record cannot outlive or precede the overwrite.
+	var conflicts []conflict
 
 	for _, r := range records {
 		h := r.Header()
@@ -131,6 +135,16 @@ func (a *applier) apply(ctx context.Context, cs *crdt.Changeset, force bool) err
 		}
 		rs := cache.RowState(h.Table, h.PK)
 		prevCL := rs.CL
+		// Conflict audit (§9): only a row another origin has written can lose
+		// anything to this changeset, so the pre-image read that tells us WHICH
+		// values are about to be discarded is paid on contended rows alone.
+		var preImage []crdt.ColValue
+		if writtenByOtherOrigin(rs, cs.Stamp) {
+			preImage, err = readRowImage(ctx, tx, ti, h.PK)
+			if err != nil {
+				return fmt.Errorf("conflict log: read pre-image %s: %w", ti.name, err)
+			}
+		}
 		// Cell-group dispatch (§8): an Update — and a same-generation Insert,
 		// which is an UPSERT-update — arbitrates per column. Delete and a
 		// CL-bumping Insert stay on the row-level path. A record carrying counter
@@ -139,12 +153,15 @@ func (a *applier) apply(ctx context.Context, cs *crdt.Changeset, force bool) err
 		if ti.cellGroup() {
 			if upd, isCell := crdt.AsCellUpdate(ti, r, rs); isCell {
 				if h.CL < rs.CL || (!updateHasCounter(upd) && !rs.DominatedBy(h.CL, cs.Stamp)) {
+					conflicts = append(conflicts, inboundLosses(ti, r, rs, cs.Stamp, h.CL)...)
 					continue
 				}
 				out, err := a.applyCellUpdate(ctx, tx, cache, ti, upd, rs, cs.Stamp, prevCL > 0 && h.CL > prevCL)
 				if err != nil {
 					return err
 				}
+				conflicts = append(conflicts, inboundLosses(ti,
+					crdt.Update{Table: h.Table, PK: h.PK, CL: h.CL, Changed: out.lost}, rs, cs.Stamp, h.CL)...)
 				if !out.applied {
 					continue
 				}
@@ -159,10 +176,12 @@ func (a *applier) apply(ctx context.Context, cs *crdt.Changeset, force bool) err
 				if img != nil {
 					pendingWinners = append(pendingWinners, pendingWinner{h.Table, h.PK, h.CL, img, out.winnerCols})
 				}
+				conflicts = append(conflicts, localLosses(ti, h.PK, preImage, img, rs, cs.Stamp, h.CL, "update")...)
 				continue
 			}
 		}
 		if !rs.DominatedBy(h.CL, cs.Stamp) {
+			conflicts = append(conflicts, inboundLosses(ti, r, rs, cs.Stamp, h.CL)...)
 			continue // local/seen write dominates
 		}
 		if ins, isIns := r.(crdt.Insert); isIns {
@@ -215,18 +234,29 @@ func (a *applier) apply(ctx context.Context, cs *crdt.Changeset, force bool) err
 			return fmt.Errorf("apply %T %s: %w", r, ti.name, err)
 		}
 		done = append(done, rowClockWrite{tid: h.Table, pk: h.PK, state: crdt.RowState{CL: h.CL, Base: cs.Stamp}})
+		postImage := winnerInsertImg
+		op := "insert"
 		switch {
 		case winnerInsertImg != nil:
 			pendingWinners = append(pendingWinners, pendingWinner{h.Table, h.PK, h.CL, winnerInsertImg, nil})
 		case winnerUpdate:
+			op = "update"
 			img, err := readRowImage(ctx, tx, ti, h.PK)
 			if err != nil {
 				return fmt.Errorf("winner-repair: read post-UPSERT row %s: %w", ti.name, err)
 			}
+			postImage = img
 			if img != nil {
 				pendingWinners = append(pendingWinners, pendingWinner{h.Table, h.PK, h.CL, img, nil})
 			}
+		default:
+			// A winning Delete: the row is gone, so every value it held is lost.
+			op, postImage = "delete", nil
 		}
+		conflicts = append(conflicts, localLosses(ti, h.PK, preImage, postImage, rs, cs.Stamp, h.CL, op)...)
+	}
+	if err := writeConflicts(ctx, tx, conflicts); err != nil {
+		return err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -292,6 +322,7 @@ func (a *applier) applySelfCorrect(ctx context.Context, ops []selfCorrectOp) err
 		return fmt.Errorf("postgres: self-correct begin: %w", err)
 	}
 	defer tx.Rollback(ctx)
+	var conflicts []conflict
 	for _, op := range ops {
 		ti := a.cat.table(op.tid)
 		if ti == nil {
@@ -304,6 +335,15 @@ func (a *applier) applySelfCorrect(ctx context.Context, ops []selfCorrectOp) err
 		if _, err := tx.Exec(ctx, sql); err != nil {
 			return fmt.Errorf("postgres: self-correct upsert: %w", err)
 		}
+		// This repair is the one place a LOCAL committed write is discarded
+		// outright, so it is exactly what the audit log exists to show (§9).
+		if c, ok := newConflict(ti, op.pk, true, lostColumns(ti, op.lost, nil),
+			op.winner, op.winnerCL, op.loser, op.loserCL, "update"); ok {
+			conflicts = append(conflicts, c)
+		}
+	}
+	if err := writeConflicts(ctx, tx, conflicts); err != nil {
+		return err
 	}
 	return tx.Commit(ctx)
 }

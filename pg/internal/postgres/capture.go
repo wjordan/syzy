@@ -641,6 +641,13 @@ type selfCorrectOp struct {
 	tid   crdt.TableID
 	pk    crdt.PKBlob
 	image []crdt.ColValue
+	// The audit facts for the local write this repair discards (§9): the values
+	// dropped, and the two stamps that arbitrated.
+	lost     []crdt.ColValue
+	winner   crdt.Stamp
+	winnerCL uint64
+	loser    crdt.Stamp
+	loserCL  uint64
 }
 
 func (c *capturer) foldCommit(t *txnAccum) (*crdt.Changeset, *localFold, error) {
@@ -792,6 +799,7 @@ func (c *capturer) foldCommit(t *txnAccum) (*crdt.Changeset, *localFold, error) 
 						if len(lost) > 0 {
 							selfCorrect = append(selfCorrect, selfCorrectOp{
 								tid: a.tid, pk: a.pk, image: repairImage(ti, w.Image, lost),
+								lost: lost, winner: w.Stamp, winnerCL: w.CL, loser: stampOnce(), loserCL: cl,
 							})
 						}
 						if len(kept) == 0 {
@@ -800,7 +808,8 @@ func (c *capturer) foldCommit(t *txnAccum) (*crdt.Changeset, *localFold, error) 
 						upd.Changed = kept
 						rec = upd
 					} else {
-						selfCorrect = append(selfCorrect, selfCorrectOp{tid: a.tid, pk: a.pk, image: w.Image})
+						selfCorrect = append(selfCorrect, selfCorrectOp{tid: a.tid, pk: a.pk, image: w.Image,
+							lost: localValues(rec), winner: w.Stamp, winnerCL: w.CL, loser: stampOnce(), loserCL: cl})
 						continue
 					}
 				} else {

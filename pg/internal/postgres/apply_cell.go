@@ -31,6 +31,9 @@ type cellOutcome struct {
 	// winnerCols is the column set the winning record arbitrated for, stashed
 	// with the winner image so a losing local fold repairs exactly these columns.
 	winnerCols map[crdt.ColumnID]struct{}
+	// lost is the columns this record carried that lost their per-column gate —
+	// the values discarded on the inbound side, for the conflict log (§9).
+	lost []crdt.ColValue
 }
 
 // rowClockWrite is one row's post-commit clock advance: the state to publish
@@ -67,7 +70,9 @@ func (a *applier) applyCellUpdate(ctx context.Context, tx pgx.Tx, cache *nodesta
 			if v.Format == crdt.FormatDelta ||
 				stamp.Dominates(rs.EffectiveStamp(v.Column, crdt.ByteRange{})) {
 				winners = append(winners, v)
+				continue
 			}
+			out.lost = append(out.lost, v)
 		}
 		if len(winners) == 0 {
 			return out, nil

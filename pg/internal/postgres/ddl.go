@@ -18,16 +18,23 @@ var genIDSQL string
 //go:embed sql/counter.sql
 var counterSQL string
 
-// installCounterSupport creates the syzy_counter domain (the cell-group /
-// counter declaration, §8) and the syzy_applied exactly-once marker table.
-// Unconditional — unlike DDL replication, a counter column can arrive on a
-// pre-created bootstrap table — and guarded by syzy.internal so its own DDL
+//go:embed sql/conflicts.sql
+var conflictsSQL string
+
+// installSidecarTables creates the node-local support objects every engine has,
+// with or without DDL replication: the syzy_counter domain and syzy_applied
+// marker (§8) and the syzy_conflicts audit table (§9). Unconditional — a
+// counter column can arrive on a pre-created bootstrap table, and a conflict
+// can happen on the first apply — and guarded by syzy.internal so its own DDL
 // writes no intent rows on a node that already has the event triggers.
-func installCounterSupport(ctx context.Context, conn *pgx.Conn) error {
+func installSidecarTables(ctx context.Context, conn *pgx.Conn) error {
 	if _, err := conn.Exec(ctx, `SET syzy.internal = 'on'`); err != nil {
 		return err
 	}
 	_, execErr := conn.Exec(ctx, counterSQL)
+	if execErr == nil {
+		_, execErr = conn.Exec(ctx, conflictsSQL)
+	}
 	if _, err := conn.Exec(ctx, `SET syzy.internal = 'off'`); err != nil && execErr == nil {
 		execErr = err
 	}

@@ -306,12 +306,40 @@ quarantines the changeset deterministically.
 
 ## 9. Conflict observability
 
-Every arbitration that overrides a committed write is recorded to a bounded
-audit table: table, primary key, columns, winner and loser origin and stamp,
-and the losing values. Because the model carries causal length, the log can
-state *precisely* whether two writes were genuinely concurrent (equal causal
-length, different origins) or one was simply stale — a distinction
-timestamp-only conflict logs cannot make.
+Every arbitration that discards a committed write is recorded to
+`public.syzy_conflicts` — **in the transaction that discards it**, so the
+audit row is exactly as durable as the overwrite and can never describe a
+loss that rolled back.
+
+```sql
+SELECT at, tbl, pk, kind, loser_side, cols, lost_values
+FROM syzy_conflicts ORDER BY seq DESC LIMIT 20;
+```
+
+Each row carries the table, primary key, affected columns, the discarded
+values, and both writes' origin, stamp, and causal length. `loser_side` says
+whose write lost: `local` when an inbound write overrode values this node had
+committed, `inbound` when this node's state overrode a peer's. Both nodes in a
+conflict record it, from their own side.
+
+`kind` is where the causal length earns its place. A loser from an *older
+generation* (`superseded`) was overridden by a delete-and-recreate of the row;
+no policy could have preserved it, and it is not evidence of contention. A
+loser at the *same* generation from a different origin (`concurrent`) is a
+genuine clobber of a write nothing orders. A timestamp-only conflict log
+cannot separate those two — every override looks alike.
+
+The log is node-local (never replicated), bounded to the newest 10,000 rows by
+the writer, and read by nobody in the engine. Losses to the same origin are
+not recorded: an origin overwriting its own earlier value is ordinary
+sequential history, not a conflict.
+
+Three paths write to it, which together cover every place a value is dropped:
+an inbound record that loses arbitration, an inbound record that wins over
+locally committed values, and a local write dropped by winner-repair on the
+fold path. The pre-image read that identifies the *specific* overwritten
+values is taken only on rows another origin has actually written, so
+uncontended apply keeps its single round trip.
 
 ---
 
