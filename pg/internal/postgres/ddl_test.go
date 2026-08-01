@@ -192,21 +192,23 @@ func TestDDLIntentMultiStatementTxn(t *testing.T) {
 	e := openDDLEngine(t, ctx, "syzy_ddl_multi", 61, crdt.ClusterID{0xd2})
 	defer closeEngine(t, ctx, e)
 
-	// No PRIMARY KEY, so CREATE TABLE yields exactly one command-end row (no
-	// implicit PK-index event) — keeps the grouping assertion exact.
+	// CREATE TABLE reports two command-end rows (the table and its implicit PK
+	// index), then the ALTER: three commands, one transaction.
 	appTxn(t, "syzy_ddl_multi",
-		`CREATE TABLE public.m (id bigint)`,
+		`CREATE TABLE public.m (id bigint PRIMARY KEY)`,
 		`ALTER TABLE public.m ADD COLUMN x int`)
 
 	rows := ddlIntentRows(t, "syzy_ddl_multi")
-	if len(rows) != 2 {
-		t.Fatalf("got %d rows, want 2: %+v", len(rows), rows)
+	if len(rows) != 3 {
+		t.Fatalf("got %d rows, want 3: %+v", len(rows), rows)
 	}
-	if rows[0].txid != rows[1].txid {
-		t.Errorf("rows span txids %d/%d, want one (co-transactional)", rows[0].txid, rows[1].txid)
-	}
-	if rows[0].ordinal != 0 || rows[1].ordinal != 1 {
-		t.Errorf("ordinals = %d,%d, want 0,1", rows[0].ordinal, rows[1].ordinal)
+	for i, r := range rows {
+		if r.txid != rows[0].txid {
+			t.Errorf("row %d txid %d, want %d (co-transactional)", i, r.txid, rows[0].txid)
+		}
+		if r.ordinal != i {
+			t.Errorf("row %d ordinal = %d, want %d", i, r.ordinal, i)
+		}
 	}
 }
 
@@ -253,19 +255,19 @@ func TestDDLIntentCapturedAndPruned(t *testing.T) {
 		return nil
 	}
 
-	// No PRIMARY KEY → exactly one CREATE TABLE command-end (no implicit PK index).
-	appExec(t, "syzy_ddl_cap", `CREATE TABLE public.c (id bigint, a text)`)
+	// CREATE TABLE reports the table and its implicit PK index; then the ALTER.
+	appExec(t, "syzy_ddl_cap", `CREATE TABLE public.c (id bigint PRIMARY KEY, a text)`)
 	appExec(t, "syzy_ddl_cap", `ALTER TABLE public.c ADD COLUMN b int`)
 	_ = captureAllWithin(t, ctx, e, 800*time.Millisecond)
 
-	if len(got) != 2 {
-		t.Fatalf("captured %d DDL descriptors, want 2: %+v", len(got), got)
+	if len(got) != 3 {
+		t.Fatalf("captured %d DDL descriptors, want 3: %+v", len(got), got)
 	}
 	if got[0].commandTag != "CREATE TABLE" || got[0].objid == 0 || got[0].classid == 0 {
 		t.Errorf("descriptor0 = %+v, want CREATE TABLE with non-zero classid/objid", got[0])
 	}
-	if got[1].commandTag != "ALTER TABLE" {
-		t.Errorf("descriptor1 = %+v, want ALTER TABLE", got[1])
+	if got[2].commandTag != "ALTER TABLE" {
+		t.Errorf("descriptor2 = %+v, want ALTER TABLE", got[2])
 	}
 	// Consumed rows are pruned.
 	if rows := ddlIntentRows(t, "syzy_ddl_cap"); len(rows) != 0 {
@@ -514,10 +516,11 @@ func TestBuildCatalogOpAlterRenameOntoDroppedName(t *testing.T) {
 	}
 }
 
-// TestBuildCatalogOpAlterRejectsUnsupported: an attribute-only change (ALTER
-// COLUMN TYPE) is not yet a typed op, so the diff rejects it cleanly rather than
-// silently dropping it (which would diverge). Increment G moves the rejection to
-// admission time.
+// TestBuildCatalogOpAlterRejectsUnsupported: the post-commit floor. With the
+// pre-command snapshot disabled — as on a node whose DDL support was installed
+// after the table already existed — admission has no prior shape to judge
+// against and lets the narrowing ALTER commit. Capture must then reject it
+// rather than silently drop it (which would diverge).
 func TestBuildCatalogOpAlterRejectsUnsupported(t *testing.T) {
 	requirePG(t)
 	ctx := context.Background()
@@ -530,6 +533,7 @@ func TestBuildCatalogOpAlterRejectsUnsupported(t *testing.T) {
 
 	appExec(t, "syzy_ddl_reject", `CREATE TABLE public.w (id bigint PRIMARY KEY, a text)`)
 	_ = captureAllWithin(t, ctx, e, 800*time.Millisecond)
+	appExec(t, "syzy_ddl_reject", `ALTER EVENT TRIGGER syzy_ddl_snapshot DISABLE`)
 	appExec(t, "syzy_ddl_reject", `ALTER TABLE public.w ALTER COLUMN a TYPE varchar(20)`)
 	_ = captureAllWithin(t, ctx, e, 800*time.Millisecond)
 
@@ -1783,10 +1787,13 @@ func TestSchemaUnhealthyOnUnreplicableDDL(t *testing.T) {
 	}
 	e1 := openDDLEngineLogMeta(t, ctx, db, origin, cluster, 0, log, meta1)
 
-	// A replicated table with no primary key cannot converge — buildCreateTableOp
-	// rejects it. The DDL commits physically before capture sees it, so the only
-	// safe response post-commit is to halt schema-unhealthy.
-	appExec(t, db, `CREATE TABLE public.nopk (a int, b text)`)
+	// A partial UNIQUE index cannot converge — its predicate's truth varies per
+	// replica, so captureUniqueKeys rejects it. Admission has no pre-commit rule
+	// for it (the index is only judged once the sidecar reads the catalog), so
+	// the DDL commits physically and the only safe response is to halt
+	// schema-unhealthy.
+	appExec(t, db, `CREATE TABLE public.part (id bigint PRIMARY KEY, a text)`)
+	appExec(t, db, `CREATE UNIQUE INDEX part_a_uq ON public.part (a) WHERE a IS NOT NULL`)
 
 	cctx, cancel := context.WithTimeout(ctx, 800*time.Millisecond)
 	defer cancel()
@@ -2183,7 +2190,7 @@ func TestLiveCreateViewConvergence(t *testing.T) {
 // TestBuildCatalogOpRejectsFunction: a CREATE FUNCTION is not replicated — its
 // determinism/side-effects aren't modeled and a replicated DEFAULT/GENERATED
 // could reference it — so the op-builder rejects it as admission-class.
-func TestBuildCatalogOpRejectsFunction(t *testing.T) {
+func TestLocalOnlyDDLIsSkipped(t *testing.T) {
 	requirePG(t)
 	ctx := context.Background()
 	const db = "syzy_fnreject"
@@ -2194,11 +2201,57 @@ func TestBuildCatalogOpRejectsFunction(t *testing.T) {
 	var buildErr error
 	catalogOpCollector(t, ctx, e, db, &ops, &buildErr)
 
-	appExec(t, db, `CREATE FUNCTION public.addone(x int) RETURNS int LANGUAGE sql AS 'SELECT x + 1'`)
+	for _, sql := range []string{
+		`CREATE FUNCTION public.addone(x int) RETURNS int LANGUAGE sql AS 'SELECT x + 1'`,
+		`CREATE SEQUENCE public.loose_seq`,
+		`CREATE TYPE public.mood AS ENUM ('ok', 'bad')`,
+		`CREATE SCHEMA staging`,
+		`CREATE TABLE staging.notreplicated (a int)`,
+		`CREATE EXTENSION IF NOT EXISTS pg_trgm`,
+		`COMMENT ON TABLE public.kv IS 'local note'`,
+		`GRANT SELECT ON public.kv TO postgres`,
+		`CREATE TRIGGER kv_tg BEFORE UPDATE ON public.kv FOR EACH ROW EXECUTE FUNCTION suppress_redundant_updates_trigger()`,
+	} {
+		appExec(t, db, sql)
+	}
 	_ = captureAllWithin(t, ctx, e, 800*time.Millisecond)
 
-	if !errors.Is(buildErr, errUnsupportedDDL) {
-		t.Fatalf("CREATE FUNCTION should be rejected as admission-class, got %v", buildErr)
+	if buildErr != nil {
+		t.Fatalf("local-only DDL halted the node: %v", buildErr)
+	}
+	if len(ops) != 0 {
+		t.Fatalf("local-only DDL produced %d ops, want none: %+v", len(ops), ops)
+	}
+	if rows := ddlIntentRows(t, db); len(rows) != 0 {
+		t.Fatalf("local-only DDL spooled %d intent rows, want none: %+v", len(rows), rows)
+	}
+}
+
+// TestAdmissionRejectsUnreplicableTable: shapes a replicated table can never
+// have are refused before the CREATE commits.
+func TestAdmissionRejectsUnreplicableTable(t *testing.T) {
+	requirePG(t)
+	ctx := context.Background()
+	const db = "syzy_tblreject"
+	e := openDDLEngine(t, ctx, db, 116, crdt.ClusterID{0xfb})
+	defer closeEngine(t, ctx, e)
+
+	appExec(t, db, `CREATE TYPE public.mood AS ENUM ('ok', 'bad')`)
+	for _, tc := range []struct{ sql, want string }{
+		{`CREATE TABLE public.nopk (a int, b text)`, "requires a PRIMARY KEY"},
+		{`CREATE TABLE public.parted (id bigint, d date, PRIMARY KEY (id, d)) PARTITION BY RANGE (d)`, "partitioned tables"},
+		{`CREATE TABLE public.enums (id bigint PRIMARY KEY, m public.mood)`, "user-defined type"},
+		{`CREATE MATERIALIZED VIEW public.mv AS SELECT 1 AS x`, "not replicable"},
+		{`CREATE TABLE public.ctas AS SELECT 1 AS x`, "not replicable"},
+	} {
+		err := appExecErr(t, db, tc.sql)
+		if err == nil {
+			t.Errorf("%s committed, want a pre-commit rejection", tc.sql)
+			continue
+		}
+		if !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: error = %v, want it to mention %q", tc.sql, err, tc.want)
+		}
 	}
 }
 

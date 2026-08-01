@@ -155,6 +155,77 @@ func TestTwoSidecarsConvergeDDLOverTCP(t *testing.T) {
 		t.Logf("node 1 stderr:\n%s", p1.stderr())
 		t.Fatalf("waitForRow (DDL-created table): %v", err)
 	}
+
+	// Auto-increment PKs: each sidecar slices the bigint id space by its
+	// -origin, so two nodes inserting without ids cannot mint the same one.
+	pgExec(t, db0, `CREATE TABLE public.auto (id bigserial PRIMARY KEY, val text)`)
+	pgExec(t, db0, `INSERT INTO public.auto (val) VALUES ('n0')`)
+	// Node 1 must have applied the CREATE (and partitioned its own sequence)
+	// before it inserts, so wait for node 0's row to land there first.
+	if err := waitForAuto(db1, map[string]bool{"n0": true}, 30*time.Second); err != nil {
+		t.Logf("node 1 stderr:\n%s", p1.stderr())
+		t.Fatalf("bigserial table never reached node 1: %v", err)
+	}
+	pgExec(t, db1, `INSERT INTO public.auto (val) VALUES ('n1')`)
+	both := map[string]bool{"n0": true, "n1": true}
+	for _, db := range []string{db0, db1} {
+		if err := waitForAuto(db, both, 30*time.Second); err != nil {
+			t.Logf("node 0 stderr:\n%s\nnode 1 stderr:\n%s", p0.stderr(), p1.stderr())
+			t.Fatalf("auto rows did not converge on %s: %v", db, err)
+		}
+	}
+}
+
+// waitForAuto polls public.auto until its val set matches want, and fails fast
+// if the two nodes minted the same id.
+func waitForAuto(db string, want map[string]bool, deadline time.Duration) error {
+	end := time.Now().Add(deadline)
+	var last map[int64]string
+	for time.Now().Before(end) {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		rows, err := selectAuto(ctx, db)
+		cancel()
+		if err == nil {
+			last = rows
+			vals := map[string]bool{}
+			for _, v := range rows {
+				vals[v] = true
+			}
+			if len(rows) == len(want) && len(vals) == len(want) {
+				for v := range want {
+					if !vals[v] {
+						return fmt.Errorf("public.auto on %s = %v, want vals %v", db, rows, want)
+					}
+				}
+				return nil // distinct ids by construction: rows is keyed by id
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("public.auto on %s = %v, want vals %v within %s", db, last, want, deadline)
+}
+
+func selectAuto(ctx context.Context, db string) (map[int64]string, error) {
+	c, err := pgx.Connect(ctx, pgtest.URL()+db)
+	if err != nil {
+		return nil, err
+	}
+	defer c.Close(ctx)
+	rows, err := c.Query(ctx, `SELECT id, val FROM public.auto`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int64]string{}
+	for rows.Next() {
+		var id int64
+		var val string
+		if err := rows.Scan(&id, &val); err != nil {
+			return nil, err
+		}
+		out[id] = val
+	}
+	return out, rows.Err()
 }
 
 // --- helpers ---

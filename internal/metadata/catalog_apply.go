@@ -38,6 +38,11 @@ func (tx *Tx) ApplyCatalogOp(op crdt.CatalogOp, schemaSeq uint64) error {
 		return catApplyAddUniqueKey(tx, op, schemaSeq)
 	case crdt.OpDropUniqueKey:
 		return catApplyDropUniqueKey(tx, op, schemaSeq)
+	case crdt.OpAlterColumn:
+		// The attributes an ALTER COLUMN carries (type, default, NOT NULL) are
+		// engine-local; this catalog records a column's identity, ordinal, clock
+		// group and collation, none of which the op moves.
+		return nil
 	case crdt.OpCreateIndex, crdt.OpDropIndex,
 		crdt.OpCreateView, crdt.OpDropView,
 		crdt.OpCreateVirtualTable, crdt.OpDropVirtualTable:

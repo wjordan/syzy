@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -252,7 +253,7 @@ func buildAlterTableOps(ctx context.Context, conn *pgx.Conn, cat *catalog, in dd
 	}
 	live := make(map[int]bool, len(pgcols))
 
-	var renames, adds []crdt.CatalogOp
+	var renames, adds, alters []crdt.CatalogOp
 	var newCols []*colInfo
 	for _, pc := range pgcols {
 		live[pc.attnum] = true
@@ -274,8 +275,21 @@ func buildAlterTableOps(ctx context.Context, conn *pgx.Conn, cat *catalog, in dd
 			})
 			continue
 		}
-		if pc.attrsDiffer(ci) {
-			return nil, unsupportedDDLf("postgres: ALTER TABLE %s: column %q attribute change (type/default/not-null/generated/pk) is not yet representable as a typed op (increment G)", ti.name, pc.name)
+		changed, err := classifyColumnChange(ti.name, ci, pc)
+		if err != nil {
+			return nil, err
+		}
+		if changed {
+			// The op carries the column's whole desired attribute state, not a
+			// delta, so a follower reaches it with one idempotent apply. This
+			// node's live column is already there (the ALTER committed), so only
+			// the cache moves.
+			alters = append(alters, crdt.CatalogOp{
+				Kind:    crdt.OpAlterColumn,
+				TableID: ti.tid,
+				Columns: []crdt.CatalogColumn{pc.catalogColumn(ci.cid, pc.attnum-1)},
+			})
+			ci.setAttrs(pc.typeName, pc.def, pc.notNull)
 		}
 		if ci.name != pc.name {
 			renames = append(renames, crdt.CatalogOp{
@@ -317,6 +331,7 @@ func buildAlterTableOps(ctx context.Context, conn *pgx.Conn, cat *catalog, in dd
 	ops = append(ops, renames...)
 	ops = append(ops, drops...)
 	ops = append(ops, adds...)
+	ops = append(ops, alters...)
 	ops = append(ops, uqOps...)
 	return ops, nil
 }
@@ -823,15 +838,93 @@ func (pc pgColumn) colInfo(id crdt.ColumnID) *colInfo {
 	}
 }
 
-// attrsDiffer reports whether the live column carries a replicated attribute
-// (type, not-null, default, generated, PK membership) that differs from the
-// cached ci — i.e. a change beyond a pure rename that the ALTER diff cannot yet
-// express as a typed op.
-func (pc pgColumn) attrsDiffer(ci *colInfo) bool {
-	return pc.typeName != ci.typeName ||
-		pc.notNull != ci.notNull ||
-		pc.def != ci.def ||
-		pc.generated != ci.generated ||
-		pc.identity != ci.identity ||
-		(pc.pkpos > 0) != ci.isPK
+// setAttrs moves the cached replicated attributes to the state an
+// OpAlterColumn carries. The originator calls it once it has emitted the op
+// (its live column is already there); a follower calls it once the ALTERs the
+// op renders have run.
+func (ci *colInfo) setAttrs(typeName, def string, notNull bool) {
+	ci.typeName, ci.def, ci.notNull = typeName, def, notNull
+}
+
+// classifyColumnChange decides what an ALTER TABLE did to one existing column:
+// changed reports whether a typed OpAlterColumn must be emitted, and an
+// errUnsupportedDDL error rejects a change that cannot converge.
+//
+// The dividing line is that a replicated schema change may only RELAX the
+// column, never restrict it. A row written on a peer before that peer applied
+// the change is already in flight, carrying values that were legal under the
+// OLD shape; apply must accept it (the changeset's schema dependency only
+// orders writes made AFTER the change). So widening a type, dropping NOT NULL
+// and changing a default all replicate, while narrowing a type or adding NOT
+// NULL would make an in-flight row unappliable — a node that took one would
+// halt forever, so they are rejected at the origin instead. Defaults are
+// origin-evaluated only (apply always supplies every column), so they carry no
+// convergence risk at all; they replicate to keep local writes identical
+// everywhere.
+func classifyColumnChange(tname string, ci *colInfo, pc pgColumn) (bool, error) {
+	switch {
+	case pc.generated != ci.generated:
+		return false, unsupportedDDLf("postgres: ALTER TABLE %s: adding or dropping a GENERATED expression on column %q recomputes every row from a node-local evaluation and is not supported", tname, pc.name)
+	case pc.identity != ci.identity:
+		return false, unsupportedDDLf("postgres: ALTER TABLE %s: changing IDENTITY on column %q mints divergent per-node values and is not supported", tname, pc.name)
+	case (pc.pkpos > 0) != ci.isPK:
+		return false, unsupportedDDLf("postgres: ALTER TABLE %s: changing PRIMARY KEY membership of column %q changes row identity and is not supported", tname, pc.name)
+	case pc.notNull && !ci.notNull:
+		return false, unsupportedDDLf("postgres: ALTER TABLE %s: SET NOT NULL on column %q cannot replicate — a NULL written on a peer before it applied the change is already in flight and would fail apply here permanently; declare the column NOT NULL when it is created", tname, pc.name)
+	case pc.typeName != ci.typeName && !typeWidens(ci.typeName, pc.typeName):
+		return false, unsupportedDDLf("postgres: ALTER TABLE %s: changing column %q from %s to %s is not a widening conversion — values already in flight under the old type could not be applied", tname, pc.name, ci.typeName, pc.typeName)
+	case pc.def != ci.def && strings.HasPrefix(pc.def, "nextval("):
+		return false, unsupportedDDLf("postgres: ALTER TABLE %s: DEFAULT nextval(…) on column %q names a node-local sequence and cannot replicate", tname, pc.name)
+	}
+	return pc.typeName != ci.typeName || pc.notNull != ci.notNull || pc.def != ci.def, nil
+}
+
+// intWidth ranks the integer types by width so a cast to a wider one is
+// recognized as lossless.
+var intWidth = map[string]int{"smallint": 1, "integer": 2, "bigint": 3}
+
+// typeWidens reports whether every value of format_type() type from is also a
+// value of to — the only kind of ALTER COLUMN TYPE that can replicate (see
+// classifyColumnChange). Conservative: an unrecognized pair is not a widening.
+func typeWidens(from, to string) bool {
+	fb, fm := splitTypeMod(from)
+	tb, tm := splitTypeMod(to)
+	switch {
+	case fb == tb:
+		switch fb {
+		case "character varying":
+			// varchar(n) → varchar(m>n), or → unlimited varchar.
+			return len(tm) == 0 || (len(fm) == 1 && len(tm) == 1 && tm[0] > fm[0])
+		case "numeric":
+			// numeric(p,s) → numeric(p'≥p, s), or → unconstrained numeric.
+			return len(tm) == 0 || (len(fm) == 2 && len(tm) == 2 && tm[1] == fm[1] && tm[0] >= fm[0])
+		}
+		return false
+	case fb == "character varying" && tb == "text":
+		return true
+	case fb == "real" && tb == "double precision":
+		return true
+	default:
+		return intWidth[fb] > 0 && intWidth[tb] > intWidth[fb]
+	}
+}
+
+// splitTypeMod splits a format_type() name into its base name and integer
+// modifiers: "character varying(20)" → ("character varying", [20]). A
+// non-numeric modifier (none exist among the widenable types) yields no
+// modifiers, which every rule above treats as unrecognized.
+func splitTypeMod(t string) (string, []int) {
+	open := strings.IndexByte(t, '(')
+	if open < 0 || !strings.HasSuffix(t, ")") {
+		return t, nil
+	}
+	var mods []int
+	for _, f := range strings.Split(t[open+1:len(t)-1], ",") {
+		n, err := strconv.Atoi(strings.TrimSpace(f))
+		if err != nil {
+			return t[:open], nil
+		}
+		mods = append(mods, n)
+	}
+	return t[:open], mods
 }

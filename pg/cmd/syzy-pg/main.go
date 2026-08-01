@@ -50,7 +50,9 @@ Usage:
 
 Required:
   -conn URL          Postgres connection URL (e.g. postgres://user:pw@host:5432/db)
-  -origin N          this node's origin id (1..65535; unique per cluster, never reused)
+  -origin N          this node's origin id (1..65535; unique per cluster, never reused).
+                     Also slices the bigint id space, so auto-increment PKs
+                     (bigserial, IDENTITY) minted here cannot collide with a peer's
   -cluster-id HEX    32-character hex cluster id, shared across peers
   -data-dir PATH     local state: metadata, self-log, mirror
 
@@ -283,8 +285,15 @@ func run(args []string) error {
 		Registry:          uniqueReg,
 		ReserveSocketDir:  filepath.Join(cfg.dataDir, "reserve"),
 		DDL:               cfg.ddl,
-		SchemaLog:         schemaLog,
-		CheckpointEvery:   cfg.checkpointEvery,
+		// The origin id is already a cluster-unique, never-reused 1..65535
+		// node number, which is exactly what the id-space slice needs — so it
+		// doubles as the ordinal and auto-increment PKs (bigserial, IDENTITY)
+		// minted on different nodes cannot collide. No separate claim
+		// protocol, and no ordinal 0 (its low range stays reserved for the
+		// node that created a table through replicated DDL).
+		NodeOrdinal:     uint16(cfg.origin),
+		SchemaLog:       schemaLog,
+		CheckpointEvery: cfg.checkpointEvery,
 	})
 	if err != nil {
 		return fmt.Errorf("postgres engine open: %w", err)

@@ -75,6 +75,21 @@ func catalogOpGoldens() []catalogOpGolden {
 			framed: "c0040222000000000000000000000000000000010d0000000000000000000000000000000570686f6e6503045445585400000003726f7700",
 		},
 		{
+			// alter_column carries the column's whole desired attribute
+			// state and encodes at version 5 (its kind's minimum), which
+			// this vector pins: an older decoder must see 5 and fail
+			// closed rather than read the body at version 4.
+			name: "alter_column",
+			op: CatalogOp{
+				Kind:    OpAlterColumn,
+				TableID: tabID(0x22),
+				Columns: []CatalogColumn{
+					{ID: colID(0xD), Name: "phone", Ordinal: 3, Type: "TEXT", NotNull: true, Default: "''", ClockGroup: "row"},
+				},
+			},
+			framed: "c0051322000000000000000000000000000000010d0000000000000000000000000000000570686f6e65030454455854010002272703726f7700",
+		},
+		{
 			name:   "rename_table",
 			op:     CatalogOp{Kind: OpRenameTable, TableID: tabID(1), TableName: "people"},
 			legacy: "03010000000000000000000000000000000670656f706c65",
@@ -180,6 +195,11 @@ func catalogOpGoldens() []catalogOpGolden {
 // the same op.
 func TestCatalogOp_LegacyGolden(t *testing.T) {
 	for _, g := range catalogOpGoldens() {
+		if g.legacy == "" {
+			// A kind introduced after the framed envelope has no legacy
+			// shape — nothing durable was ever written in that layout.
+			continue
+		}
 		raw, err := hex.DecodeString(g.legacy)
 		if err != nil {
 			t.Fatalf("%s: bad hex: %v", g.name, err)

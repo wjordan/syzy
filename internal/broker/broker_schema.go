@@ -235,8 +235,11 @@ func (b *Broker) ReconcileSchemaToSQLite(ctx context.Context) (int, error) {
 		// beyond this binary (e.g. metadata restored from a newer node),
 		// and serving with catalog state we cannot interpret is the
 		// silent divergence this pass exists to prevent — fail closed.
+		// An unknown KIND says the same thing at finer grain: ops carry
+		// their kind's minimum version, so a kind we lack means a
+		// semantic op we would otherwise silently drop.
 		op, err := crdt.DecodeCatalogOp(e.CatalogOp)
-		if errors.Is(err, crdt.ErrCatalogOpVersion) {
+		if errors.Is(err, crdt.ErrCatalogOpVersion) || errors.Is(err, crdt.ErrCatalogOpKind) {
 			return repaired, b.markSchemaUnhealthy(e.SchemaSeq,
 				fmt.Errorf("reconcile decode seq=%d: %w", e.SchemaSeq, err))
 		}

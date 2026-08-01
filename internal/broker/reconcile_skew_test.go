@@ -253,9 +253,11 @@ func TestReconcileSchemaToSQLite_FailsClosedOnFutureVersionOp(t *testing.T) {
 		t.Fatalf("seed catch-up: %v", err)
 	}
 
-	// Framed envelope with version catalogOpMaxVersion+1: sentinel,
-	// uvarint version 5, uvarint kind (DropTable), 16-byte table id.
-	future := append([]byte{0xC0, 5, byte(crdt.OpDropTable)}, make([]byte, 16)...)
+	// Framed envelope one version beyond what this build decodes:
+	// sentinel, uvarint version, uvarint kind (DropTable), 16-byte table
+	// id. Derived from the constant so adding a wire version cannot
+	// quietly turn this into a test of a SUPPORTED version.
+	future := append([]byte{0xC0, crdt.MaxCatalogOpVersion + 1, byte(crdt.OpDropTable)}, make([]byte, 16)...)
 	f.corruptSchemaEventOp(t, 1, future)
 
 	if _, err := f.br.ReconcileSchemaToSQLite(ctx); !errors.Is(err, ErrSchemaUnhealthy) {
@@ -263,6 +265,32 @@ func TestReconcileSchemaToSQLite_FailsClosedOnFutureVersionOp(t *testing.T) {
 	}
 	if _, unhealthy, err := f.br.cfg.Meta.GetSchemaHealth(); err != nil || !unhealthy {
 		t.Fatalf("schema health after future-version op: unhealthy=%v err=%v; want durable fail-closed marker", unhealthy, err)
+	}
+}
+
+// An op whose KIND this build lacks must halt too. Ops encode at their kind's
+// minimum version, so a peer can legitimately send a kind we do not know at a
+// version we do — skipping it would apply a partial catalog and diverge.
+func TestReconcileSchemaToSQLite_FailsClosedOnUnknownOpKind(t *testing.T) {
+	t.Parallel()
+	f := newCatchupFixture(t)
+	ctx := context.Background()
+
+	f.appendCreateTable(t, 0, "t")
+	if err := f.br.runSchemaCatchup(ctx); err != nil {
+		t.Fatalf("seed catch-up: %v", err)
+	}
+
+	// Kind 200 is in the unassigned range (64+) and will not be allocated
+	// out from under this test the way a low kind might.
+	unknown := append([]byte{0xC0, crdt.MaxCatalogOpVersion, 200}, make([]byte, 16)...)
+	f.corruptSchemaEventOp(t, 1, unknown)
+
+	if _, err := f.br.ReconcileSchemaToSQLite(ctx); !errors.Is(err, ErrSchemaUnhealthy) {
+		t.Fatalf("ReconcileSchemaToSQLite err = %v; want ErrSchemaUnhealthy (fail closed)", err)
+	}
+	if _, unhealthy, err := f.br.cfg.Meta.GetSchemaHealth(); err != nil || !unhealthy {
+		t.Fatalf("schema health after unknown-kind op: unhealthy=%v err=%v; want durable fail-closed marker", unhealthy, err)
 	}
 }
 

@@ -39,9 +39,216 @@ CREATE OR REPLACE FUNCTION syzy_ddl_next_ordinal() RETURNS int
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
 DECLARE n int;
 BEGIN
-    n := COALESCE(current_setting('syzy.ddl_ordinal', true), '0')::int;
+    -- NULLIF, not just COALESCE: once a placeholder GUC has been set in a
+    -- session, reverting the transaction-local value leaves current_setting
+    -- returning '' rather than NULL — so every DDL transaction after the first
+    -- one on a connection would fail on ''::int.
+    n := COALESCE(NULLIF(current_setting('syzy.ddl_ordinal', true), ''), '0')::int;
     PERFORM set_config('syzy.ddl_ordinal', (n + 1)::text, true);  -- true = txn-local
     RETURN n;
+END $$;
+
+-- Admission (§6 G) needs the column shape the ALTER started from, and
+-- ddl_command_end sees only the finished catalog. So a ddl_command_start
+-- trigger — which runs before the command touches anything — records the
+-- pre-command shape of every replicated table in this backend's slot of
+-- syzy_ddl_prior. It is UNLOGGED and transaction-scoped in effect: a ROLLBACK
+-- discards the rows, decoding never sees them, and the next command in the same
+-- session replaces them. (The target relation is not known at command_start —
+-- pg_event_trigger_ddl_commands() is end-only and the SQL text is never parsed
+-- — hence the whole replicated schema.)
+CREATE UNLOGGED TABLE IF NOT EXISTS syzy_ddl_prior (
+    pid          int     NOT NULL,
+    relid        oid     NOT NULL,
+    attname      name    NOT NULL,
+    typename     text    NOT NULL,
+    is_notnull   boolean NOT NULL,
+    is_generated boolean NOT NULL,
+    identity     "char"  NOT NULL,
+    pkpos        int     NOT NULL,
+    PRIMARY KEY (pid, relid, attname)
+);
+
+CREATE OR REPLACE FUNCTION syzy_ddl_snapshot() RETURNS event_trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+BEGIN
+    IF current_setting('syzy.internal', true) = 'on' THEN RETURN; END IF;
+    DELETE FROM syzy_ddl_prior WHERE pid = pg_backend_pid();
+    -- Rows a backend left behind by disconnecting mid-DDL: reclaimed here
+    -- rather than by a background sweep.
+    DELETE FROM syzy_ddl_prior p
+    WHERE NOT EXISTS (SELECT 1 FROM pg_stat_activity s WHERE s.pid = p.pid);
+    INSERT INTO syzy_ddl_prior
+      (pid, relid, attname, typename, is_notnull, is_generated, identity, pkpos)
+    SELECT pg_backend_pid(), a.attrelid, a.attname,
+           format_type(a.atttypid, a.atttypmod), a.attnotnull,
+           a.attgenerated <> '', a.attidentity, COALESCE(k.pkpos, 0)
+    FROM pg_attribute a
+    JOIN pg_class c ON c.oid = a.attrelid AND c.relkind = 'r' AND c.relpersistence = 'p'
+    JOIN pg_namespace ns ON ns.oid = c.relnamespace AND ns.nspname = 'public'
+    LEFT JOIN LATERAL (
+        SELECT x.ord AS pkpos
+        FROM pg_index i, unnest(i.indkey) WITH ORDINALITY AS x(attnum, ord)
+        WHERE i.indrelid = a.attrelid AND i.indisprimary AND x.attnum = a.attnum
+    ) k ON true
+    WHERE a.attnum > 0 AND NOT a.attisdropped AND c.relname NOT LIKE 'syzy\_%';
+END $$;
+
+-- syzy_type_mods extracts a format_type() modifier list — "numeric(10,2)" → {10,2},
+-- anything without an all-numeric modifier → {}.
+CREATE OR REPLACE FUNCTION syzy_type_mods(t text) RETURNS int[]
+LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$
+    SELECT CASE WHEN t ~ '^[^(]+\([0-9]+(,[0-9]+)?\)$'
+                THEN string_to_array(substring(t from '\(([0-9,]+)\)'), ',')::int[]
+                ELSE '{}'::int[] END
+$$;
+
+-- syzy_type_widens: every value of v_from is also a value of v_to. The twin of
+-- typeWidens() in ddl_catalog.go — the two are held identical by a test that
+-- runs the same pairs through both.
+CREATE OR REPLACE FUNCTION syzy_type_widens(v_from text, v_to text) RETURNS boolean
+LANGUAGE plpgsql IMMUTABLE SET search_path = pg_catalog, public AS $$
+DECLARE
+    fb   text := split_part(v_from, '(', 1);
+    tb   text := split_part(v_to, '(', 1);
+    ints constant text[] := ARRAY['smallint', 'integer', 'bigint'];
+    fm   int[];
+    tm   int[];
+BEGIN
+    IF fb <> tb THEN
+        RETURN (fb = 'character varying' AND tb = 'text')
+            OR (fb = 'real' AND tb = 'double precision')
+            OR COALESCE(array_position(ints, tb) > array_position(ints, fb), false);
+    END IF;
+    IF fb NOT IN ('character varying', 'numeric') THEN
+        RETURN false;
+    END IF;
+    fm := syzy_type_mods(v_from);
+    tm := syzy_type_mods(v_to);
+    IF array_length(tm, 1) IS NULL THEN
+        RETURN true;  -- an unconstrained target holds every constrained value
+    END IF;
+    -- An unmodified source (array_length → NULL, e.g. bare "numeric") is not a
+    -- subset of a constrained target, so these must land on false, not NULL:
+    -- the caller treats NULL as "no rule matched" and would admit the change.
+    IF fb = 'character varying' THEN
+        RETURN COALESCE(array_length(fm, 1) = 1 AND array_length(tm, 1) = 1 AND tm[1] > fm[1], false);
+    END IF;
+    RETURN COALESCE(array_length(fm, 1) = 2 AND array_length(tm, 1) = 2
+                    AND tm[2] = fm[2] AND tm[1] >= fm[1], false);
+END $$;
+
+-- syzy_ddl_admit_table rejects a new table whose shape can never replicate. Its
+-- twin in the sidecar is buildCreateTableOp/rejectUnreplicable, which stays as
+-- the post-commit floor.
+CREATE OR REPLACE FUNCTION syzy_ddl_admit_table(rel oid) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+DECLARE
+    tname text := rel::regclass::text;
+    c     record;
+    bad   text;
+BEGIN
+    SELECT relkind, relispartition INTO c FROM pg_class WHERE oid = rel;
+    IF c.relkind = 'p' OR c.relispartition THEN
+        RAISE EXCEPTION 'syzy: CREATE TABLE %: partitioned tables are not supported', tname
+            USING ERRCODE = 'feature_not_supported';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_index WHERE indrelid = rel AND indisprimary) THEN
+        RAISE EXCEPTION 'syzy: CREATE TABLE %: a replicated table requires a PRIMARY KEY — rows are identified by it, and without one no write could be merged', tname
+            USING ERRCODE = 'feature_not_supported';
+    END IF;
+    -- A column of a user-defined type (enum, domain, composite, extension type)
+    -- would replicate as text into a type the receiving node may not have — and
+    -- an enum that later gains a value on one node only would fail apply there
+    -- forever. Built-in types (and arrays of them) live in pg_catalog.
+    SELECT string_agg(format('%I %s', a.attname, format_type(a.atttypid, a.atttypmod)), ', ')
+      INTO bad
+      FROM pg_attribute a
+      JOIN pg_type t ON t.oid = a.atttypid
+      JOIN pg_namespace tn ON tn.oid = t.typnamespace
+     WHERE a.attrelid = rel AND a.attnum > 0 AND NOT a.attisdropped
+       AND tn.nspname <> 'pg_catalog';
+    IF bad IS NOT NULL THEN
+        RAISE EXCEPTION 'syzy: CREATE TABLE %: column(s) % use a user-defined type; only built-in types replicate', tname, bad
+            USING ERRCODE = 'feature_not_supported';
+    END IF;
+END $$;
+
+-- syzy_ddl_admit_alter rejects — pre-commit, so the user's transaction rolls
+-- back cleanly — an ALTER that RESTRICTS a replicated table. A row written on a
+-- peer before it applied the change is already in flight carrying values that
+-- were legal under the old shape, so a receiver that had tightened the column
+-- could never apply it and would halt forever. Relaxations (widening a type,
+-- DROP NOT NULL, default changes) replicate and are admitted. The same rules
+-- run post-commit in classifyColumnChange(), which stays as the floor for a
+-- node whose DDL support was installed after the fact.
+CREATE OR REPLACE FUNCTION syzy_ddl_admit_alter(rel oid) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+DECLARE
+    tname text := rel::regclass::text;
+    live  record;
+    prior record;
+BEGIN
+    FOR live IN
+        SELECT a.attname, format_type(a.atttypid, a.atttypmod) AS typename,
+               a.attnotnull AS is_notnull, a.attgenerated <> '' AS is_generated,
+               a.attidentity AS identity, COALESCE(k.pkpos, 0) AS pkpos,
+               COALESCE(pg_get_expr(d.adbin, d.adrelid), '') AS def
+        FROM pg_attribute a
+        LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+        LEFT JOIN LATERAL (
+            SELECT x.ord AS pkpos
+            FROM pg_index i, unnest(i.indkey) WITH ORDINALITY AS x(attnum, ord)
+            WHERE i.indrelid = a.attrelid AND i.indisprimary AND x.attnum = a.attnum
+        ) k ON true
+        WHERE a.attrelid = rel AND a.attnum > 0 AND NOT a.attisdropped
+    LOOP
+        SELECT * INTO prior FROM syzy_ddl_prior p
+        WHERE p.pid = pg_backend_pid() AND p.relid = rel AND p.attname = live.attname;
+        IF NOT FOUND THEN
+            -- ADD COLUMN. Its values are minted per node for existing rows, so an
+            -- auto-increment column cannot be added to a table that already has any.
+            IF live.identity <> '' OR live.def LIKE 'nextval(%' THEN
+                RAISE EXCEPTION 'syzy: ALTER TABLE %: ADD COLUMN "%" is auto-increment (serial/identity); it mints divergent per-node values for existing rows', tname, live.attname
+                    USING ERRCODE = 'feature_not_supported';
+            END IF;
+            CONTINUE;
+        END IF;
+        IF live.is_generated <> prior.is_generated THEN
+            RAISE EXCEPTION 'syzy: ALTER TABLE %: adding or dropping a GENERATED expression on column "%" recomputes every row from a node-local evaluation and is not supported', tname, live.attname
+                USING ERRCODE = 'feature_not_supported';
+        END IF;
+        IF live.identity <> prior.identity THEN
+            RAISE EXCEPTION 'syzy: ALTER TABLE %: changing IDENTITY on column "%" mints divergent per-node values and is not supported', tname, live.attname
+                USING ERRCODE = 'feature_not_supported';
+        END IF;
+        IF (live.pkpos > 0) <> (prior.pkpos > 0) THEN
+            RAISE EXCEPTION 'syzy: ALTER TABLE %: changing PRIMARY KEY membership of column "%" changes row identity and is not supported', tname, live.attname
+                USING ERRCODE = 'feature_not_supported';
+        END IF;
+        IF live.is_notnull AND NOT prior.is_notnull THEN
+            RAISE EXCEPTION 'syzy: ALTER TABLE %: SET NOT NULL on column "%" cannot replicate — a NULL written on a peer before it applied the change is already in flight and would fail apply there permanently; declare the column NOT NULL when it is created', tname, live.attname
+                USING ERRCODE = 'feature_not_supported';
+        END IF;
+        IF live.typename <> prior.typename AND NOT syzy_type_widens(prior.typename, live.typename) THEN
+            RAISE EXCEPTION 'syzy: ALTER TABLE %: changing column "%" from % to % is not a widening conversion — values already in flight under the old type could not be applied', tname, live.attname, prior.typename, live.typename
+                USING ERRCODE = 'feature_not_supported';
+        END IF;
+        IF live.def LIKE 'nextval(%' THEN
+            RAISE EXCEPTION 'syzy: ALTER TABLE %: DEFAULT nextval(...) on column "%" names a node-local sequence and cannot replicate', tname, live.attname
+                USING ERRCODE = 'feature_not_supported';
+        END IF;
+    END LOOP;
+    IF EXISTS (
+        SELECT 1 FROM syzy_ddl_prior p
+        WHERE p.pid = pg_backend_pid() AND p.relid = rel AND p.pkpos > 0
+          AND NOT EXISTS (
+            SELECT 1 FROM pg_attribute a
+            WHERE a.attrelid = rel AND a.attname = p.attname AND NOT a.attisdropped)
+    ) THEN
+        RAISE EXCEPTION 'syzy: ALTER TABLE %: dropping a PRIMARY KEY column changes row identity and is not supported', tname
+            USING ERRCODE = 'feature_not_supported';
+    END IF;
 END $$;
 
 -- ddl_command_end fires once per top-level DDL command (CREATE/ALTER); it does
@@ -56,21 +263,41 @@ DECLARE
 BEGIN
     IF current_setting('syzy.internal', true) = 'on' THEN RETURN; END IF;
     FOR r IN SELECT * FROM pg_event_trigger_ddl_commands() LOOP
-        -- Replication scope: only PERMANENT relations. A TEMP table is
+        -- Only PERMANENT relations are in scope at all. A TEMP table is
         -- session-local and an UNLOGGED table is not WAL-logged, so logical
-        -- decoding never sees either's DML — skip their DDL entirely (no intent
-        -- row), rather than capture it and later (wrongly) halt as unreplicable.
+        -- decoding never sees either's DML. Checked first, so a harmless
+        -- CREATE TEMP TABLE … AS is not caught by the rejection below.
         SELECT relpersistence INTO persist FROM pg_class WHERE oid = r.objid;
         IF persist IS NOT NULL AND persist <> 'p' THEN
             CONTINUE;
         END IF;
-        -- Admission (§6 G): a permanent CREATE TABLE AS / SELECT INTO materializes
-        -- a node-local query result that cannot replicate. Reject it PRE-COMMIT so
-        -- the user txn rolls back cleanly, instead of committing and forcing the
-        -- sidecar to halt schema-unhealthy post-commit.
-        IF r.command_tag IN ('CREATE TABLE AS', 'SELECT INTO') THEN
+        -- Admission (§6 G): a permanent CREATE TABLE AS / SELECT INTO / MATERIALIZED
+        -- VIEW materializes a node-local query result that cannot replicate. Reject
+        -- it PRE-COMMIT so the user txn rolls back cleanly, instead of committing and
+        -- forcing the sidecar to halt schema-unhealthy post-commit.
+        IF r.command_tag IN ('CREATE TABLE AS', 'SELECT INTO', 'CREATE MATERIALIZED VIEW') THEN
             RAISE EXCEPTION 'syzy: % is not replicable (node-local query result); use CREATE TABLE then INSERT ... SELECT', r.command_tag
                 USING ERRCODE = 'feature_not_supported';
+        END IF;
+        -- Replication scope. Only these commands, on a table/view/index in the
+        -- replicated schema, become intent rows. EVERYTHING else — extensions,
+        -- functions, procedures, triggers, types, schemas, standalone sequences,
+        -- GRANT, COMMENT, and any object outside public — is local to this node:
+        -- no intent row, so capture never sees it and the node can never halt on
+        -- it. (A trigger's or function's EFFECTS still replicate: they run on the
+        -- originator and their row changes are captured as ordinary DML.)
+        IF r.command_tag NOT IN ('CREATE TABLE', 'ALTER TABLE', 'CREATE INDEX', 'CREATE VIEW')
+           OR COALESCE(r.schema_name, '') <> 'public' THEN
+            CONTINUE;
+        END IF;
+        -- Admission (§6 G): shapes that cannot replicate at all, and column
+        -- changes that RESTRICT the table (judged against the pre-command
+        -- snapshot) — both rejected before they can commit.
+        IF r.command_tag = 'CREATE TABLE' THEN
+            PERFORM syzy_ddl_admit_table(r.objid);
+        END IF;
+        IF r.command_tag = 'ALTER TABLE' AND r.object_type = 'table' THEN
+            PERFORM syzy_ddl_admit_alter(r.objid);
         END IF;
         INSERT INTO syzy_ddl_intent
           (txid, ordinal, command_tag, object_type, classid, objid, objsubid,
@@ -90,7 +317,10 @@ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
 DECLARE r record;
 BEGIN
     IF current_setting('syzy.internal', true) = 'on' THEN RETURN; END IF;
-    FOR r IN SELECT * FROM pg_event_trigger_dropped_objects() WHERE original LOOP
+    FOR r IN SELECT * FROM pg_event_trigger_dropped_objects()
+             WHERE original AND NOT is_temporary
+               AND object_type IN ('table', 'index', 'view')
+               AND COALESCE(schema_name, '') = 'public' LOOP
         INSERT INTO syzy_ddl_intent
           (txid, ordinal, command_tag, object_type, classid, objid, objsubid,
            schema_name, object_identity, is_drop, audit_query)
@@ -105,6 +335,10 @@ END $$;
 -- are silent when the sidecar applies peer DDL under session_replication_role=
 -- replica, so applied DDL writes no intent rows and is never re-captured.
 DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_event_trigger WHERE evtname = 'syzy_ddl_snapshot') THEN
+        CREATE EVENT TRIGGER syzy_ddl_snapshot ON ddl_command_start
+            EXECUTE FUNCTION syzy_ddl_snapshot();
+    END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_event_trigger WHERE evtname = 'syzy_ddl_end') THEN
         CREATE EVENT TRIGGER syzy_ddl_end ON ddl_command_end
             EXECUTE FUNCTION syzy_ddl_command_end();

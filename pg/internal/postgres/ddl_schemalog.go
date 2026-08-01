@@ -56,7 +56,9 @@ func (e *Engine) appendDDLBundle(ctx context.Context, intents []ddlIntent) error
 	// so the trigger DDL doesn't spool a ddl intent; safe here because
 	// appendDDLBundle runs on the orchestrator goroutine that owns that conn.
 	for _, op := range ops {
-		refresh := e.cat.coordUnique && op.Kind == crdt.OpDropUniqueKey
+		// A dropped key retires its triggers; an altered column changes the type
+		// the reservation path encodes its values through.
+		refresh := e.cat.coordUnique && (op.Kind == crdt.OpDropUniqueKey || op.Kind == crdt.OpAlterColumn)
 		for _, k := range op.Keys {
 			refresh = refresh || k.Coordinated
 		}

@@ -34,7 +34,25 @@ const (
 	OpDropTrigger        CatalogOpKind = 16
 	OpBundle             CatalogOpKind = 17
 	OpSetClockGroup      CatalogOpKind = 18
+	OpAlterColumn        CatalogOpKind = 19
 )
+
+// opVersion is the lowest envelope version that can express kind.
+//
+// A new kind is a semantic addition, so a decoder that does not know it MUST
+// fail closed rather than skip — but bumping the version on every op would
+// make one new kind unreadable to an older node's entire schema log. Encoding
+// each op at the minimum version its kind needs keeps that blast radius to
+// the ops that actually use the new kind: an older node reads everything it
+// understands and halts precisely on what it does not.
+func opVersion(kind CatalogOpKind) uint64 {
+	switch kind {
+	case OpAlterColumn:
+		return 5
+	default:
+		return catalogOpVersion
+	}
+}
 
 // CatalogOp encoding
 //
@@ -67,12 +85,12 @@ const (
 // misparse hazard the framed format exists to end.
 const (
 	catalogOpSentinel = 0xC0
-	// catalogOpVersion is what encoders write. Versions 1–3 name the
-	// legacy layout lineage (base / +coordinated / +predicate) and
-	// never appear in an envelope.
+	// catalogOpVersion is the baseline every framed op encodes at.
+	// Versions 1–3 name the legacy layout lineage (base / +coordinated /
+	// +predicate) and never appear in an envelope.
 	catalogOpVersion = 4
 	// catalogOpMaxVersion is the newest version this decoder reads.
-	catalogOpMaxVersion = 4
+	catalogOpMaxVersion = 5
 
 	legacyCoordFlag   = 0x80
 	legacyPartialFlag = 0x40
@@ -83,6 +101,17 @@ const (
 // unhealthy / quarantine), never skip the event.
 var ErrCatalogOpVersion = errors.New("crdt: CatalogOp version not supported")
 
+// MaxCatalogOpVersion is the newest envelope version this build decodes.
+// Exported so fail-closed tests and diagnostics can name "newer than this
+// binary" without hardcoding a number that goes stale the moment the wire
+// gains a version.
+const MaxCatalogOpVersion = catalogOpMaxVersion
+
+// ErrCatalogOpKind is returned when an op names a kind this decoder does not
+// implement. Like ErrCatalogOpVersion it means "cannot participate": the kind
+// carries semantics, so skipping the event would apply a partial catalog.
+var ErrCatalogOpKind = errors.New("crdt: CatalogOp kind not supported")
+
 // String returns a stable human-readable name for the op kind. Used by
 // logging, status output, and catalog_op debug dumps.
 func (k CatalogOpKind) String() string {
@@ -91,6 +120,8 @@ func (k CatalogOpKind) String() string {
 		return "create_table"
 	case OpAddColumn:
 		return "add_column"
+	case OpAlterColumn:
+		return "alter_column"
 	case OpRenameTable:
 		return "rename_table"
 	case OpRenameColumn:
@@ -237,7 +268,7 @@ func EncodeCatalogOp(op CatalogOp) ([]byte, error) {
 		return nil, errors.New("crdt: cannot encode CatalogOp with Kind=Unknown")
 	}
 	buf := []byte{catalogOpSentinel}
-	buf = binary.AppendUvarint(buf, catalogOpVersion)
+	buf = binary.AppendUvarint(buf, opVersion(op.Kind))
 	buf = binary.AppendUvarint(buf, uint64(op.Kind))
 	switch op.Kind {
 	case OpCreateTable:
@@ -247,6 +278,12 @@ func EncodeCatalogOp(op CatalogOp) ([]byte, error) {
 		buf = appendKeys(buf, op.Keys)
 		buf = appendBool(buf, op.WithoutRowid)
 	case OpAddColumn:
+		buf = appendBytes16(buf, op.TableID[:])
+		buf = appendColumns(buf, op.Columns)
+	case OpAlterColumn:
+		// Carries the column's whole desired attribute state rather than a
+		// delta, so applying it is idempotent and a replay cannot depend on
+		// what the receiver currently believes.
 		buf = appendBytes16(buf, op.TableID[:])
 		buf = appendColumns(buf, op.Columns)
 	case OpRenameTable:
@@ -341,7 +378,7 @@ func decodeFramedCatalogOp(buf []byte, allowBundle bool) (CatalogOp, error) {
 	}
 	buf = buf[sz:]
 	if kindU == 0 || kindU > 0xFF {
-		return CatalogOp{}, fmt.Errorf("crdt: unknown CatalogOpKind %d", kindU)
+		return CatalogOp{}, fmt.Errorf("%w: %d", ErrCatalogOpKind, kindU)
 	}
 	op, rest, err := decodeCatalogOpBody(CatalogOpKind(kindU), buf, true, true, allowBundle)
 	if err != nil {
@@ -409,7 +446,7 @@ func decodeCatalogOpBody(kind CatalogOpKind, rest []byte, withCoord, withPred, a
 		if op.WithoutRowid, rest, err = readBool(rest); err != nil {
 			return CatalogOp{}, nil, err
 		}
-	case OpAddColumn:
+	case OpAddColumn, OpAlterColumn:
 		if rest, err = readBytes16(rest, op.TableID[:]); err != nil {
 			return CatalogOp{}, nil, err
 		}
@@ -522,7 +559,7 @@ func decodeCatalogOpBody(kind CatalogOpKind, rest []byte, withCoord, withPred, a
 			rest = rest[subLen:]
 		}
 	default:
-		return CatalogOp{}, nil, fmt.Errorf("crdt: unknown CatalogOpKind %d", kind)
+		return CatalogOp{}, nil, fmt.Errorf("%w: %d", ErrCatalogOpKind, kind)
 	}
 	return op, rest, nil
 }

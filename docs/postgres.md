@@ -162,9 +162,10 @@ spool rows, and the orchestrator turns them into typed `crdt.CatalogOp`s
 appended to the ordered schema log under a DDL lease and a parent-CAS.
 Receivers apply the typed op, never the originator's SQL.
 
-Unsupported DDL is rejected **before commit**, at `ddl_command_start`, so a
-migration typo fails the migration instead of halting the node. The
-allow/reject matrix is in §11.
+Unsupported DDL is rejected **before commit** — a migration typo fails the
+migration instead of halting the node — and DDL that is simply out of scope
+(extensions, functions, triggers, anything outside `public`) is left local to
+the node rather than treated as an error. The allow/reject matrix is in §11.
 
 Schema health is fail-closed: a node that cannot interpret a schema event
 stops rather than serving a schema it cannot prove.
@@ -280,8 +281,67 @@ re-clones, which is strictly better than the database going down.
 
 ## 11. DDL allow/reject matrix
 
-Decided, not discovered. See the reference table in the engine docs section
-of this file as the feature set lands.
+Decided, not discovered. Every DDL statement lands in exactly one of three
+buckets, and the bucket is chosen **before the statement commits**.
+
+**The rule behind the table:** a replicated schema change may only *relax* the
+schema. Rows written on a peer before it applied the change are already in
+flight, carrying values that were legal under the old shape, and a changeset's
+schema dependency only orders writes made *after* the change. So a receiver
+that had tightened the column could never apply them, and would halt forever.
+
+### Replicated
+
+| Statement | Notes |
+|---|---|
+| `CREATE TABLE` | Permanent, in `public`, with a `PRIMARY KEY` |
+| `DROP TABLE`, `ALTER TABLE … RENAME` | |
+| `ADD COLUMN` / `DROP COLUMN` / `RENAME COLUMN` | |
+| `ALTER COLUMN … TYPE` | **Widening only**: `smallint`→`integer`→`bigint`, `real`→`double precision`, `varchar(n)`→`varchar(m>n)`/`text`, `numeric(p,s)`→`numeric(p'≥p,s)` |
+| `ALTER COLUMN … SET/DROP DEFAULT` | Defaults are evaluated only at the origin (apply supplies every column), so they carry no convergence risk |
+| `ALTER COLUMN … DROP NOT NULL` | A relaxation |
+| `CREATE UNIQUE INDEX` / `UNIQUE` constraint | Total keys only; becomes a §7 unique key |
+| `CREATE INDEX` (non-unique), `DROP INDEX` | Ships as opaque SQL |
+| `CREATE VIEW`, `DROP VIEW` | Ships as opaque SQL |
+| `bigserial` / `IDENTITY` primary keys | Each node mints from its own slice of the id space (§6) |
+
+### Local to the node — not replicated, and never a halt
+
+Run them on every node yourself. Their *effects* still replicate where that
+makes sense: a trigger or function fires on the originator and the rows it
+writes are captured as ordinary DML.
+
+`CREATE EXTENSION` · `CREATE FUNCTION` / `PROCEDURE` · `CREATE TRIGGER` ·
+`CREATE TYPE` · `CREATE SCHEMA` · standalone `CREATE SEQUENCE` · `CREATE RULE`
+· `GRANT` / `REVOKE` · `COMMENT` · `ALTER TABLE … ADD CHECK` / foreign keys /
+storage parameters · anything on a `TEMP` or `UNLOGGED` relation · **anything
+outside the `public` schema**.
+
+### Rejected before commit
+
+The statement fails with `SQLSTATE 0A000` and the transaction rolls back; the
+node stays healthy.
+
+| Statement | Why |
+|---|---|
+| `CREATE TABLE` without a `PRIMARY KEY` | Rows are identified by it; without one no write could be merged |
+| `CREATE TABLE … PARTITION BY` / a partition | Not supported in v1 |
+| A column of a user-defined type (enum, domain, composite, extension type) | Would replicate as text into a type the receiver may not have; an enum that gains a value on one node only would fail apply there forever |
+| `CREATE TABLE AS`, `SELECT INTO`, `CREATE MATERIALIZED VIEW` | Materializes a node-local query result |
+| `ALTER COLUMN … SET NOT NULL` | A `NULL` written on a peer before it applied the change is already in flight. Declare the column `NOT NULL` when it is created |
+| `ALTER COLUMN … TYPE` that narrows | Values in flight under the old type could not be applied |
+| Adding/dropping a `GENERATED` expression, changing `IDENTITY` | Recomputed per node |
+| Changing `PRIMARY KEY` membership, dropping a PK column | Changes row identity |
+| `SET DEFAULT nextval(…)`, `ADD COLUMN` that is serial/identity | Names a node-local sequence / mints divergent values for existing rows |
+| `UNIQUE` that is partial (`WHERE`), on an expression, or `NULLS NOT DISTINCT` | Not a plain column tuple, or a predicate whose truth varies per replica |
+| `UNIQUE` mixing `NOT NULL` and nullable members | No convergent loser state |
+
+Two layers enforce this. A `ddl_command_start` trigger records the
+pre-command column shape; `ddl_command_end` diffs the finished catalog against
+it and raises. The same rules run again in the sidecar after commit, as the
+floor for a node that has no snapshot to judge against — one whose DDL support
+was installed after the table already existed. That second layer halts
+schema-unhealthy, which is the outcome the first layer exists to prevent.
 
 ---
 
@@ -304,6 +364,11 @@ of this file as the feature set lands.
   reservation. A direct `psql` write with the sidecar down therefore has no
   index to stop it, which is the same posture as any other write that
   bypasses the gate.
+- **Only the `public` schema replicates.** Tables elsewhere are node-local;
+  their DDL is skipped rather than rejected (§11).
+- **`SET NOT NULL` and narrowing type changes are refused** (§11). A schema
+  change may only relax the schema, because writes made before a peer applied
+  it are already in flight under the old shape.
 - **Incremental blob patching is not supported.** Use `bytea` and replicate
   whole values.
 - **Postgres 17+**, one sidecar per database, and a superuser-adjacent

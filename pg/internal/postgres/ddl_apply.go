@@ -53,6 +53,8 @@ func applyCatalogOp(ctx context.Context, conn *pgx.Conn, cat *catalog, op crdt.C
 		return applyCreateTable(ctx, conn, cat, op, ordinal)
 	case crdt.OpAddColumn:
 		return applyAddColumn(ctx, conn, cat, op)
+	case crdt.OpAlterColumn:
+		return applyAlterColumn(ctx, conn, cat, op)
 	case crdt.OpDropColumn:
 		return applyDropColumn(ctx, conn, cat, op)
 	case crdt.OpRenameColumn:
@@ -210,6 +212,58 @@ func applyAddColumn(ctx context.Context, conn *pgx.Conn, cat *catalog, op crdt.C
 	ci := &colInfo{name: c.Name, typeName: pgColumnType(c.Type), cid: c.ID, isPK: c.IsPK, attnum: attnum, notNull: c.NotNull, def: c.Default, generated: c.Generated}
 	ti.cols = append(ti.cols, ci)
 	ti.byName[c.Name] = ci
+	return nil
+}
+
+// applyAlterColumn brings one column to the whole attribute state the op
+// carries. The op is a desired state, not a delta, so this compares against the
+// cached column and issues only the ALTERs whose effect is missing — a replay
+// after a crash mid-batch is a no-op. Only relaxations reach here
+// (classifyColumnChange), so no statement can fail on existing rows.
+func applyAlterColumn(ctx context.Context, conn *pgx.Conn, cat *catalog, op crdt.CatalogOp) error {
+	ti := cat.byID[op.TableID]
+	if ti == nil {
+		return fmt.Errorf("apply alter column: table id %x not in catalog", op.TableID)
+	}
+	if len(op.Columns) != 1 {
+		return fmt.Errorf("apply alter column %s: expected 1 column, got %d", ti.name, len(op.Columns))
+	}
+	c := op.Columns[0]
+	ci := ti.colByID(c.ID)
+	if ci == nil {
+		return fmt.Errorf("apply alter column %s: column id %x not in table", ti.name, c.ID)
+	}
+	col := quoteIdent(ci.name)
+	typ := pgColumnType(c.Type)
+	var stmts []string
+	if ci.typeName != typ {
+		stmts = append(stmts, fmt.Sprintf("ALTER COLUMN %s TYPE %s", col, typ))
+	}
+	if ci.def != c.Default {
+		if c.Default == "" {
+			stmts = append(stmts, "ALTER COLUMN "+col+" DROP DEFAULT")
+		} else {
+			stmts = append(stmts, "ALTER COLUMN "+col+" SET DEFAULT "+c.Default)
+		}
+	}
+	if ci.notNull && !c.NotNull {
+		stmts = append(stmts, "ALTER COLUMN "+col+" DROP NOT NULL")
+	}
+	for _, s := range stmts {
+		if err := execDDLApply(ctx, conn, "ALTER TABLE "+tableRef(ti)+" "+s); err != nil {
+			return fmt.Errorf("apply alter column %s.%s: %w", ti.name, ci.name, err)
+		}
+	}
+	ci.setAttrs(typ, c.Default, c.NotNull)
+	// A coordinated key's reservation path encodes values through the column's
+	// type, so its decoupled snapshot has to see the new one.
+	if cat.coordIdx != nil {
+		for _, uk := range ti.uniqueKeys {
+			if uk.coordinated {
+				return ensureCoordinated(ctx, conn, cat, ti)
+			}
+		}
+	}
 	return nil
 }
 
