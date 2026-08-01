@@ -140,7 +140,7 @@ func (b *Broker) applyCellUpdate(tab *catalog.Table, upd crdt.Update, rs crdt.Ro
 	out.applied = true
 	out.cellUpdates = append(out.cellUpdates, stolen...)
 
-	if tab.CoversAllNonPK(winners) {
+	if crdt.CoversAllNonPK(tab, winners) {
 		// Opportunistic collapse: the write defines every live column,
 		// so the row is uniformly stamped — absorb into the baseline
 		// and drop the overrides instead of writing one per column.

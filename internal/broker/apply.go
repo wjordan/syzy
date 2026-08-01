@@ -260,7 +260,7 @@ func (b *Broker) ReassertLocal(records []crdt.Record, stamp crdt.Stamp) error {
 			// with any interleaved apply (no overwrite to repair) and
 			// re-running one would double-count, so the record is
 			// re-asserted with them stripped.
-			if upd, isCell := tab.AsCellUpdate(rec, rs); isCell {
+			if upd, isCell := crdt.AsCellUpdate(tab, rec, rs); isCell {
 				for _, v := range upd.Changed {
 					if v.Format == crdt.FormatDelta {
 						continue
@@ -386,7 +386,7 @@ func (b *Broker) applyRecordsLWW(records []crdt.Record, stamp crdt.Stamp, marker
 		// and refines per column inside applyCellUpdate (registers
 		// stamp-gate there; counter contributions always land).
 		if tab.CellGroup() {
-			if upd, isCell := tab.AsCellUpdate(rec, rs); isCell {
+			if upd, isCell := crdt.AsCellUpdate(tab, rec, rs); isCell {
 				if h.CL < rs.CL ||
 					(!cellUpdateHasCounter(upd) && !rs.DominatedBy(h.CL, stamp)) {
 					continue

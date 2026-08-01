@@ -127,7 +127,7 @@ func (b *Broker) stripCounterContributions(records []crdt.Record) []crdt.Record 
 // or run SQL arithmetic: FormatDelta is only valid on a declared counter
 // column and only as an 8-byte ColInt, and a counter column only ever
 // carries FormatDelta (materialize ships every counter update as a
-// delta; Table.AsCellUpdate marks valid same-generation images). A
+// delta; crdt.AsCellUpdate marks valid same-generation images). A
 // violating value means a buggy or hostile peer — fail deterministically
 // into quarantine rather than diverge silently.
 func validateCellCounterValues(tab *catalog.Table, upd crdt.Update) error {

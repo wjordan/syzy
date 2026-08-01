@@ -8,8 +8,14 @@ import (
 
 	"github.com/wjordan/syzy/crdt"
 	"github.com/wjordan/syzy/internal/journal"
-	"github.com/wjordan/syzy/internal/sqlitecatalog"
 )
+
+// CellTables resolves tables that replay with per-column cell-clock
+// bookkeeping (known, live, cell clock group). The engine catalog
+// implements it; nil keeps the row-level replay for every table.
+type CellTables interface {
+	CellGroupTable(crdt.TableID) (crdt.CellTable, bool)
+}
 
 // MirrorSource is the per-origin journal lookup the recovery walker
 // needs. mirror.Manager satisfies it.
@@ -34,14 +40,15 @@ type MirrorSource interface {
 // a partial order over Stamps and converges regardless of replay
 // interleaving.
 //
-// cat refines cell-group replay: for a table the catalog knows to be
-// cell-group, a same-CL update replays as per-column cell stamps
+// tables refines cell-group replay: for a table the catalog knows to
+// be cell-group, a same-CL update replays as per-column cell stamps
 // (mirroring the live apply path) instead of a row Base advance. nil
-// cat — or a table missing from it — degrades to the row-level replay.
+// tables — or a table missing from it — degrades to the row-level
+// replay.
 //
 // Returns the per-origin journal head reached (informational; useful
 // for setting drainer start points).
-func RecoverMirror(cache *Cache, src MirrorSource, cat *catalog.Catalog) (map[crdt.Origin]journal.Offset, error) {
+func RecoverMirror(cache *Cache, src MirrorSource, tables CellTables) (map[crdt.Origin]journal.Offset, error) {
 	heads := map[crdt.Origin]journal.Offset{}
 	for _, origin := range src.Origins() {
 		if origin == cache.Self() {
@@ -124,8 +131,8 @@ func RecoverMirror(cache *Cache, src MirrorSource, cat *catalog.Catalog) (map[cr
 				// Handles counter contributions too (never stamped, CL-only
 				// gate), including mixed counter+register updates, whose
 				// register columns replay per column.
-				if tab := cellGroupTable(cat, h.Table); tab != nil {
-					if upd, isCell := tab.AsCellUpdate(r, rs); isCell {
+				if tab, ok := cellGroupTable(tables, h.Table); ok {
+					if upd, isCell := crdt.AsCellUpdate(tab, r, rs); isCell {
 						replayCellClocks(cache, tab, upd, rs, cs.Stamp)
 						continue
 					}
@@ -185,7 +192,7 @@ type SelfLogReplayer interface {
 // Pre-self-log origins can retain records with no source endOffset forever.
 // A kept origin follows a clean shutdown whose final snapshot covers those
 // records, so recovery skips them before decoding and leaves its marker alone.
-func RecoverSelf(cache *Cache, j *journal.Journal, cat *catalog.Catalog, blobs SelfLogReplayer) error {
+func RecoverSelf(cache *Cache, j *journal.Journal, tables CellTables, blobs SelfLogReplayer) error {
 	self := cache.Self()
 	head := j.Head()
 	marker := cache.SnapshotMarker(self)
@@ -246,8 +253,8 @@ func RecoverSelf(cache *Cache, j *journal.Journal, cat *catalog.Catalog, blobs S
 			}
 			h := r.Header()
 			rs := cache.RowState(h.Table, h.PK)
-			if tab := cellGroupTable(cat, h.Table); tab != nil {
-				if upd, isCell := tab.AsCellUpdate(r, rs); isCell {
+			if tab, ok := cellGroupTable(tables, h.Table); ok {
+				if upd, isCell := crdt.AsCellUpdate(tab, r, rs); isCell {
 					replayCellClocks(cache, tab, upd, rs, cs.Stamp)
 					continue
 				}
@@ -302,19 +309,14 @@ func updateHasDelta(upd crdt.Update) bool {
 	return false
 }
 
-// cellGroupTable returns the catalog entry for id when replay should
-// use per-column bookkeeping: known, not dropped, and cell-group.
-// Returns nil otherwise (including cat == nil), which keeps the
+// cellGroupTable resolves id through tables when replay should use
+// per-column bookkeeping. ok=false (including tables == nil) keeps the
 // historical row-level replay.
-func cellGroupTable(cat *catalog.Catalog, id crdt.TableID) *catalog.Table {
-	if cat == nil {
-		return nil
+func cellGroupTable(tables CellTables, id crdt.TableID) (crdt.CellTable, bool) {
+	if tables == nil {
+		return nil, false
 	}
-	tab, ok := cat.TableByID(id)
-	if !ok || tab.Dropped() || !tab.CellGroup() {
-		return nil
-	}
-	return tab
+	return tables.CellGroupTable(id)
 }
 
 // replayCellClocks re-derives the clock bookkeeping the live cell
@@ -326,7 +328,7 @@ func cellGroupTable(cat *catalog.Catalog, id crdt.TableID) *catalog.Table {
 // stamps. Idempotent and order-independent — PutRowState and
 // PutCellStamp are monotone, so replay converges to the live path's
 // final state regardless of interleaving with snapshot contents.
-func replayCellClocks(cache *Cache, tab *catalog.Table, upd crdt.Update, rs crdt.RowState, stamp crdt.Stamp) {
+func replayCellClocks(cache *Cache, tab crdt.CellTable, upd crdt.Update, rs crdt.RowState, stamp crdt.Stamp) {
 	// Same admission gate as the live path (applyRecordsLWW): a record
 	// carrying counter contributions gates on CL alone — its Stamp never
 	// arbitrates counter cells — and refines per column below.
@@ -347,7 +349,7 @@ func replayCellClocks(cache *Cache, tab *catalog.Table, upd crdt.Update, rs crdt
 			return
 		}
 	}
-	if tab.CoversAllNonPK(winners) {
+	if crdt.CoversAllNonPK(tab, winners) {
 		// Opportunistic collapse: uniformly stamped, absorb into the
 		// baseline and drop the overrides.
 		if cache.PutRowState(upd.Table, upd.PK, crdt.RowState{CL: upd.CL, Base: stamp}) {
@@ -364,7 +366,7 @@ func replayCellClocks(cache *Cache, tab *catalog.Table, upd crdt.Update, rs crdt
 		}
 	}
 	for _, v := range winners {
-		if col, ok := tab.ColumnByID(v.Column); ok && col.Counter() {
+		if _, counter := tab.ColumnRole(v.Column); counter {
 			// Counter cells carry no stamps — nothing to advance.
 			continue
 		}
