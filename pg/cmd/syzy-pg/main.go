@@ -82,6 +82,9 @@ Replication scope:
   -tables T1,T2      schema-qualified replicated set (e.g. public.kv,public.items)
                      mutually-exclusive with -ddl
   -ddl               enable DDL replication (-tables empty; tables created by cluster DDL)
+  -adopt             publish the rows that already existed in this database, once,
+                     so an existing database can join a cluster. Idempotent (a
+                     durable marker records that it ran); safe to leave set.
 
 DDL schema log (with -ddl, exactly one source is required):
   -schema-log PATH   local schemalog file (single-host, or shared filesystem)
@@ -285,6 +288,7 @@ func run(args []string) error {
 		Registry:          uniqueReg,
 		ReserveSocketDir:  filepath.Join(cfg.dataDir, "reserve"),
 		DDL:               cfg.ddl,
+		Adopt:             cfg.adopt,
 		// The origin id is already a cluster-unique, never-reused 1..65535
 		// node number, which is exactly what the id-space slice needs — so it
 		// doubles as the ordinal and auto-increment PKs (bigserial, IDENTITY)
@@ -376,6 +380,7 @@ type sidecarConfig struct {
 	insecure        bool
 	tables          []string
 	ddl             bool
+	adopt           bool
 	schemaLogPath   string
 	schemaLogDial   string
 	schemaLogS3     string
@@ -406,6 +411,7 @@ func parseFlags(args []string) (*sidecarConfig, error) {
 	insecure := fs.Bool("insecure", false, "")
 	tables := fs.String("tables", "", "")
 	ddl := fs.Bool("ddl", false, "")
+	adopt := fs.Bool("adopt", false, "")
 	schemaLog := fs.String("schema-log", "", "")
 	schemaLogDial := fs.String("schema-log-dial", "", "")
 	schemaLogS3 := fs.String("schema-log-s3", "", "")
@@ -485,6 +491,7 @@ func parseFlags(args []string) (*sidecarConfig, error) {
 		insecure:        *insecure,
 		tables:          splitCSV(*tables),
 		ddl:             *ddl,
+		adopt:           *adopt,
 		schemaLogPath:   *schemaLog,
 		schemaLogDial:   *schemaLogDial,
 		schemaLogS3:     *schemaLogS3,

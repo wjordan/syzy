@@ -76,6 +76,12 @@ type Config struct {
 
 	Tables []string // schema-qualified replicated set (PK-only phase)
 
+	// Adopt publishes the rows that already existed when the replication slot
+	// was created, once, so an EXISTING database can join a cluster (§10). It is
+	// idempotent (a durable marker records that it ran) and deliberately an
+	// explicit operator action — see adopt.go for why it is never inferred.
+	Adopt bool
+
 	// NodeOrdinal is the compact node id (1..2^16-1; 0 disables) that scopes
 	// auto-increment PK partitioning (§6): each node retunes its bigint
 	// sequences to a disjoint slice of the id space so bigserial/IDENTITY PKs
@@ -197,6 +203,12 @@ type Engine struct {
 	appl    *applier
 	orch    *orchestrator
 	selfLog *journal.Journal // self-origin durable log (§3); nil when disabled
+
+	// pendingAdopt holds adoption changesets when there is no self-log to carry
+	// them; Run broadcasts them before entering the loop (§10). adoptedRows is
+	// the count, for the operator-facing log line.
+	pendingAdopt []*crdt.Changeset
+	adoptedRows  int
 
 	// winners is the runtime-only winner-repair stash (§9 Option A,
 	// winners.go), shared by the apply path (writer) and the fold path
@@ -451,6 +463,15 @@ func Open(ctx context.Context, cfg Config) (*Engine, error) {
 		e.Close()
 		return nil, fmt.Errorf("startup schema catch-up: %w", err)
 	}
+	// Adoption (§10): publish the rows that predate the slot, once, on explicit
+	// operator request. After the self-log is open, so the publication is as
+	// durable as any local write.
+	if cfg.Adopt {
+		if err := e.adoptExisting(ctx); err != nil {
+			e.Close()
+			return nil, err
+		}
+	}
 	return e, nil
 }
 
@@ -475,6 +496,14 @@ func (e *Engine) Applier() engine.Applier { return e.appl }
 // inbox delivers decoded peer changesets; broadcast ships locally-folded
 // changesets to the transport. It returns when ctx is cancelled.
 func (e *Engine) Run(ctx context.Context, inbox <-chan *crdt.Changeset, broadcast engine.Sink) error {
+	// Adoption changesets held for want of a self-log go out first, so peers see
+	// the pre-existing rows before any write that builds on them (§10).
+	for _, cs := range e.pendingAdopt {
+		if err := broadcast(ctx, cs); err != nil {
+			return fmt.Errorf("postgres: broadcast adopted rows: %w", err)
+		}
+	}
+	e.pendingAdopt = nil
 	return e.orch.Run(ctx, inbox, broadcast)
 }
 
