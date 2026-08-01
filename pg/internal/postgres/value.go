@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	corecatalog "github.com/wjordan/syzy/catalog"
 	"github.com/wjordan/syzy/crdt"
 )
 
@@ -106,39 +107,32 @@ func colValueText(cv crdt.ColValue) (string, error) {
 }
 
 // pkBlobTyped is the canonical cross-engine PK identity: per PK column in key
-// order, ColumnID + 1-byte class tag + uvarint length + canonical bytes —
-// byte-identical to internal/catalog's EncodePKFromSlice for the same logical
-// row, so both engines key the same clocks.
-func pkBlobTyped(cvs []crdt.ColValue) crdt.PKBlob {
-	var out []byte
-	var lenBuf [binary.MaxVarintLen64]byte
-	for _, cv := range cvs {
-		out = append(out, cv.Column[:]...)
-		out = append(out, byte(cv.TypeTag))
-		n := binary.PutUvarint(lenBuf[:], uint64(len(cv.Bytes)))
-		out = append(out, lenBuf[:n]...)
-		out = append(out, cv.Bytes...)
+// order, ColumnID + 1-byte class tag + uvarint length + canonical bytes. It is
+// the core's tuple encoding, shared rather than restated, because both engines
+// must key the same clocks from the same logical row — a second implementation
+// that drifted would silently split one row into two identities.
+//
+// The error is the NULL-member case, which a PK column being NOT NULL should
+// make unreachable — but it is returned rather than ignored, because reaching
+// it means the row image and the catalog disagree, and encoding a PK from
+// that would mint a wrong row identity.
+func pkBlobTyped(cvs []crdt.ColValue) (crdt.PKBlob, error) {
+	out, err := corecatalog.EncodeTuple(cvs)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: encode PK: %w", err)
 	}
-	return out
+	return out, nil
 }
 
 // decodePKBlobTyped reverses pkBlobTyped into its component typed values (in
-// PK key order). Malformed input returns what parsed cleanly.
+// PK key order). Malformed input returns what parsed cleanly, since callers
+// use this to render a diagnostic or a WHERE clause from bytes they already
+// hold.
 func decodePKBlobTyped(pk crdt.PKBlob) []crdt.ColValue {
 	var out []crdt.ColValue
-	buf := []byte(pk)
-	for len(buf) >= 17 {
-		var cv crdt.ColValue
-		copy(cv.Column[:], buf[:16])
-		cv.TypeTag = crdt.ColType(buf[16])
-		buf = buf[17:]
-		l, sz := binary.Uvarint(buf)
-		if sz <= 0 || uint64(len(buf)-sz) < l {
-			break
-		}
-		cv.Bytes = buf[sz : sz+int(l)]
-		buf = buf[sz+int(l):]
+	_ = corecatalog.RangeTuple(pk, func(cv crdt.ColValue) error {
 		out = append(out, cv)
-	}
+		return nil
+	})
 	return out
 }

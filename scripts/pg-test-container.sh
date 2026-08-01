@@ -15,12 +15,23 @@ set -euo pipefail
 NAME=syzy-pg-test
 PORT=${SYZY_PG_TEST_PORT:-5433}
 IMAGE=postgres:17
+# Coordinated uniqueness needs Postgres to dial BACK into the sidecar, over
+# a unix socket. In a container that means a bind mount both sides can see;
+# tests find it via SYZY_PG_TEST_SOCKDIR. Mounted at the same path inside so
+# one conninfo works from either side.
+SOCKDIR=${SYZY_PG_TEST_SOCKDIR:-/tmp/syzy-pg-test-sock}
 
 case "${1:-start}" in
 start)
   docker rm -f "$NAME" >/dev/null 2>&1 || true
+  # World-writable: the sidecar (the test process) creates sockets here and
+  # the server's postgres user connects to them, and the two are different
+  # uids — more so under rootless containers, which remap them again.
+  mkdir -p "$SOCKDIR"
+  chmod 777 "$SOCKDIR"
   docker run -d --name "$NAME" -p "$PORT:5432" \
     -e POSTGRES_PASSWORD=syzy \
+    -v "$SOCKDIR:$SOCKDIR:z" \
     "$IMAGE" \
     -c wal_level=logical \
     -c max_replication_slots=64 \

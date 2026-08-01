@@ -25,6 +25,11 @@ type catalog struct {
 	// coordUnique mirrors Config.CoordinatedUnique: DDL admission marks an
 	// all-NOT-NULL unique key Coordinated instead of rejecting it.
 	coordUnique bool
+	// coordIdx is the reservation endpoint's copy of the coordinated-key
+	// metadata. Unlike the rest of the catalog it IS read off this
+	// goroutine — by the pgwire endpoint serving Postgres backends — so it
+	// carries its own lock. Nil when coordinated uniqueness is disabled.
+	coordIdx *coordIndex
 }
 
 type tableInfo struct {
@@ -48,10 +53,10 @@ type tableInfo struct {
 type uniqueKey struct {
 	keyID crdt.KeyID
 	cols  []*colInfo
-	// coordinated marks a CP key (all members NOT NULL): reservation-free on
-	// this engine — enforced by the physical index on every node plus the
-	// leaseholder write gate (coordinated.go). Skipped by loser-null
-	// arbitration.
+	// coordinated marks a CP key (all members NOT NULL): guaranteed by
+	// construction through reserve-before-commit against the cluster
+	// registry, with NO physical index on any node (coordinated.go).
+	// Skipped by loser-null arbitration.
 	coordinated bool
 	// indexOID is the backing unique index's OID on the node that physically
 	// holds it (the originator). It maps a standalone DROP INDEX back to this

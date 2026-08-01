@@ -31,8 +31,8 @@ func applyCatalogOp(ctx context.Context, conn *pgx.Conn, cat *catalog, op crdt.C
 	// engine cannot enforce (its arbitration is over total keys). Refusing the
 	// op halts schema-unhealthy — silently recording the key would let local
 	// writes break the cluster's uniqueness guarantee. Coordinated total keys
-	// ARE enforced (physical index + leaseholder gate, coordinated.go) — but
-	// only when this node runs with coordination enabled.
+	// ARE enforced (reserve-before-commit, coordinated.go) — but only when
+	// this node runs with coordination enabled.
 	for _, k := range op.Keys {
 		if k.Predicate.Root != nil {
 			return unsupportedDDLf("postgres: %s: partial unique key cannot be enforced by this engine", op.TableName)
@@ -165,7 +165,7 @@ func applyCreateTable(ctx context.Context, conn *pgx.Conn, cat *catalog, op crdt
 	}
 	cat.addTable(ti)
 	if coordinated {
-		if err := ensureCoordinatedPhysical(ctx, conn, ti); err != nil {
+		if err := ensureCoordinated(ctx, conn, cat, ti); err != nil {
 			return fmt.Errorf("apply create table %s: %w", op.TableName, err)
 		}
 	}
@@ -283,7 +283,7 @@ func applyAddUniqueKey(ctx context.Context, conn *pgx.Conn, cat *catalog, op crd
 		return err
 	}
 	if op.Keys[0].Coordinated {
-		return ensureCoordinatedPhysical(ctx, conn, ti)
+		return ensureCoordinated(ctx, conn, cat, ti)
 	}
 	return nil
 }
@@ -301,10 +301,10 @@ func applyDropUniqueKey(ctx context.Context, conn *pgx.Conn, cat *catalog, op cr
 	}
 	ti.removeUniqueKey(op.KeyID) // no-op if the key is already gone (idempotent replay)
 	if wasCoordinated {
-		if err := execDDLApply(ctx, conn, "DROP INDEX IF EXISTS "+quoteIdent(coordIndexName(op.KeyID))); err != nil {
-			return err
-		}
-		return ensureCoordinatedPhysical(ctx, conn, ti) // rebuilds (or drops) the gate triggers
+		// Reconcile rather than drop-by-name: the key is gone from ti, so
+		// this uninstalls its accumulating trigger (and the table's
+		// reservation trigger once no coordinated key is left).
+		return ensureCoordinated(ctx, conn, cat, ti)
 	}
 	return nil
 }

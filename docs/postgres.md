@@ -189,16 +189,40 @@ stored redundantly.
 Postgres has exactly one pre-commit veto point available to a sidecar without
 a server extension: a `DEFERRABLE INITIALLY DEFERRED` constraint trigger,
 whose `ERROR` aborts the commit. The engine uses it: `BEFORE` row triggers
-accumulate the transaction's net key values in transaction-local state, and
-one deferred constraint trigger makes a single batched reservation call to
-the sidecar, which forwards it to the registry leaseholder. A denial raises
-and aborts.
+accumulate the transaction's net key values in an unlogged scratch table, and
+one deferred constraint trigger makes a single batched reservation call at
+commit. The call reaches the sidecar over `dblink` — the trigger's only way
+out of its own transaction — so the sidecar answers as a Postgres server for
+exactly one verb. A denial raises `23505` and aborts, which is precisely what
+a `UNIQUE` index would have done.
+
+The batch carries the transaction's **net** effect. A value inserted and then
+deleted in one transaction is never reserved; a value moved between rows
+reserves once, naming the prior owner so the registry transfers it rather than
+reporting a conflict; an update that does not touch the key does not call out
+at all.
+
+Key values cross the wire as text and are re-encoded into canonical key bytes
+in the sidecar's Go, sharing the encoder with capture. Canonical byte equality
+*is* row identity, so a second implementation in PL/pgSQL could split one
+logical value into two. The trigger renders text under pinned per-function
+GUCs (`DateStyle`, `TimeZone`, `extra_float_digits`, `bytea_output`) so a
+writer's session settings cannot change the bytes.
+
+The taken-set is **derived, never a ledger**: the registry leaseholder
+enumerates the rows that actually hold each key. That is what makes a
+reservation survive a leaseholder restart, and it means a released value
+re-enters the free pool only after an enumeration observes the row gone and
+the release hold expires.
 
 Consequences, stated plainly: a coordinated write's commit includes one mesh
 round trip while holding locks (inherent to CP uniqueness); a crash between
 reservation and commit leaks a hold bounded by the quarantine window, never a
-duplicate; and if the sidecar is unreachable, coordinated commits abort —
-fail-closed, scoped to coordinated tables only.
+duplicate; if the sidecar is unreachable, coordinated commits abort with
+`40001` — fail-closed and retryable, scoped to coordinated tables only; and
+**the engine drops the physical unique index** backing a coordinated key,
+including the one the originator's own `CREATE TABLE` built (see
+[LIMITATIONS](#12-limitations)).
 
 ---
 
@@ -271,6 +295,15 @@ of this file as the feature set lands.
   to per column; counters eliminate it for accumulation.
 - **Eventual unique keys converge by loser-null.** A local insert's success
   is not a global guarantee.
+- **A coordinated key's physical UNIQUE index is dropped**, on every node
+  including the one whose `CREATE TABLE` declared it. This is not an
+  optimization: every node is a receiver, and a local index would fail an
+  apply transaction with `23505` before arbitration could run — turning a
+  legitimate transfer, or a value whose release this node has not yet seen,
+  into permanent divergence. Enforcement moves entirely to the pre-commit
+  reservation. A direct `psql` write with the sidecar down therefore has no
+  index to stop it, which is the same posture as any other write that
+  bypasses the gate.
 - **Incremental blob patching is not supported.** Use `bytea` and replicate
   whole values.
 - **Postgres 17+**, one sidecar per database, and a superuser-adjacent

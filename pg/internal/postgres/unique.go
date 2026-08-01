@@ -271,7 +271,11 @@ func findUniqueOwner(ctx context.Context, tx pgx.Tx, ti *tableInfo, key *uniqueK
 		}
 		pkCVs[i] = cv
 	}
-	return pkBlobTyped(pkCVs), true, nil
+	pk, err := pkBlobTyped(pkCVs)
+	if err != nil {
+		return nil, false, err
+	}
+	return pk, true, nil
 }
 
 // nullKeyColumns stages UPDATE <table> SET <k cols> = NULL WHERE pk = qPK on the

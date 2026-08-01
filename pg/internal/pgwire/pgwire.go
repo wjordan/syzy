@@ -43,6 +43,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -156,6 +157,15 @@ func Listen(cfg Config) (*Server, error) {
 	ln, err := net.Listen("unix", cfg.Socket)
 	if err != nil {
 		return nil, fmt.Errorf("pgwire: listen %s: %w", cfg.Socket, err)
+	}
+	// The Postgres backend that connects runs as the postgres user, not as
+	// whoever runs the sidecar, and connecting to a unix socket requires
+	// write permission on it. Postgres's own sockets are 0777 for the same
+	// reason: the containing directory's permissions are the access control,
+	// not the socket file's.
+	if err := os.Chmod(cfg.Socket, 0o777); err != nil {
+		ln.Close()
+		return nil, fmt.Errorf("pgwire: chmod %s: %w", cfg.Socket, err)
 	}
 	s := &Server{
 		ln:       ln,

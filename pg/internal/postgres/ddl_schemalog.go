@@ -62,8 +62,8 @@ func (e *Engine) appendDDLBundle(ctx context.Context, intents []ddlIntent) error
 		}
 		if refresh {
 			if ti := e.cat.byID[op.TableID]; ti != nil {
-				if err := ensureCoordinatedPhysical(ctx, e.appl.conn, ti); err != nil {
-					return fmt.Errorf("coordinated gate on %s: %w", ti.name, err)
+				if err := ensureCoordinated(ctx, e.appl.conn, e.cat, ti); err != nil {
+					return fmt.Errorf("coordinated key on %s: %w", ti.name, err)
 				}
 			}
 		}

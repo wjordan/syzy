@@ -27,7 +27,11 @@ func typedPK(t testing.TB, e *Engine, table string, texts ...string) crdt.PKBlob
 			}
 			cvs[i] = cv
 		}
-		return pkBlobTyped(cvs)
+		pk, err := pkBlobTyped(cvs)
+		if err != nil {
+			t.Fatalf("typedPK: %v", err)
+		}
+		return pk
 	}
 	t.Fatalf("typedPK: table %s not in catalog", table)
 	return nil
@@ -58,7 +62,10 @@ func TestPKBlobMatchesSQLiteCatalog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EncodePKFromSlice: %v", err)
 	}
-	pgPK := pkBlobTyped([]crdt.ColValue{intCV, textCV})
+	pgPK, err := pkBlobTyped([]crdt.ColValue{intCV, textCV})
+	if err != nil {
+		t.Fatalf("pkBlobTyped: %v", err)
+	}
 	if !bytes.Equal(sqlitePK, pgPK) {
 		t.Fatalf("PK identity diverges:\n sqlite %x\n pg     %x", sqlitePK, pgPK)
 	}

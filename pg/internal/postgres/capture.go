@@ -586,7 +586,11 @@ func decodeRawTuple(ti *tableInfo, colNames []string, cols []rawCol) (image []cr
 			continue
 		}
 	}
-	return image, pkBlobTyped(pkCVs), nil
+	pk, perr := pkBlobTyped(pkCVs)
+	if perr != nil {
+		return nil, nil, perr
+	}
+	return image, pk, nil
 }
 
 func pkIndexOf(ti *tableInfo, col *colInfo) int {

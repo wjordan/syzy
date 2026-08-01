@@ -26,8 +26,10 @@ import (
 	"github.com/wjordan/syzy/internal/metadata"
 	"github.com/wjordan/syzy/internal/mirror"
 	"github.com/wjordan/syzy/internal/nodestate"
+	"github.com/wjordan/syzy/pg/internal/pgwire"
 	"github.com/wjordan/syzy/schemalog"
 	"github.com/wjordan/syzy/transport"
+	"github.com/wjordan/syzy/unique"
 )
 
 // selfLogSegmentSize bounds each self-origin-log segment file; the active
@@ -160,13 +162,27 @@ type Config struct {
 	// delivery.
 	SealedSelfSeq func() crdt.Seq
 
-	// CoordinatedUnique enables CP unique keys (docs/postgres.md §8 v1):
-	// admission marks an all-NOT-NULL UNIQUE key Coordinated, every node holds
-	// its physical index, and local coordinated-key writes are gated on the
-	// unique-write lease (RunUniqueLease + SetUniqueGate). Requires the
-	// cluster's object store for the lease; without it NOT NULL UNIQUE stays
-	// rejected at DDL admission.
+	// CoordinatedUnique enables CP unique keys (docs/postgres.md §7):
+	// admission marks an all-NOT-NULL UNIQUE key Coordinated and the engine
+	// enforces it by reserve-before-commit against Registry. No node holds a
+	// physical index for such a key. Requires Registry and ReserveSocketDir;
+	// without them NOT NULL UNIQUE stays rejected at DDL admission.
 	CoordinatedUnique bool
+
+	// Registry is the cluster's coordinated-uniqueness backend. Required
+	// when CoordinatedUnique.
+	Registry unique.Registry
+
+	// ReserveSocketDir is a directory this process and the Postgres server
+	// both see, in which the reservation endpoint binds its socket. The name
+	// inside it is libpq's own (".s.PGSQL.<port>"), because the writer's
+	// trigger reaches the endpoint through dblink, which builds a libpq
+	// connection. Required when CoordinatedUnique.
+	ReserveSocketDir string
+
+	// ReservePort names the socket within ReserveSocketDir. Any value works
+	// — the directory is the sidecar's — and it defaults to 5432.
+	ReservePort int
 }
 
 // Engine is the Postgres adapter. It owns the apply connection and the
@@ -187,10 +203,15 @@ type Engine struct {
 	// (reader) — both on the orchestrator goroutine.
 	winners *winnerStash
 
-	// gateConn is a dedicated session for SetUniqueGate: the sidecar's lease
-	// goroutine writes the gate concurrently with the orchestrator's use of
-	// the apply conn. nil unless Config.CoordinatedUnique.
-	gateConn *pgx.Conn
+	// reserveSrv answers coordinated-key reservations from Postgres backends
+	// blocked in their commit. nil unless Config.CoordinatedUnique.
+	reserveSrv *pgwire.Server
+
+	// enumConn is the leaseholder enumeration's own read-only session. It
+	// exists because that enumeration runs on the lease-maintenance
+	// goroutine while the orchestrator owns the apply conn, and a pgx
+	// connection carries one session's state — sharing would be a race.
+	enumConn *pgx.Conn
 
 	// schemaSeq is the highest schema-log event this node has originated or
 	// applied (§6); the parent for the next append and the floor for catch-up.
@@ -252,16 +273,10 @@ func Open(ctx context.Context, cfg Config) (*Engine, error) {
 	e.cat = cat
 	cat.coordUnique = cfg.CoordinatedUnique
 	if cfg.CoordinatedUnique {
-		if err := ensureCoordGateSchema(ctx, apply); err != nil {
+		if err := e.startReservationEndpoint(ctx, cat); err != nil {
 			e.Close()
-			return nil, fmt.Errorf("coordinated gate schema: %w", err)
+			return nil, err
 		}
-		gate, err := pgx.Connect(ctx, cfg.ConnURL)
-		if err != nil {
-			e.Close()
-			return nil, fmt.Errorf("gate conn: %w", err)
-		}
-		e.gateConn = gate
 	}
 	e.prog = &progress{}
 	e.winners = newWinnerStash()
@@ -471,9 +486,13 @@ func (e *Engine) Close() error {
 		_ = e.maint.Close(context.Background())
 		e.maint = nil
 	}
-	if e.gateConn != nil {
-		_ = e.gateConn.Close(context.Background())
-		e.gateConn = nil
+	if e.reserveSrv != nil {
+		_ = e.reserveSrv.Close()
+		e.reserveSrv = nil
+	}
+	if e.enumConn != nil {
+		_ = e.enumConn.Close(context.Background())
+		e.enumConn = nil
 	}
 	if e.apply == nil {
 		return nil

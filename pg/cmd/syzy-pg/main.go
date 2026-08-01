@@ -228,7 +228,40 @@ func run(args []string) error {
 	ctx, cancel := signalContext()
 	defer cancel()
 
-	eng, err := postgres.Open(ctx, postgres.Config{
+	// Coordinated uniqueness (docs/postgres.md §7). The leaseholder derives
+	// the taken-set by enumerating this node's own rows, so it needs the
+	// engine — which in turn needs the registry. The engine pointer is
+	// filled in below, before anything can tick.
+	var eng *postgres.Engine
+	var uniqueReg unique.Registry
+	var leaseholder *unique.Leaseholder
+	if coordBucket != nil {
+		leaseStore := unique.OpenLease(coordBucket, "unique/lease")
+		leaseholder = unique.NewLeaseholder(unique.LeaseholderConfig{
+			Store: leaseStore,
+			// A clean shutdown publishes the taken-set so a successor
+			// serves immediately instead of waiting out a failover drain.
+			Handoff:   unique.OpenHandoff(coordBucket, "unique/handoff"),
+			Owner:     fmt.Sprintf("pg-%d", cfg.origin),
+			Transport: ch.UniqueServeTransport(),
+			Enumerate: func(ctx context.Context) (unique.Snapshot, error) {
+				if eng == nil {
+					return unique.Snapshot{}, nil
+				}
+				return eng.EnumerateCoordinated(ctx)
+			},
+		})
+		if err := leaseholder.Start(); err != nil {
+			return fmt.Errorf("start unique leaseholder: %w", err)
+		}
+		defer leaseholder.Close()
+		// Co-locate: when this node holds the lease, reserve in-process
+		// rather than dialing the address published for remote peers.
+		uniqueReg = unique.NewLeaseClientTransport(leaseStore, ch.UniqueDialTransport()).
+			UseLocalLeaseholder(leaseholder)
+	}
+
+	eng, err = postgres.Open(ctx, postgres.Config{
 		Name:              cfg.dbName,
 		Origin:            cfg.origin,
 		Cluster:           cfg.clusterID,
@@ -247,6 +280,8 @@ func run(args []string) error {
 		OnPublished:       onPublished,
 		SealedSelfSeq:     sealedSelfSeq,
 		CoordinatedUnique: coordBucket != nil,
+		Registry:          uniqueReg,
+		ReserveSocketDir:  filepath.Join(cfg.dataDir, "reserve"),
 		DDL:               cfg.ddl,
 		SchemaLog:         schemaLog,
 		CheckpointEvery:   cfg.checkpointEvery,
@@ -263,20 +298,15 @@ func run(args []string) error {
 		ch.SetCatchupSource(src)
 	}
 
-	// Coordinated uniqueness (docs/postgres.md §8): contend for the cluster's
-	// unique-write lease and mirror it into this node's gate. The drain gives a
-	// dead predecessor's in-flight coordinated writes time to arrive first.
-	if coordBucket != nil {
-		ls := unique.OpenLease(coordBucket, "unique/lease")
-		owner := fmt.Sprintf("pg-%d", cfg.origin)
+	// Drive the lease loop now that the engine can answer enumeration. The
+	// goroutine is joined before the engine closes, so the last enumeration
+	// never races the connection teardown.
+	if leaseholder != nil {
 		leaseDone := make(chan struct{})
 		go func() {
 			defer close(leaseDone)
-			eng.RunUniqueLease(ctx, ls, owner, 5*time.Second)
+			leaseholder.RunMaintenance(ctx)
 		}()
-		// Registered after eng's deferred Close, so it runs first: the lease
-		// goroutine must finish (closing the gate + releasing the lease over
-		// the engine's gate conn) before Close tears that conn down.
 		defer func() { <-leaseDone }()
 	}
 

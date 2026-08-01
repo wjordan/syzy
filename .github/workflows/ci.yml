@@ -52,6 +52,10 @@ jobs:
         run: |
           chmod +x scripts/pg-test-container.sh
           echo "SYZY_PG_TEST_URL=$(scripts/pg-test-container.sh start)" >> "$GITHUB_ENV"
+          # Coordinated-uniqueness tests need Postgres to dial back into the
+          # test process over a socket both sides can see (the script bind
+          # -mounts this directory into the container).
+          echo "SYZY_PG_TEST_SOCKDIR=${SYZY_PG_TEST_SOCKDIR:-/tmp/syzy-pg-test-sock}" >> "$GITHUB_ENV"
 
       - name: test
         run: go test -race -count=1 ./...

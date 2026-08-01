@@ -439,9 +439,9 @@ type liveUniqueKey struct {
 //   - a NOT NULL member in a key that is not fully NOT NULL — a loser converges
 //     by nulling its key columns, which a NOT NULL column forbids. A key whose
 //     members are ALL NOT NULL is instead **coordinated** when the engine has
-//     coordination enabled (coordOK): leaseholder-gated, physically indexed on
-//     every node, never loser-nulled (coordinated.go). Without coordination it
-//     stays rejected.
+//     coordination enabled (coordOK): reserved before commit, physically
+//     indexed on no node, never loser-nulled (coordinated.go). Without
+//     coordination it stays rejected.
 func liveUniqueKeyCols(ctx context.Context, conn *pgx.Conn, ti *tableInfo, coordOK bool) ([]liveUniqueKey, error) {
 	byAttnum := make(map[int]*colInfo, len(ti.cols))
 	for _, ci := range ti.cols {
@@ -493,9 +493,9 @@ func liveUniqueKeyCols(ctx context.Context, conn *pgx.Conn, ti *tableInfo, coord
 		coordinated := false
 		switch {
 		case notNull == len(cols) && coordOK:
-			coordinated = true // CP key: leaseholder-gated, physically indexed everywhere
+			coordinated = true // CP key: reserved before commit, indexed nowhere
 		case notNull == len(cols):
-			return nil, unsupportedDDLf("postgres: %s: NOT NULL UNIQUE requires coordinated uniqueness (run with an object-store bucket so the unique-write lease is available)", ti.name)
+			return nil, unsupportedDDLf("postgres: %s: NOT NULL UNIQUE requires coordinated uniqueness (run with an object-store bucket so the cluster's key registry is available)", ti.name)
 		case notNull > 0:
 			return nil, unsupportedDDLf("postgres: %s: UNIQUE mixing NOT NULL and nullable members has no convergent loser state and is rejected", ti.name)
 		}
