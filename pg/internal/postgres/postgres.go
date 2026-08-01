@@ -265,6 +265,14 @@ func Open(ctx context.Context, cfg Config) (*Engine, error) {
 		return nil, err
 	}
 
+	// Cell clock group + counter support (§8): the syzy_counter domain must
+	// exist before the catalog is introspected (a bootstrap table may declare a
+	// counter column) and before any counter-bearing changeset applies.
+	if err := installCounterSupport(ctx, apply); err != nil {
+		e.Close()
+		return nil, fmt.Errorf("install counter support: %w", err)
+	}
+
 	cat, err := introspectCatalog(ctx, apply, cfg.Tables)
 	if err != nil {
 		e.Close()

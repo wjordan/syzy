@@ -576,7 +576,7 @@ func (s *MetaSink) buildRecords(evidence []recordEvidence, stamp crdt.Stamp) err
 			cur := s.getRowState(ev.tableID, ev.newPK)
 			cl := cur.NextLiveCL()
 			s.records = append(s.records, crdt.Update{Table: ev.tableID, PK: ev.newPK, CL: cl, Changed: ev.changed})
-			if tab, ok := s.cat.TableByID(ev.tableID); ok && tab.CellGroup() && !coversAllNonPK(tab, ev.changed) {
+			if tab, ok := s.cat.TableByID(ev.tableID); ok && tab.CellGroup() && !crdt.CoversAllNonPK(tab, ev.changed) {
 				// Cell group, partial coverage: the local commit
 				// advances only the carried columns' stamps. The row
 				// baseline stays put so concurrent remote writes to

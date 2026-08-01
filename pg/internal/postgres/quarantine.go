@@ -24,20 +24,32 @@ const quarantineRetryInterval = 30 * time.Second
 // quarantines instead of pinning its origin's frontier.
 var errBlobPatchUnsupported = errors.New("postgres: blob patches are not supported by the postgres engine")
 
+// errCounterApply marks a deterministic, payload-specific counter failure — a
+// wire value that violates the counter contract. Like a constraint violation it
+// would otherwise pin the origin's frontier forever, so it routes to quarantine.
+var errCounterApply = errors.New("postgres: counter apply")
+
 // isDeterministicApplyErr reports whether an apply error is deterministic and
 // payload-specific — a Postgres integrity-constraint violation (SQLSTATE
-// class 23: NOT NULL, UNIQUE, FK, CHECK, exclusion) or a record kind this
-// engine refuses by construction (blob patches). These would otherwise pin
+// class 23: NOT NULL, UNIQUE, FK, CHECK, exclusion), a counter payload that
+// violates the summation contract, or a record kind this engine refuses by
+// construction (blob patches). These would otherwise pin
 // the per-origin frontier forever — retrying the same bytes yields the same
 // error. Everything else (connection loss, schema gate, serialization, disk)
 // is treated as transient and stays fatal to Run: restart + redelivery is the
 // recovery path.
 func isDeterministicApplyErr(err error) bool {
-	if errors.Is(err, errBlobPatchUnsupported) {
+	if errors.Is(err, errBlobPatchUnsupported) || errors.Is(err, errCounterApply) {
 		return true
 	}
 	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && strings.HasPrefix(pgErr.Code, "23")
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	// 22003 numeric_value_out_of_range: a counter summation that overflows
+	// bigint. Payload-specific like a constraint violation — and it can even
+	// clear on a retry, once later contributions move the cell back in range.
+	return strings.HasPrefix(pgErr.Code, "23") || pgErr.Code == "22003"
 }
 
 // quarantinePolicy binds the shared quarantine behavior (internal/quarantine)

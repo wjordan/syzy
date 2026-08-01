@@ -26,7 +26,8 @@ import (
 // as 0/1 (SQLite's own convention).
 func sqliteClass(typeName string) crdt.ColType {
 	switch typeName {
-	case "smallint", "integer", "bigint", "int2", "int4", "int8", "boolean":
+	case "smallint", "integer", "bigint", "int2", "int4", "int8", "boolean",
+		counterTypeName: // the counter domain is a bigint underneath (cell.go)
 		return crdt.ColInt
 	case "real", "double precision", "float4", "float8":
 		return crdt.ColReal

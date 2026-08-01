@@ -208,6 +208,11 @@ type rowAccum struct {
 	firstOp byte // 'i' | 'u' | 'd' at first touch this txn
 	lastOp  byte
 	image   []crdt.ColValue // latest new image (insert/update); nil for delete
+	// oldImage is the row's image at FIRST touch this transaction, decoded from
+	// the REPLICA IDENTITY FULL old tuple. Only cell-group tables carry it: the
+	// net changed-column set is (first old → last new), so a row updated twice in
+	// one transaction ships one record for the combined effect (§8).
+	oldImage []crdt.ColValue
 }
 
 // feed records one primitive op on a row, updating its net first/last effect.
@@ -215,14 +220,14 @@ type rowAccum struct {
 // unchanged-TOAST columns ('u') from an UPDATE, so an INSERT-then-UPDATE in
 // one txn must keep the insert's columns the update omitted — otherwise the
 // collapsed Insert would ship a truncated row.
-func (t *txnAccum) feed(tid crdt.TableID, pk crdt.PKBlob, op byte, image []crdt.ColValue) {
+func (t *txnAccum) feed(tid crdt.TableID, pk crdt.PKBlob, op byte, image, oldImage []crdt.ColValue) {
 	if t.rows == nil {
 		t.rows = map[rowKey]*rowAccum{}
 	}
 	k := rowKey{tid, string(pk)}
 	a := t.rows[k]
 	if a == nil {
-		a = &rowAccum{tid: tid, pk: pk, firstOp: op}
+		a = &rowAccum{tid: tid, pk: pk, firstOp: op, oldImage: oldImage}
 		t.rows[k] = a
 		t.order = append(t.order, k)
 	}
@@ -622,6 +627,14 @@ type localFold struct {
 	selfCorrect []selfCorrectOp
 }
 
+// stagedClock is one row's clock effect from this fold, held until the
+// changeset is built: the row state to publish and whether the prior
+// generation's per-column overrides go with it.
+type stagedClock struct {
+	state      crdt.RowState
+	clearCells bool
+}
+
 // selfCorrectOp is one row's winner-repair write: the orchestrator UPSERTs
 // image into table at pk via the apply conn, repairing a local loser.
 type selfCorrectOp struct {
@@ -647,40 +660,47 @@ func (c *capturer) foldCommit(t *txnAccum) (*crdt.Changeset, *localFold, error) 
 			if err != nil {
 				return nil, nil, err
 			}
-			t.feed(ti.tid, pk, 'i', image)
+			t.feed(ti.tid, pk, 'i', image, nil)
 		case 'u':
 			image, newPK, err := decodeRawTuple(ti, raw.colNames, raw.newTup)
 			if err != nil {
 				return nil, nil, err
 			}
-			// Under default REPLICA IDENTITY, OldTuple is present iff the PK
-			// changed; a PK change is delete(oldPK)+insert(newPK) (§3).
+			// OldTuple is present iff the PK changed (default REPLICA IDENTITY) or
+			// the table is in the cell clock group (FULL, which logs the whole old
+			// row — the per-column diff baseline, §8). A PK change is
+			// delete(oldPK)+insert(newPK) (§3).
+			var oldImage []crdt.ColValue
 			if raw.oldTup != nil {
-				_, oldPK, err := decodeRawTuple(ti, raw.colNames, raw.oldTup)
+				old, oldPK, err := decodeRawTuple(ti, raw.colNames, raw.oldTup)
 				if err != nil {
 					return nil, nil, err
 				}
 				if !bytes.Equal(oldPK, newPK) {
-					t.feed(ti.tid, oldPK, 'd', nil)
-					t.feed(ti.tid, newPK, 'i', image)
+					t.feed(ti.tid, oldPK, 'd', nil, nil)
+					t.feed(ti.tid, newPK, 'i', image, nil)
 					continue
 				}
+				oldImage = old
 			}
-			t.feed(ti.tid, newPK, 'u', image)
+			t.feed(ti.tid, newPK, 'u', image, oldImage)
 		case 'd':
 			_, pk, err := decodeRawTuple(ti, raw.colNames, raw.oldTup)
 			if err != nil {
 				return nil, nil, err
 			}
-			t.feed(ti.tid, pk, 'd', nil)
+			t.feed(ti.tid, pk, 'd', nil, nil)
 		}
 	}
 
 	records := make([]crdt.Record, 0, len(t.order))
 	// CLs are assigned against the Cache, staged so multiple effects on one
 	// key (rare: PK-change collisions) compose; the stamp is allocated once,
-	// only if some effect survives the net-effect collapse.
-	staged := map[rowKey]crdt.RowState{}
+	// only if some effect survives the net-effect collapse. A cell-group
+	// partial-column update stages per-column stamps instead of a row baseline
+	// (cellWrites), exactly as the peers applying that record will (§8).
+	staged := map[rowKey]stagedClock{}
+	var cellWrites []cellStamp
 	var stamp crdt.Stamp
 	stampOnce := func() crdt.Stamp {
 		if stamp.IsZero() {
@@ -689,8 +709,8 @@ func (c *capturer) foldCommit(t *txnAccum) (*crdt.Changeset, *localFold, error) 
 		return stamp
 	}
 	rowStateOf := func(k rowKey) crdt.RowState {
-		if rs, ok := staged[k]; ok {
-			return rs
+		if sc, ok := staged[k]; ok {
+			return sc.state
 		}
 		return c.cfg.Cache.RowState(k.tid, []byte(k.pk))
 	}
@@ -698,6 +718,7 @@ func (c *capturer) foldCommit(t *txnAccum) (*crdt.Changeset, *localFold, error) 
 	var selfCorrect []selfCorrectOp
 	for _, k := range t.order {
 		a := t.rows[k]
+		ti := c.cat.table(a.tid)
 		op := a.lastOp
 		if op == 'd' && a.firstOp == 'i' {
 			continue // created and removed within the txn — net no-op
@@ -706,6 +727,7 @@ func (c *capturer) foldCommit(t *txnAccum) (*crdt.Changeset, *localFold, error) 
 		var cl uint64
 		var rec crdt.Record
 		isRecreate := false // d-then-i pair: emits a preceding Delete and always dominates any Insert-shaped stash
+		cellUpdate := false // cell-group UPDATE: arbitrates (and stamps) per column
 		switch {
 		case op == 'd':
 			cl = rs.NextTombCL()
@@ -728,7 +750,24 @@ func (c *capturer) foldCommit(t *txnAccum) (*crdt.Changeset, *localFold, error) 
 			rec = crdt.Insert{Table: a.tid, PK: a.pk, CL: cl, Image: a.image}
 		case a.firstOp == 'u':
 			cl = rs.NextLiveCL()
-			rec = crdt.Update{Table: a.tid, PK: a.pk, CL: cl, Changed: a.image}
+			changed := a.image
+			if ti != nil && ti.cellGroup() {
+				// The payload unit must match the arbitration unit: a cell-group
+				// receiver arbitrates each carried column on its own, so carrying a
+				// column this transaction did not change would stomp a concurrent
+				// disjoint write at our stamp. Ship the diff (counter columns as
+				// summable contributions).
+				diff, err := cellChanged(ti, a.oldImage, a.image)
+				if err != nil {
+					return nil, nil, err
+				}
+				if len(diff) == 0 {
+					continue // no column actually changed — nothing to replicate
+				}
+				changed = diff
+				cellUpdate = true
+			}
+			rec = crdt.Update{Table: a.tid, PK: a.pk, CL: cl, Changed: changed}
 		default: // brand-new live row
 			cl = rs.NextLiveCL()
 			rec = crdt.Insert{Table: a.tid, PK: a.pk, CL: cl, Image: a.image}
@@ -745,15 +784,53 @@ func (c *capturer) foldCommit(t *txnAccum) (*crdt.Changeset, *localFold, error) 
 			if w, ok := c.winners.winner(a.tid, a.pk); ok {
 				local := crdt.RowState{CL: cl, Base: stampOnce()}
 				if local.DominatedBy(w.CL, w.Stamp) {
-					selfCorrect = append(selfCorrect, selfCorrectOp{tid: a.tid, pk: a.pk, image: w.Image})
-					continue
+					// A cell-group loss is per column: only the columns the winning
+					// record actually carried are lost, and the rest of this write
+					// still wins on every peer, so only those are repaired + dropped.
+					if upd, isUpd := rec.(crdt.Update); isUpd && cellUpdate {
+						kept, lost := splitCellLosers(upd.Changed, w.Cols)
+						if len(lost) > 0 {
+							selfCorrect = append(selfCorrect, selfCorrectOp{
+								tid: a.tid, pk: a.pk, image: repairImage(ti, w.Image, lost),
+							})
+						}
+						if len(kept) == 0 {
+							continue
+						}
+						upd.Changed = kept
+						rec = upd
+					} else {
+						selfCorrect = append(selfCorrect, selfCorrectOp{tid: a.tid, pk: a.pk, image: w.Image})
+						continue
+					}
+				} else {
+					// Local dominates — winner stash is stale; peers will adopt this write.
+					c.winners.clear(a.tid, a.pk)
 				}
-				// Local dominates — winner stash is stale; peers will adopt this write.
-				c.winners.clear(a.tid, a.pk)
 			}
 		}
 		records = append(records, rec)
-		staged[k] = crdt.RowState{CL: cl, Base: stampOnce()}
+		if upd, isUpd := rec.(crdt.Update); isUpd && cellUpdate && !crdt.CoversAllNonPK(ti, upd.Changed) {
+			// Partial coverage: advance only the carried columns' stamps. The row
+			// baseline stays put so a concurrent remote write to another column
+			// still merges in; a generation bump leaves Base zero, mirroring the
+			// receiver-side rule (internal/broker applyCellUpdate).
+			sc := stagedClock{state: rs}
+			if cl > rs.CL {
+				sc = stagedClock{state: crdt.RowState{CL: cl}, clearCells: true}
+			}
+			staged[k] = sc
+			for _, v := range upd.Changed {
+				if v.Format == crdt.FormatDelta {
+					continue // counter cells carry no stamp — they sum
+				}
+				cellWrites = append(cellWrites, cellStamp{tid: a.tid, pk: a.pk, col: v.Column, stamp: stampOnce()})
+			}
+			continue
+		}
+		// Row group, or a cell-group write covering every column (collapse): the
+		// write defines the whole row — absorb it into the baseline.
+		staged[k] = stagedClock{state: crdt.RowState{CL: cl, Base: stampOnce()}, clearCells: rs.Cells != nil}
 	}
 	if len(records) == 0 {
 		if len(selfCorrect) == 0 {
@@ -776,10 +853,15 @@ func (c *capturer) foldCommit(t *txnAccum) (*crdt.Changeset, *localFold, error) 
 	if err != nil {
 		return nil, nil, err
 	}
-	// Commit staged row states to the shared Cache before delivery (mirrors
-	// syncer/sink.go).
-	for k, rs := range staged {
-		c.cfg.Cache.PutRowState(k.tid, []byte(k.pk), rs)
+	// Commit staged clocks to the shared Cache before delivery (mirrors
+	// syncer/sink.go): row states first, then the per-column overrides.
+	for k, sc := range staged {
+		if c.cfg.Cache.PutRowState(k.tid, []byte(k.pk), sc.state) && sc.clearCells {
+			c.cfg.Cache.ClearCellsForRow(k.tid, []byte(k.pk))
+		}
+	}
+	for _, cw := range cellWrites {
+		c.cfg.Cache.PutCellStamp(cw.tid, cw.pk, cw.col, cw.stamp)
 	}
 	return cs, &localFold{selfCorrect: selfCorrect}, nil
 }

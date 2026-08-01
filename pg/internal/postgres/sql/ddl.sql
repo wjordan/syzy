@@ -66,8 +66,14 @@ CREATE UNLOGGED TABLE IF NOT EXISTS syzy_ddl_prior (
     is_generated boolean NOT NULL,
     identity     "char"  NOT NULL,
     pkpos        int     NOT NULL,
+    -- The table's pre-command pg_class.relreplident, repeated on each of its
+    -- rows: REPLICA IDENTITY FULL is the cell-clock-group opt-in, so the
+    -- admission gate has to know which side of the flip the command started on.
+    replident    "char"  NOT NULL DEFAULT 'd',
     PRIMARY KEY (pid, relid, attname)
 );
+-- Upgrade path for a node whose spool predates the column.
+ALTER TABLE syzy_ddl_prior ADD COLUMN IF NOT EXISTS replident "char" NOT NULL DEFAULT 'd';
 
 CREATE OR REPLACE FUNCTION syzy_ddl_snapshot() RETURNS event_trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
@@ -79,10 +85,10 @@ BEGIN
     DELETE FROM syzy_ddl_prior p
     WHERE NOT EXISTS (SELECT 1 FROM pg_stat_activity s WHERE s.pid = p.pid);
     INSERT INTO syzy_ddl_prior
-      (pid, relid, attname, typename, is_notnull, is_generated, identity, pkpos)
+      (pid, relid, attname, typename, is_notnull, is_generated, identity, pkpos, replident)
     SELECT pg_backend_pid(), a.attrelid, a.attname,
            format_type(a.atttypid, a.atttypmod), a.attnotnull,
-           a.attgenerated <> '', a.attidentity, COALESCE(k.pkpos, 0)
+           a.attgenerated <> '', a.attidentity, COALESCE(k.pkpos, 0), c.relreplident
     FROM pg_attribute a
     JOIN pg_class c ON c.oid = a.attrelid AND c.relkind = 'r' AND c.relpersistence = 'p'
     JOIN pg_namespace ns ON ns.oid = c.relnamespace AND ns.nspname = 'public'
@@ -167,7 +173,11 @@ BEGIN
       JOIN pg_type t ON t.oid = a.atttypid
       JOIN pg_namespace tn ON tn.oid = t.typnamespace
      WHERE a.attrelid = rel AND a.attnum > 0 AND NOT a.attisdropped
-       AND tn.nspname <> 'pg_catalog';
+       AND tn.nspname <> 'pg_catalog'
+       -- syzy_counter is the one non-built-in type that replicates: it is a
+       -- bigint domain every node installs, and it is how a counter column is
+       -- declared (sql/counter.sql).
+       AND NOT (tn.nspname = 'public' AND t.typname = 'syzy_counter');
     IF bad IS NOT NULL THEN
         RAISE EXCEPTION 'syzy: CREATE TABLE %: column(s) % use a user-defined type; only built-in types replicate', tname, bad
             USING ERRCODE = 'feature_not_supported';
@@ -251,6 +261,104 @@ BEGIN
     END IF;
 END $$;
 
+-- syzy_ddl_admit_cells enforces the merge-semantics rules for the cell clock
+-- group and counter columns (docs/postgres.md §8), and installs the physical
+-- capability they need.
+--
+-- REPLICA IDENTITY FULL is the cell-group opt-in: it is exactly the capability
+-- per-column merge requires (capture diffs the old tuple against the new to
+-- learn which columns a transaction actually changed), so the physical setting
+-- and the merge rule cannot drift apart. A counter column implies the cell
+-- group, so a table that declares one has FULL set here — in the same
+-- transaction as the DDL that declared it, before any row can be written.
+--
+-- Its twins in the sidecar are classifyColumnChange / buildAlterTableOps, which
+-- stay as the post-commit floor for a node whose DDL support was installed late.
+CREATE OR REPLACE FUNCTION syzy_ddl_admit_cells(rel oid) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+DECLARE
+    tname     text := rel::regclass::text;
+    c         record;
+    counters  boolean := false;
+    live_ri   "char";
+    prior_ri  "char";
+BEGIN
+    SELECT relreplident INTO live_ri FROM pg_class WHERE oid = rel;
+    SELECT max(p.replident) INTO prior_ri FROM syzy_ddl_prior p
+     WHERE p.pid = pg_backend_pid() AND p.relid = rel;
+
+    -- Counter columns merge by summation: every contribution has to be a real
+    -- number the receiver can add, on a cell that no other rule may overwrite.
+    FOR c IN
+        SELECT a.attname, a.attnotnull, a.attgenerated <> '' AS is_generated,
+               a.attidentity AS identity, COALESCE(k.pkpos, 0) AS pkpos
+        FROM pg_attribute a
+        JOIN pg_type t ON t.oid = a.atttypid
+        JOIN pg_namespace tn ON tn.oid = t.typnamespace
+        LEFT JOIN LATERAL (
+            SELECT x.ord AS pkpos
+            FROM pg_index i, unnest(i.indkey) WITH ORDINALITY AS x(attnum, ord)
+            WHERE i.indrelid = a.attrelid AND i.indisprimary AND x.attnum = a.attnum
+        ) k ON true
+        WHERE a.attrelid = rel AND a.attnum > 0 AND NOT a.attisdropped
+          AND tn.nspname = 'public' AND t.typname = 'syzy_counter'
+    LOOP
+        counters := true;
+        IF NOT c.attnotnull THEN
+            RAISE EXCEPTION 'syzy: %: counter column "%" must be NOT NULL — a NULL cell has no value to sum contributions into', tname, c.attname
+                USING ERRCODE = 'feature_not_supported';
+        END IF;
+        IF c.pkpos > 0 THEN
+            RAISE EXCEPTION 'syzy: %: counter column "%" cannot be part of the PRIMARY KEY — row identity must not change when a contribution is summed in', tname, c.attname
+                USING ERRCODE = 'feature_not_supported';
+        END IF;
+        IF c.is_generated OR c.identity <> '' THEN
+            RAISE EXCEPTION 'syzy: %: counter column "%" cannot be GENERATED or an IDENTITY column — its value is the sum of replicated contributions, not a node-local expression', tname, c.attname
+                USING ERRCODE = 'feature_not_supported';
+        END IF;
+        IF EXISTS (
+            SELECT 1 FROM pg_index i, unnest(i.indkey) AS x(attnum)
+            JOIN pg_attribute a ON a.attrelid = rel AND a.attnum = x.attnum
+            WHERE i.indrelid = rel AND i.indisunique AND a.attname = c.attname
+        ) OR EXISTS (
+            -- Coordinated keys carry no physical index (coordinated.sql); their
+            -- member columns are named in the accumulating trigger's arguments.
+            SELECT 1 FROM pg_trigger tg
+            WHERE tg.tgrelid = rel AND NOT tg.tgisinternal
+              AND tg.tgname LIKE 'syzy\_coord\_accum\_%'
+              AND pg_get_triggerdef(tg.oid) LIKE '%' || quote_literal(c.attname) || '%'
+        ) THEN
+            RAISE EXCEPTION 'syzy: %: counter column "%" cannot be part of a UNIQUE key — concurrent contributions sum to a value no writer reserved', tname, c.attname
+                USING ERRCODE = 'feature_not_supported';
+        END IF;
+    END LOOP;
+
+    IF counters AND live_ri <> 'f' THEN
+        IF prior_ri = 'f' THEN
+            -- The command turned the opt-in off under the counters' feet.
+            RAISE EXCEPTION 'syzy: %: counter columns merge per column and require REPLICA IDENTITY FULL; drop the counter columns before leaving the cell clock group', tname
+                USING ERRCODE = 'feature_not_supported';
+        END IF;
+        -- The table just declared its first counter column: give it the cell
+        -- clock group now, inside this transaction, so no row is ever written
+        -- to a counter column under whole-row merge.
+        PERFORM set_config('syzy.internal', 'on', true);
+        EXECUTE format('ALTER TABLE %s REPLICA IDENTITY FULL', tname);
+        PERFORM set_config('syzy.internal', 'off', true);
+        live_ri := 'f';
+    END IF;
+
+    IF live_ri = 'f' AND EXISTS (
+        SELECT 1 FROM pg_trigger tg
+        WHERE tg.tgrelid = rel AND NOT tg.tgisinternal
+          AND tg.tgname LIKE 'syzy\_coord\_accum\_%'
+          AND tg.tgnargs > 3
+    ) THEN
+        RAISE EXCEPTION 'syzy: %: a composite coordinated (NOT NULL UNIQUE) key cannot use the cell clock group — per-column merge could assemble a row from writes that were never reserved together', tname
+            USING ERRCODE = 'feature_not_supported';
+    END IF;
+END $$;
+
 -- ddl_command_end fires once per top-level DDL command (CREATE/ALTER); it does
 -- NOT expose per-sub-object rows (ALTER TABLE t ADD COLUMN a is objid=t,
 -- objsubid=0), so the consumer reconstructs the column change by diffing the
@@ -298,6 +406,11 @@ BEGIN
         END IF;
         IF r.command_tag = 'ALTER TABLE' AND r.object_type = 'table' THEN
             PERFORM syzy_ddl_admit_alter(r.objid);
+        END IF;
+        -- Merge semantics (§8): counter-column rules, and the REPLICA IDENTITY
+        -- FULL the cell clock group runs on.
+        IF r.command_tag IN ('CREATE TABLE', 'ALTER TABLE') AND r.object_type = 'table' THEN
+            PERFORM syzy_ddl_admit_cells(r.objid);
         END IF;
         INSERT INTO syzy_ddl_intent
           (txid, ordinal, command_tag, object_type, classid, objid, objsubid,

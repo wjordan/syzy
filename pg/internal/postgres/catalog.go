@@ -40,6 +40,12 @@ type tableInfo struct {
 	byName       map[string]*colInfo
 	pk           []*colInfo // PK columns, key order
 
+	// clockGroup is the table's merge unit: metadata.ClockGroupRow (whole-row
+	// LWW, the default) or ClockGroupCell (per-column LWW + counter columns).
+	// It mirrors pg_class.relreplident — REPLICA IDENTITY FULL is the opt-in,
+	// and the capability per-column capture runs on (cell.go).
+	clockGroup string
+
 	// uniqueKeys lists the active non-PK unique keys (UNIQUE constraints /
 	// CREATE UNIQUE INDEX) the apply path's loser-null arbitration (§5) reads.
 	// Followers bind these in-catalog only — they do NOT create a physical
@@ -74,9 +80,17 @@ type colInfo struct {
 	def       string // diff (§6) can detect — and cleanly reject — an attribute-only
 	generated bool   // change it cannot yet represent as a typed op (increment G).
 	identity  uint8  // attidentity: 0/'a'/'d'; 'a' (GENERATED ALWAYS) needs OVERRIDING SYSTEM VALUE on apply.
+	counter   bool   // declared syzy_counter: the cell merges by summation (cell.go).
 }
 
-func (c *catalog) table(tid crdt.TableID) *tableInfo { return c.byID[tid] }
+// table resolves a stable id to its tableInfo, or nil. Nil-receiver-safe: the
+// deterministic fold fixtures drive a capturer with no catalog at all.
+func (c *catalog) table(tid crdt.TableID) *tableInfo {
+	if c == nil {
+		return nil
+	}
+	return c.byID[tid]
+}
 
 // addTable indexes ti by both its stable ID and its OID.
 func (c *catalog) addTable(ti *tableInfo) {
@@ -166,9 +180,10 @@ func introspectCatalog(ctx context.Context, conn *pgx.Conn, tables []string) (*c
 	for _, qname := range tables {
 		schema, name := splitQName(qname)
 		var oid uint32
+		var replident string
 		if err := conn.QueryRow(ctx, `
-			SELECT c.oid FROM pg_class c JOIN pg_namespace ns ON ns.oid = c.relnamespace
-			WHERE ns.nspname = $1 AND c.relname = $2`, schema, name).Scan(&oid); err != nil {
+			SELECT c.oid, c.relreplident::text FROM pg_class c JOIN pg_namespace ns ON ns.oid = c.relnamespace
+			WHERE ns.nspname = $1 AND c.relname = $2`, schema, name).Scan(&oid, &replident); err != nil {
 			return nil, fmt.Errorf("introspect %s: %w", qname, err)
 		}
 		pgcols, err := introspectColumns(ctx, conn, oid)
@@ -178,7 +193,8 @@ func introspectCatalog(ctx context.Context, conn *pgx.Conn, tables []string) (*c
 		if err := rejectUnreplicable(schema, name, pgcols); err != nil {
 			return nil, err
 		}
-		ti := &tableInfo{schema: schema, name: name, oid: oid, tid: deriveTableID(schema, name), byName: map[string]*colInfo{}}
+		ti := &tableInfo{schema: schema, name: name, oid: oid, tid: deriveTableID(schema, name),
+			byName: map[string]*colInfo{}, clockGroup: clockGroupForReplIdent(replIdentByte(replident))}
 		var pks []pkEntry
 		for _, pc := range pgcols {
 			ci := pc.colInfo(deriveColumnID(schema, name, pc.name))

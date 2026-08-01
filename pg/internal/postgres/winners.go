@@ -28,6 +28,49 @@ type winnerEntry struct {
 	CL    uint64
 	Stamp crdt.Stamp
 	Image []crdt.ColValue
+	// Cols are the columns the winning record actually arbitrated for, set only
+	// on a cell-group table. A losing local write there loses ONLY these columns
+	// — the rest of it still wins on every peer — so the fold repairs and drops
+	// exactly this set instead of the whole row. nil means the whole row (a
+	// row-group table, or an image that defines every column).
+	Cols map[crdt.ColumnID]struct{}
+}
+
+// splitCellLosers partitions a cell-group record's carried columns against the
+// stashed winner's column set: kept still wins on every peer, lost is what the
+// winner already owns.
+func splitCellLosers(changed []crdt.ColValue, winnerCols map[crdt.ColumnID]struct{}) (kept, lost []crdt.ColValue) {
+	if len(winnerCols) == 0 {
+		return nil, changed // whole-row winner: everything loses
+	}
+	for _, v := range changed {
+		if _, ok := winnerCols[v.Column]; ok {
+			lost = append(lost, v)
+		} else {
+			kept = append(kept, v)
+		}
+	}
+	return kept, lost
+}
+
+// repairImage restricts a stashed winner's full row image to the lost columns,
+// keeping the PK columns so the repair UPSERT can address the row.
+func repairImage(ti *tableInfo, image []crdt.ColValue, lost []crdt.ColValue) []crdt.ColValue {
+	want := make(map[crdt.ColumnID]struct{}, len(lost))
+	for _, v := range lost {
+		want[v.Column] = struct{}{}
+	}
+	out := make([]crdt.ColValue, 0, len(lost)+len(ti.pk))
+	for _, v := range image {
+		c := ti.colByID(v.Column)
+		if c == nil {
+			continue
+		}
+		if _, ok := want[v.Column]; ok || c.isPK {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // winnerStash maps contended rows to their stashed winner. Both the apply

@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/wjordan/syzy/crdt"
+	"github.com/wjordan/syzy/internal/metadata"
 )
 
 // applyCatalogOp executes the structural change described by op on conn — the
@@ -75,6 +76,8 @@ func applyCatalogOp(ctx context.Context, conn *pgx.Conn, cat *catalog, op crdt.C
 		return applyAddUniqueKey(ctx, conn, cat, op)
 	case crdt.OpDropUniqueKey:
 		return applyDropUniqueKey(ctx, conn, cat, op)
+	case crdt.OpSetClockGroup:
+		return applySetClockGroup(ctx, conn, cat, op)
 	default:
 		return fmt.Errorf("postgres: apply catalog op: unsupported kind %v", op.Kind)
 	}
@@ -165,6 +168,16 @@ func applyCreateTable(ctx context.Context, conn *pgx.Conn, cat *catalog, op crdt
 		}
 		coordinated = coordinated || k.Coordinated
 	}
+	// A counter column implies the cell clock group; set the REPLICA IDENTITY it
+	// runs on before the table can take a single row, so no write is ever
+	// captured under whole-row merge. A cell table with no counters gets its own
+	// OpSetClockGroup right after this op.
+	if ti.hasCounters() {
+		if err := setReplicaIdentity(ctx, conn, ti, metadata.ClockGroupCell); err != nil {
+			return err
+		}
+		ti.clockGroup = metadata.ClockGroupCell
+	}
 	cat.addTable(ti)
 	if coordinated {
 		if err := ensureCoordinated(ctx, conn, cat, ti); err != nil {
@@ -184,6 +197,38 @@ func applyCreateTable(ctx context.Context, conn *pgx.Conn, cat *catalog, op crdt
 		if err := partitionTable(ctx, conn, ti, lo, hi); err != nil {
 			return fmt.Errorf("partition %s: %w", op.TableName, err)
 		}
+	}
+	return nil
+}
+
+// applySetClockGroup switches a table's merge unit. The clock group IS the
+// table's REPLICA IDENTITY on this engine (§8): FULL logs the old tuple every
+// UPDATE, which is what per-column capture diffs against, so applying the op
+// installs the capability and records the rule in one step. Idempotent.
+func applySetClockGroup(ctx context.Context, conn *pgx.Conn, cat *catalog, op crdt.CatalogOp) error {
+	ti := cat.byID[op.TableID]
+	if ti == nil {
+		return fmt.Errorf("apply set clock group: table id %x not in catalog", op.TableID)
+	}
+	group := op.ClockGroup
+	if group != metadata.ClockGroupCell {
+		group = metadata.ClockGroupRow
+	}
+	if group == metadata.ClockGroupRow && ti.hasCounters() {
+		return unsupportedDDLf("postgres: %s: counter columns merge per column and cannot leave the cell clock group", ti.name)
+	}
+	if err := setReplicaIdentity(ctx, conn, ti, group); err != nil {
+		return err
+	}
+	ti.clockGroup = group
+	return nil
+}
+
+// setReplicaIdentity installs the REPLICA IDENTITY the clock group runs on.
+func setReplicaIdentity(ctx context.Context, conn *pgx.Conn, ti *tableInfo, group string) error {
+	if err := execDDLApply(ctx, conn, fmt.Sprintf("ALTER TABLE %s REPLICA IDENTITY %s",
+		tableRef(ti), replIdentClause(group))); err != nil {
+		return fmt.Errorf("apply clock group %s on %s: %w", group, ti.name, err)
 	}
 	return nil
 }
@@ -209,9 +254,22 @@ func applyAddColumn(ctx context.Context, conn *pgx.Conn, cat *catalog, op crdt.C
 	if err != nil {
 		return err
 	}
-	ci := &colInfo{name: c.Name, typeName: pgColumnType(c.Type), cid: c.ID, isPK: c.IsPK, attnum: attnum, notNull: c.NotNull, def: c.Default, generated: c.Generated}
+	counter := c.ClockGroup == metadata.ClockGroupCounter
+	ci := &colInfo{name: c.Name, typeName: pgColumnType(c.Type), cid: c.ID, isPK: c.IsPK, attnum: attnum,
+		notNull: c.NotNull, def: c.Default, generated: c.Generated, counter: counter}
+	if counter {
+		ci.typeName = counterTypeName
+	}
 	ti.cols = append(ti.cols, ci)
 	ti.byName[c.Name] = ci
+	if counter && !ti.cellGroup() {
+		// The added counter declares the cell clock group for the whole table,
+		// exactly as the originator's admission gate did when the ALTER ran there.
+		if err := setReplicaIdentity(ctx, conn, ti, metadata.ClockGroupCell); err != nil {
+			return err
+		}
+		ti.clockGroup = metadata.ClockGroupCell
+	}
 	return nil
 }
 
@@ -450,7 +508,14 @@ func renderPGColumnDef(c crdt.CatalogColumn) string {
 	var b strings.Builder
 	b.WriteString(quoteIdent(c.Name))
 	b.WriteString(" ")
-	b.WriteString(pgColumnType(c.Type))
+	if c.ClockGroup == metadata.ClockGroupCounter {
+		// The counter declaration rides the column type on every engine; here it
+		// is the syzy_counter domain, whatever integer type the originator used
+		// to express it (sql/counter.sql).
+		b.WriteString(counterTypeName)
+	} else {
+		b.WriteString(pgColumnType(c.Type))
+	}
 	if c.NotNull {
 		b.WriteString(" NOT NULL")
 	}

@@ -1,5 +1,11 @@
 package crdt
 
+import (
+	"encoding/binary"
+	"errors"
+	"fmt"
+)
+
 // Cell-group record normalization shared by every engine's live apply
 // path and by mirror-journal recovery replay (internal/nodestate) —
 // one implementation so no two consumers can drift on which records
@@ -48,6 +54,64 @@ func AsCellUpdate(t CellTable, rec Record, rs RowState) (Update, bool) {
 		return Update{Table: r.Table, PK: r.PK, CL: r.CL, Changed: changed}, true
 	}
 	return Update{}, false
+}
+
+// ErrCounterValue marks a value that cannot participate in counter
+// summation: a counter cell that is not an 8-byte integer, or a
+// difference that overflows int64. Producers surface it as a hard stop
+// (a wrong delta would apply everywhere); receivers route it to
+// quarantine.
+var ErrCounterValue = errors.New("crdt: counter value")
+
+// ColValueEqual reports whether two values carry the same logical
+// content — the diff predicate cell-group producers use to decide
+// which columns a transaction actually changed.
+func ColValueEqual(a, b ColValue) bool {
+	if a.TypeTag != b.TypeTag || len(a.Bytes) != len(b.Bytes) {
+		return false
+	}
+	for i := range a.Bytes {
+		if a.Bytes[i] != b.Bytes[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// CounterDelta returns the FormatDelta contribution NEW − OLD for one
+// counter cell: receivers sum it (CRDT.md F_counter), so concurrent
+// increments merge instead of stomping each other. Both sides must be
+// 8-byte ColInt values, and the subtraction is checked — a wrapped
+// delta would apply as arithmetically wrong on every node, so it fails
+// loudly (ErrCounterValue) rather than silently. Callers wrap the error
+// with their table and column names.
+func CounterDelta(old, new ColValue) (ColValue, error) {
+	oldV, ok := counterInt(old)
+	if !ok {
+		return ColValue{}, fmt.Errorf("%w: old value is not an 8-byte integer (tag %d, %d bytes)", ErrCounterValue, old.TypeTag, len(old.Bytes))
+	}
+	newV, ok := counterInt(new)
+	if !ok {
+		return ColValue{}, fmt.Errorf("%w: new value is not an 8-byte integer (tag %d, %d bytes)", ErrCounterValue, new.TypeTag, len(new.Bytes))
+	}
+	delta := newV - oldV
+	if (oldV > 0 && delta > newV) || (oldV < 0 && delta < newV) {
+		return ColValue{}, fmt.Errorf("%w: delta overflows int64 (old %d, new %d)", ErrCounterValue, oldV, newV)
+	}
+	return ColValue{Column: new.Column, TypeTag: ColInt, Format: FormatDelta, Bytes: encodeInt64(delta)}, nil
+}
+
+func counterInt(v ColValue) (int64, bool) {
+	if v.TypeTag != ColInt || len(v.Bytes) != 8 {
+		return 0, false
+	}
+	return int64(binary.BigEndian.Uint64(v.Bytes)), true
+}
+
+func encodeInt64(n int64) []byte {
+	b := make([]byte, 8)
+	binary.BigEndian.PutUint64(b, uint64(n))
+	return b
 }
 
 // CoversAllNonPK reports whether writes covers every active non-PK

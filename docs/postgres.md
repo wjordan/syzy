@@ -242,12 +242,65 @@ images are diffed at capture. The cost is WAL amplification — roughly a full
 old row per update — so it is per-table opt-in, and wide or TOAST-heavy
 tables should stay in the row group.
 
-**Counter columns** (`INTEGER COUNTER NOT NULL`) merge by summation rather
-than by LWW, so concurrent increments all survive. They require the cell
-clock group — a whole-row image would stomp concurrent contributions — and
-the same `REPLICA IDENTITY FULL` old image that yields per-column diffs also
-yields the counter delta (new minus old). Deletes stay row-level in every
-clock group.
+**Counter columns** merge by summation rather than by LWW, so concurrent
+increments all survive. They require the cell clock group — a whole-row image
+would stomp concurrent contributions — and the same `REPLICA IDENTITY FULL`
+old image that yields per-column diffs also yields the counter delta (new
+minus old). Deletes stay row-level in every clock group.
+
+### The declaration is the capability
+
+```sql
+ALTER TABLE public.doc REPLICA IDENTITY FULL;                   -- cell group
+ALTER TABLE public.hits ADD COLUMN n public.syzy_counter NOT NULL DEFAULT 0;
+```
+
+There is no separate registry to drift out of sync with the database: the
+physical capability per-column capture *needs* is the declaration. A table is
+in the cell group exactly when `pg_class.relreplident = 'f'`, and a column is
+a counter exactly when its type is the `public.syzy_counter` domain (`bigint`
+underneath, so it arithmetics and indexes like one). Declaring a counter
+column implies the group — the admission gate sets `REPLICA IDENTITY FULL` in
+the same transaction — so the two can never be half-configured.
+
+Both facts replicate: `CREATE TABLE` ships its columns' clock groups and a
+following clock-group op, and a later `ALTER TABLE … REPLICA IDENTITY` ships
+that flip. A node applying the schema gets the same merge semantics without
+anyone running DDL on it.
+
+### Admission rules
+
+Rejected before commit (`SQLSTATE 0A000`), because each would make
+contributions unmergeable:
+
+| Rejected | Why |
+|---|---|
+| A nullable counter | `NULL + delta` is `NULL`; there is no identity element |
+| A counter in the `PRIMARY KEY` | Summation would move row identity |
+| A `GENERATED` / `IDENTITY` counter | Recomputed per node, not accumulated |
+| A counter in any unique key, physical or coordinated | Two nodes' sums both land; the constraint has no convergent loser |
+| `REPLICA IDENTITY` away from `FULL` on a table with counters | Leaves the group its counters require |
+| A composite coordinated key on a cell-group table | Its members arbitrate as a unit, which per-column merge would split |
+| `ALTER COLUMN … TYPE` into or out of `syzy_counter` | Existing rows' values are absolute on one side and contributions on the other |
+
+### Costs and guarantees
+
+`REPLICA IDENTITY FULL` writes the whole old tuple to WAL on every `UPDATE`
+and `DELETE` — roughly a doubling for a narrow table, far worse for a wide or
+TOAST-heavy one. Opt in per table, and prefer narrow tables. Capture spends
+that image immediately: an `UPDATE` that changes nothing replicates nothing,
+and one that changes one column replicates one column.
+
+Counter apply is **exactly-once**, not idempotent — a re-delivered
+contribution would double-count. Each apply transaction that carries a
+contribution writes `(origin, seq)` into `public.syzy_applied` *inside that
+same transaction*, so the marker is exactly as durable as the sum it
+certifies. On redelivery the marker is found and the contributions are
+stripped; only the idempotent remainder of the changeset re-applies. Markers
+are pruned behind the persisted frontier. Summation itself runs in Postgres
+(`SET n = target.n + excluded.n`), so it inherits row locking and needs no
+read-modify-write in the sidecar; `bigint` overflow surfaces as `22003` and
+quarantines the changeset deterministically.
 
 ---
 
@@ -301,6 +354,8 @@ that had tightened the column could never apply them, and would halt forever.
 | `ALTER COLUMN … SET/DROP DEFAULT` | Defaults are evaluated only at the origin (apply supplies every column), so they carry no convergence risk |
 | `ALTER COLUMN … DROP NOT NULL` | A relaxation |
 | `CREATE UNIQUE INDEX` / `UNIQUE` constraint | Total keys only; becomes a §7 unique key |
+| `ALTER TABLE … REPLICA IDENTITY FULL` / `DEFAULT` | Joins or leaves the cell clock group; the group replicates with the table (§8) |
+| A `public.syzy_counter` column | A counter (§8); implies the cell group, which is set in the same transaction |
 | `CREATE INDEX` (non-unique), `DROP INDEX` | Ships as opaque SQL |
 | `CREATE VIEW`, `DROP VIEW` | Ships as opaque SQL |
 | `bigserial` / `IDENTITY` primary keys | Each node mints from its own slice of the id space (§6) |
@@ -326,7 +381,7 @@ node stays healthy.
 |---|---|
 | `CREATE TABLE` without a `PRIMARY KEY` | Rows are identified by it; without one no write could be merged |
 | `CREATE TABLE … PARTITION BY` / a partition | Not supported in v1 |
-| A column of a user-defined type (enum, domain, composite, extension type) | Would replicate as text into a type the receiver may not have; an enum that gains a value on one node only would fail apply there forever |
+| A column of a user-defined type (enum, domain, composite, extension type) | Would replicate as text into a type the receiver may not have; an enum that gains a value on one node only would fail apply there forever. `public.syzy_counter` is exempt — the sidecar creates it on every node (§8) |
 | `CREATE TABLE AS`, `SELECT INTO`, `CREATE MATERIALIZED VIEW` | Materializes a node-local query result |
 | `ALTER COLUMN … SET NOT NULL` | A `NULL` written on a peer before it applied the change is already in flight. Declare the column `NOT NULL` when it is created |
 | `ALTER COLUMN … TYPE` that narrows | Values in flight under the old type could not be applied |
@@ -335,6 +390,9 @@ node stays healthy.
 | `SET DEFAULT nextval(…)`, `ADD COLUMN` that is serial/identity | Names a node-local sequence / mints divergent values for existing rows |
 | `UNIQUE` that is partial (`WHERE`), on an expression, or `NULLS NOT DISTINCT` | Not a plain column tuple, or a predicate whose truth varies per replica |
 | `UNIQUE` mixing `NOT NULL` and nullable members | No convergent loser state |
+| A counter column that is nullable, in the PK, `GENERATED`, or in a unique key | Contributions could not merge (§8) |
+| `REPLICA IDENTITY` away from `FULL` on a table with counters | Counters require the cell group (§8) |
+| `ALTER COLUMN … TYPE` into or out of `public.syzy_counter` | Existing values are absolute on one side, contributions on the other |
 
 Two layers enforce this. A `ddl_command_start` trigger records the
 pre-command column shape; `ddl_command_end` diffs the finished catalog against
@@ -353,6 +411,12 @@ schema-unhealthy, which is the outcome the first layer exists to prevent.
   concurrent same-row writes. Deterministic winner; loss window is
   replication lag; every instance is recorded (§9). Cell groups narrow this
   to per column; counters eliminate it for accumulation.
+- **The cell clock group costs WAL.** `REPLICA IDENTITY FULL` logs the whole
+  old tuple on every `UPDATE` and `DELETE`. It is per-table opt-in for that
+  reason; wide and TOAST-heavy tables should stay in the row group (§8).
+- **Counter apply depends on `public.syzy_applied`.** Contributions are
+  exactly-once, certified by a marker written in the apply transaction.
+  Truncating that table by hand can double-count a redelivery.
 - **Eventual unique keys converge by loser-null.** A local insert's success
   is not a global guarantee.
 - **A coordinated key's physical UNIQUE index is dropped**, on every node

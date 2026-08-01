@@ -2,7 +2,6 @@ package syncer
 
 import (
 	"bytes"
-	"encoding/binary"
 	"fmt"
 	"math"
 	"sort"
@@ -752,7 +751,7 @@ func changedColumnsSlice(t *catalog.Table, old, new []crdt.ColValue) []crdt.ColV
 		if i >= len(old) || i >= len(new) {
 			break
 		}
-		if colValueEqual(old[i], new[i]) {
+		if crdt.ColValueEqual(old[i], new[i]) {
 			continue
 		}
 		v := new[i]
@@ -784,47 +783,17 @@ func counterDeltasInPlace(t *catalog.Table, old, new []crdt.ColValue, changed []
 		if ci < 0 {
 			continue // column unchanged this transaction
 		}
-		if old[i].TypeTag != crdt.ColInt || new[i].TypeTag != crdt.ColInt ||
-			len(old[i].Bytes) != 8 || len(new[i].Bytes) != 8 {
-			return fmt.Errorf("syncer: counter column %q.%q holds a non-INTEGER value (old tag %d, new tag %d); counter columns must hold integers",
-				t.Name, c.Name, old[i].TypeTag, new[i].TypeTag)
+		// Shared with every other engine's counter producer: a
+		// non-integer cell or a wrapped difference is a hard stop, since
+		// a wrong contribution would apply on every node.
+		delta, err := crdt.CounterDelta(old[i], new[i])
+		if err != nil {
+			return fmt.Errorf("syncer: counter column %q.%q: %w", t.Name, c.Name, err)
 		}
-		oldV := int64(binary.BigEndian.Uint64(old[i].Bytes))
-		newV := int64(binary.BigEndian.Uint64(new[i].Bytes))
-		delta := newV - oldV
-		// Checked subtraction: a wrapped delta would apply as an
-		// arithmetically wrong contribution everywhere. Unreachable
-		// without values already straddling the int64 range, so fail
-		// loudly like the non-integer case.
-		if (oldV > 0 && delta > newV) || (oldV < 0 && delta < newV) {
-			return fmt.Errorf("syncer: counter column %q.%q delta overflows int64 (old %d, new %d)",
-				t.Name, c.Name, oldV, newV)
-		}
-		buf := make([]byte, 8)
-		binary.BigEndian.PutUint64(buf, uint64(delta))
-		changed[ci] = crdt.ColValue{
-			Column:  c.ID,
-			TypeTag: crdt.ColInt,
-			Format:  crdt.FormatDelta,
-			Bytes:   buf,
-		}
+		delta.Column = c.ID
+		changed[ci] = delta
 	}
 	return nil
-}
-
-func colValueEqual(a, b crdt.ColValue) bool {
-	if a.TypeTag != b.TypeTag {
-		return false
-	}
-	if len(a.Bytes) != len(b.Bytes) {
-		return false
-	}
-	for i := range a.Bytes {
-		if a.Bytes[i] != b.Bytes[i] {
-			return false
-		}
-	}
-	return true
 }
 
 const (
@@ -835,21 +804,3 @@ const (
 	syzyBlobIntent = 6
 )
 
-// coversAllNonPK reports whether writes covers every active non-PK
-// column of t — the cell-group opportunistic-collapse predicate
-// (mirrors the broker's apply-side check).
-func coversAllNonPK(t *catalog.Table, writes []crdt.ColValue) bool {
-	written := make(map[crdt.ColumnID]struct{}, len(writes))
-	for _, v := range writes {
-		written[v.Column] = struct{}{}
-	}
-	for _, c := range t.Columns {
-		if c.PKPos > 0 {
-			continue
-		}
-		if _, ok := written[c.ID]; !ok {
-			return false
-		}
-	}
-	return true
-}

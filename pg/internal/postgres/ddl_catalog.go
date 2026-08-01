@@ -10,7 +10,6 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/wjordan/syzy/crdt"
-	"github.com/wjordan/syzy/internal/metadata"
 	catalogpkg "github.com/wjordan/syzy/internal/sqlitecatalog"
 )
 
@@ -45,11 +44,11 @@ func buildCatalogOps(ctx context.Context, conn *pgx.Conn, cat *catalog, intents 
 				// AllocTableID a divergent id and re-append, so skip.
 				continue
 			}
-			op, err := buildCreateTableOp(ctx, conn, cat, in)
+			created, err := buildCreateTableOp(ctx, conn, cat, in)
 			if err != nil {
 				return nil, err
 			}
-			ops = append(ops, op)
+			ops = append(ops, created...)
 		case in.commandTag == "ALTER TABLE":
 			altered, err := buildAlterTableOps(ctx, conn, cat, in)
 			if err != nil {
@@ -144,20 +143,20 @@ func buildCatalogOps(ctx context.Context, conn *pgx.Conn, cat *catalog, intents 
 // gate (increment E) make this exact — a node's own pending DDL is appended
 // before its next DDL txn proceeds. DropTable does not read the catalog (it
 // resolves the prior mapping), so only the create path is timing-sensitive.
-func buildCreateTableOp(ctx context.Context, conn *pgx.Conn, cat *catalog, in ddlIntent) (crdt.CatalogOp, error) {
+func buildCreateTableOp(ctx context.Context, conn *pgx.Conn, cat *catalog, in ddlIntent) ([]crdt.CatalogOp, error) {
 	var schema, name string
 	if err := conn.QueryRow(ctx, `
 		SELECT ns.nspname, c.relname
 		FROM pg_class c JOIN pg_namespace ns ON ns.oid = c.relnamespace
 		WHERE c.oid = $1`, in.objid).Scan(&schema, &name); err != nil {
-		return crdt.CatalogOp{}, fmt.Errorf("create table oid %d: %w", in.objid, err)
+		return nil, fmt.Errorf("create table oid %d: %w", in.objid, err)
 	}
 	pgcols, err := introspectColumns(ctx, conn, in.objid)
 	if err != nil {
-		return crdt.CatalogOp{}, err
+		return nil, err
 	}
 	if err := rejectUnreplicable(schema, name, pgcols); err != nil {
-		return crdt.CatalogOp{}, err
+		return nil, err
 	}
 
 	ti := &tableInfo{schema: schema, name: name, oid: in.objid, tid: catalogpkg.AllocTableID(), byName: map[string]*colInfo{}}
@@ -174,7 +173,7 @@ func buildCreateTableOp(ctx context.Context, conn *pgx.Conn, cat *catalog, in dd
 		}
 	}
 	if len(pks) == 0 {
-		return crdt.CatalogOp{}, unsupportedDDLf("postgres: CREATE TABLE %s.%s: replicated tables require a PRIMARY KEY", schema, name)
+		return nil, unsupportedDDLf("postgres: CREATE TABLE %s.%s: replicated tables require a PRIMARY KEY", schema, name)
 	}
 	pkMembers := buildPK(ti, pks)
 	keys := []crdt.CatalogKey{{KeyID: crdt.KeyID{}, Members: pkMembers}}
@@ -182,17 +181,32 @@ func buildCreateTableOp(ctx context.Context, conn *pgx.Conn, cat *catalog, in dd
 	// distinct non-PK key in op.Keys; a follower binds it in-catalog only.
 	uqKeys, err := captureUniqueKeys(ctx, conn, ti, cat.coordUnique)
 	if err != nil {
-		return crdt.CatalogOp{}, err
+		return nil, err
 	}
 	keys = append(keys, uqKeys...)
+	// Merge unit (§8): REPLICA IDENTITY FULL is the cell clock group, which the
+	// admission gate has already set if a counter column declared it. It ships as
+	// its own op after the create so every node — including a SQLite peer — binds
+	// the same arbitration rule from the same schema event.
+	replident, err := tableReplIdent(ctx, conn, in.objid)
+	if err != nil {
+		return nil, err
+	}
+	ti.clockGroup = clockGroupForReplIdent(replident)
 	cat.addTable(ti)
-	return crdt.CatalogOp{
+	ops := []crdt.CatalogOp{{
 		Kind:      crdt.OpCreateTable,
 		TableID:   ti.tid,
 		TableName: name,
 		Columns:   cols,
 		Keys:      keys,
-	}, nil
+	}}
+	if ti.cellGroup() {
+		ops = append(ops, crdt.CatalogOp{
+			Kind: crdt.OpSetClockGroup, TableID: ti.tid, ClockGroup: ti.clockGroup,
+		})
+	}
+	return ops, nil
 }
 
 // buildAlterTableOps reconstructs what one ALTER TABLE command changed by
@@ -319,6 +333,20 @@ func buildAlterTableOps(ctx context.Context, conn *pgx.Conn, cat *catalog, in dd
 		ti.byName[ci.name] = ci
 	}
 
+	// Merge unit (§8): ALTER TABLE … REPLICA IDENTITY is the cell/row clock
+	// group flip. It carries no column change, so it is diffed off pg_class.
+	var groupOps []crdt.CatalogOp
+	replident, err := tableReplIdent(ctx, conn, in.objid)
+	if err != nil {
+		return nil, err
+	}
+	if group := clockGroupForReplIdent(replident); group != ti.clockGroup {
+		ti.clockGroup = group
+		groupOps = append(groupOps, crdt.CatalogOp{
+			Kind: crdt.OpSetClockGroup, TableID: ti.tid, ClockGroup: group,
+		})
+	}
+
 	// Unique-key diff (§5): introspect the table's live non-PK unique indexes
 	// and reconcile against the cached set. Runs after the column rebuild so a
 	// key on a column added in the same ALTER resolves. Emitted after column
@@ -332,6 +360,7 @@ func buildAlterTableOps(ctx context.Context, conn *pgx.Conn, cat *catalog, in dd
 	ops = append(ops, drops...)
 	ops = append(ops, adds...)
 	ops = append(ops, alters...)
+	ops = append(ops, groupOps...)
 	ops = append(ops, uqOps...)
 	return ops, nil
 }
@@ -696,6 +725,7 @@ type pgColumn struct {
 	pkpos      int    // 1-based PK key position, 0 if not in the PK
 	serialType string // "bigserial"/"serial"/"smallserial" if backed by an OWNED sequence; else ""
 	identity   uint8  // attidentity: 0 (none), 'a' (GENERATED ALWAYS), 'd' (GENERATED BY DEFAULT)
+	counter    bool   // declared with the syzy_counter domain (cell.go)
 }
 
 // introspectColumns reads a relation's live, non-dropped user columns (attnum
@@ -714,8 +744,11 @@ func introspectColumns(ctx context.Context, conn *pgx.Conn, oid uint32) ([]pgCol
 		         WHERE dep.refobjid = a.attrelid AND dep.refobjsubid = a.attnum
 		           AND dep.deptype = 'a'
 		       ) AS owns_seq,
-		       CASE WHEN a.attidentity IN ('a','d') THEN a.attidentity::text ELSE '' END AS identity
+		       CASE WHEN a.attidentity IN ('a','d') THEN a.attidentity::text ELSE '' END AS identity,
+		       (tn.nspname = 'public' AND t.typname = 'syzy_counter') AS counter
 		FROM pg_attribute a
+		JOIN pg_type t ON t.oid = a.atttypid
+		JOIN pg_namespace tn ON tn.oid = t.typnamespace
 		LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
 		LEFT JOIN (
 		  SELECT i.indrelid, x.attnum, x.ord AS pkpos
@@ -733,8 +766,14 @@ func introspectColumns(ctx context.Context, conn *pgx.Conn, oid uint32) ([]pgCol
 		var c pgColumn
 		var ownsSeq bool
 		var ident string
-		if err := rows.Scan(&c.attnum, &c.name, &c.typeName, &c.notNull, &c.def, &c.generated, &c.pkpos, &ownsSeq, &ident); err != nil {
+		if err := rows.Scan(&c.attnum, &c.name, &c.typeName, &c.notNull, &c.def, &c.generated, &c.pkpos, &ownsSeq, &ident, &c.counter); err != nil {
 			return nil, err
+		}
+		if c.counter {
+			// format_type() renders the domain bare or qualified depending on the
+			// reading session's search_path; pin the canonical name so every
+			// comparison and every rendered cast means the same type (cell.go).
+			c.typeName = counterTypeName
 		}
 		c.serialType = serialTypeFor(c.typeName, ownsSeq && strings.HasPrefix(c.def, "nextval("))
 		if ident != "" {
@@ -818,7 +857,7 @@ func (pc pgColumn) catalogColumn(id crdt.ColumnID, ordinal int) crdt.CatalogColu
 		Default:    def,
 		IsPK:       pc.pkpos > 0,
 		PKPos:      pc.pkpos,
-		ClockGroup: metadata.ClockGroupRow,
+		ClockGroup: clockGroupForColumn(pc.counter),
 		Generated:  pc.generated,
 	}
 }
@@ -835,6 +874,7 @@ func (pc pgColumn) colInfo(id crdt.ColumnID) *colInfo {
 		def:       pc.def,
 		generated: pc.generated,
 		identity:  pc.identity,
+		counter:   pc.counter,
 	}
 }
 
@@ -865,6 +905,8 @@ func classifyColumnChange(tname string, ci *colInfo, pc pgColumn) (bool, error) 
 	switch {
 	case pc.generated != ci.generated:
 		return false, unsupportedDDLf("postgres: ALTER TABLE %s: adding or dropping a GENERATED expression on column %q recomputes every row from a node-local evaluation and is not supported", tname, pc.name)
+	case pc.counter != ci.counter:
+		return false, unsupportedDDLf("postgres: ALTER TABLE %s: changing column %q into or out of a counter (%s) changes how its cell merges — values already in flight under the old rule could not be merged; declare the column a counter when it is created", tname, pc.name, counterTypeName)
 	case pc.identity != ci.identity:
 		return false, unsupportedDDLf("postgres: ALTER TABLE %s: changing IDENTITY on column %q mints divergent per-node values and is not supported", tname, pc.name)
 	case (pc.pkpos > 0) != ci.isPK:

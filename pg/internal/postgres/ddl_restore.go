@@ -178,9 +178,19 @@ func (e *Engine) bindRestoredTable(ctx context.Context, te metadata.TableEntry, 
 	for _, pc := range pgcols {
 		byAttnum[pc.attnum] = pc
 	}
-	ti := &tableInfo{schema: appliedSchema, name: te.Name, oid: oid, tid: te.ID, byName: map[string]*colInfo{}}
+	// The merge unit comes from the RECORDED entry like every other catalog
+	// fact here, not from live pg_class: it is what peers know, and a crash
+	// between the physical ALTER and the schema-log append must not flip this
+	// node's arbitration rule ahead of the cluster's.
+	group := te.DefaultClockGroup
+	if group != metadata.ClockGroupCell {
+		group = metadata.ClockGroupRow
+	}
+	ti := &tableInfo{schema: appliedSchema, name: te.Name, oid: oid, tid: te.ID,
+		byName: map[string]*colInfo{}, clockGroup: group}
 	for _, c := range cols {
-		ci := &colInfo{name: c.Name, cid: c.ColumnID, attnum: c.Ordinal + 1} // attnum is 1-based; ordinal is 0-based
+		ci := &colInfo{name: c.Name, cid: c.ColumnID, attnum: c.Ordinal + 1, // attnum is 1-based; ordinal is 0-based
+			counter: c.ClockGroup == metadata.ClockGroupCounter}
 		if pc, ok := byAttnum[ci.attnum]; ok {
 			ci.typeName, ci.notNull, ci.def = pc.typeName, pc.notNull, pc.def
 			ci.generated, ci.identity, ci.isPK = pc.generated, pc.identity, pc.pkpos > 0

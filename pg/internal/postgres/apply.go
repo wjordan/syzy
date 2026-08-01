@@ -74,12 +74,25 @@ func (a *applier) apply(ctx context.Context, cs *crdt.Changeset, force bool) err
 	}
 	defer tx.Rollback(ctx)
 
-	type accepted struct {
-		tid crdt.TableID
-		pk  crdt.PKBlob
-		cl  uint64
+	// Counter contributions are not idempotent, and the sidecar's frontier is
+	// persisted outside this transaction — so a crash between the two would
+	// re-deliver this changeset. The applied marker closes that window: it is
+	// written in THIS transaction, and on a re-delivery it certifies the
+	// contributions already landed, leaving only the idempotent remainder to
+	// re-apply (§8).
+	records := cs.Records
+	if a.counterBearing(records) {
+		present, err := appliedMarkerPresent(ctx, tx, cs.Dot)
+		if err != nil {
+			return err
+		}
+		if present {
+			records = a.stripCounterContributions(records)
+		} else if err := writeAppliedMarker(ctx, tx, cache, cs.Dot); err != nil {
+			return err
+		}
 	}
-	var done []accepted
+	var done []rowClockWrite
 	// pendingWinners stashes each winning record's post-DML image to be pushed
 	// to Cache.StashWinner after tx.Commit. For Insert we hold the post-arb
 	// Image directly; for Update we read the full post-UPSERT row inside the
@@ -91,17 +104,15 @@ func (a *applier) apply(ctx context.Context, cs *crdt.Changeset, force bool) err
 		pk    crdt.PKBlob
 		cl    uint64
 		image []crdt.ColValue
+		cols  map[crdt.ColumnID]struct{} // cell group: the columns this record won
 	}
 	var pendingWinners []pendingWinner
-	// staged holds row CLs accepted EARLIER in this same changeset — the shared
-	// Cache isn't updated until after commit.
-	staged := map[rowKey]uint64{}
 	// cellStamps holds the §5 steal path's cell_clock writes (on loser rows),
 	// applied to the Cache only after the apply tx commits, so a rolled-back
 	// apply leaves no stamp the loser-null UPDATE didn't also undo.
 	var cellStamps []cellStamp
 
-	for _, r := range cs.Records {
+	for _, r := range records {
 		h := r.Header()
 		ti := a.cat.table(h.Table)
 		if ti == nil {
@@ -118,9 +129,46 @@ func (a *applier) apply(ctx context.Context, cs *crdt.Changeset, force bool) err
 			// MarkApplied a record whose bytes were never written.
 			return fmt.Errorf("%w (table %x)", errBlobPatchUnsupported, h.Table[:8])
 		}
-		prevCL := cache.RowState(h.Table, h.PK).CL
-		if !cache.RowState(h.Table, h.PK).DominatedBy(h.CL, cs.Stamp) {
+		rs := cache.RowState(h.Table, h.PK)
+		prevCL := rs.CL
+		// Cell-group dispatch (§8): an Update — and a same-generation Insert,
+		// which is an UPSERT-update — arbitrates per column. Delete and a
+		// CL-bumping Insert stay on the row-level path. A record carrying counter
+		// contributions must not be dropped on a Stamp it never arbitrates with,
+		// so it gates on causal length alone and refines per column inside.
+		if ti.cellGroup() {
+			if upd, isCell := crdt.AsCellUpdate(ti, r, rs); isCell {
+				if h.CL < rs.CL || (!updateHasCounter(upd) && !rs.DominatedBy(h.CL, cs.Stamp)) {
+					continue
+				}
+				out, err := a.applyCellUpdate(ctx, tx, cache, ti, upd, rs, cs.Stamp, prevCL > 0 && h.CL > prevCL)
+				if err != nil {
+					return err
+				}
+				if !out.applied {
+					continue
+				}
+				if out.rowUpdate != nil {
+					done = append(done, *out.rowUpdate)
+				}
+				cellStamps = append(cellStamps, out.cellStamps...)
+				img, err := readRowImage(ctx, tx, ti, h.PK)
+				if err != nil {
+					return fmt.Errorf("winner-repair: read post-UPSERT row %s: %w", ti.name, err)
+				}
+				if img != nil {
+					pendingWinners = append(pendingWinners, pendingWinner{h.Table, h.PK, h.CL, img, out.winnerCols})
+				}
+				continue
+			}
+		}
+		if !rs.DominatedBy(h.CL, cs.Stamp) {
 			continue // local/seen write dominates
+		}
+		if ins, isIns := r.(crdt.Insert); isIns {
+			if err := validateInsertCounterImage(ti, ins.Image); err != nil {
+				return err
+			}
 		}
 		// genBumped: this record advances the row to a new generation (a recreate),
 		// so any cell clock on the prior generation is stale and about to be cleared
@@ -166,18 +214,17 @@ func (a *applier) apply(ctx context.Context, cs *crdt.Changeset, force bool) err
 		if _, err := tx.Exec(ctx, sql); err != nil {
 			return fmt.Errorf("apply %T %s: %w", r, ti.name, err)
 		}
-		done = append(done, accepted{h.Table, h.PK, h.CL})
-		staged[rowKey{h.Table, string(h.PK)}] = h.CL
+		done = append(done, rowClockWrite{tid: h.Table, pk: h.PK, state: crdt.RowState{CL: h.CL, Base: cs.Stamp}})
 		switch {
 		case winnerInsertImg != nil:
-			pendingWinners = append(pendingWinners, pendingWinner{h.Table, h.PK, h.CL, winnerInsertImg})
+			pendingWinners = append(pendingWinners, pendingWinner{h.Table, h.PK, h.CL, winnerInsertImg, nil})
 		case winnerUpdate:
 			img, err := readRowImage(ctx, tx, ti, h.PK)
 			if err != nil {
 				return fmt.Errorf("winner-repair: read post-UPSERT row %s: %w", ti.name, err)
 			}
 			if img != nil {
-				pendingWinners = append(pendingWinners, pendingWinner{h.Table, h.PK, h.CL, img})
+				pendingWinners = append(pendingWinners, pendingWinner{h.Table, h.PK, h.CL, img, nil})
 			}
 		}
 	}
@@ -186,7 +233,9 @@ func (a *applier) apply(ctx context.Context, cs *crdt.Changeset, force bool) err
 		return err
 	}
 	for _, d := range done {
-		cache.PutRowState(d.tid, d.pk, crdt.RowState{CL: d.cl, Base: cs.Stamp})
+		if cache.PutRowState(d.tid, d.pk, d.state) && d.clearCells {
+			cache.ClearCellsForRow(d.tid, d.pk)
+		}
 	}
 	// Winner-repair (§9 Option A): stash each winning record's post-DML image so
 	// a later local fold that loses LWW to this stamp can self-correct rather
@@ -194,7 +243,7 @@ func (a *applier) apply(ctx context.Context, cs *crdt.Changeset, force bool) err
 	// it relates to land together.
 	for _, w := range pendingWinners {
 		a.winners.stash(w.tid, w.pk, winnerEntry{
-			Dot: cs.Dot, CL: w.cl, Stamp: cs.Stamp, Image: w.image,
+			Dot: cs.Dot, CL: w.cl, Stamp: cs.Stamp, Image: w.image, Cols: w.cols,
 		})
 	}
 	// Key-column cell clocks AFTER the row states. A steal records an override on
@@ -259,11 +308,20 @@ func (a *applier) applySelfCorrect(ctx context.Context, ops []selfCorrectOp) err
 	return tx.Commit(ctx)
 }
 
+// upsertTarget aliases the conflict target so a counter contribution can name
+// the committed row it sums onto (`n = <alias>.n + excluded.n`).
+const upsertTarget = "syzy_target"
+
 // upsertSQL renders INSERT … ON CONFLICT (pk) DO UPDATE for a full-image row.
 // Values are cast from text literals to each column's local type — exactly how
 // the real adapter binds via local typinput (§5). Omitted columns (e.g.
 // unchanged-TOAST) are left intact on update. A GENERATED ALWAYS AS IDENTITY
 // column gets OVERRIDING SYSTEM VALUE so the replicated id is accepted verbatim.
+//
+// A counter contribution (FormatDelta, §8) is SUMMED onto the committed cell
+// rather than overwriting it, so concurrent increments accumulate; on the INSERT
+// side it lands verbatim as the generation's opening value. The arithmetic runs
+// in Postgres, where bigint overflow raises rather than silently changing type.
 func upsertSQL(ti *tableInfo, image []crdt.ColValue) string {
 	if len(image) == 0 {
 		return "" // arbitration dropped every column (cell-LWW loss); nothing to write
@@ -281,6 +339,11 @@ func upsertSQL(ti *tableInfo, image []crdt.ColValue) string {
 		}
 		cols = append(cols, quoteIdent(c.name))
 		vals = append(vals, literal(cv, c.typeName))
+		if cv.Format == crdt.FormatDelta {
+			sets = append(sets, fmt.Sprintf("%s = %s.%s + excluded.%s",
+				quoteIdent(c.name), quoteIdent(upsertTarget), quoteIdent(c.name), quoteIdent(c.name)))
+			continue
+		}
 		// A GENERATED ALWAYS AS IDENTITY column rejects an explicit INSERT value
 		// unless OVERRIDING SYSTEM VALUE is given, and cannot be UPDATEd at all —
 		// so feed the replicated id with OVERRIDING but never put it in the SET
@@ -296,9 +359,9 @@ func upsertSQL(ti *tableInfo, image []crdt.ColValue) string {
 	if len(sets) > 0 {
 		conflict = "DO UPDATE SET " + strings.Join(sets, ", ")
 	}
-	return fmt.Sprintf("INSERT INTO %s (%s)%s VALUES (%s) ON CONFLICT (%s) %s",
-		tableRef(ti), strings.Join(cols, ", "), overriding, strings.Join(vals, ", "),
-		strings.Join(pkIdents(ti), ", "), conflict)
+	return fmt.Sprintf("INSERT INTO %s AS %s (%s)%s VALUES (%s) ON CONFLICT (%s) %s",
+		tableRef(ti), quoteIdent(upsertTarget), strings.Join(cols, ", "), overriding,
+		strings.Join(vals, ", "), strings.Join(pkIdents(ti), ", "), conflict)
 }
 
 func deleteSQL(ti *tableInfo, pk crdt.PKBlob) string {

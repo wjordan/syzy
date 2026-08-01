@@ -15,6 +15,25 @@ var ddlSQL string
 //go:embed sql/gen_id.sql
 var genIDSQL string
 
+//go:embed sql/counter.sql
+var counterSQL string
+
+// installCounterSupport creates the syzy_counter domain (the cell-group /
+// counter declaration, §8) and the syzy_applied exactly-once marker table.
+// Unconditional — unlike DDL replication, a counter column can arrive on a
+// pre-created bootstrap table — and guarded by syzy.internal so its own DDL
+// writes no intent rows on a node that already has the event triggers.
+func installCounterSupport(ctx context.Context, conn *pgx.Conn) error {
+	if _, err := conn.Exec(ctx, `SET syzy.internal = 'on'`); err != nil {
+		return err
+	}
+	_, execErr := conn.Exec(ctx, counterSQL)
+	if _, err := conn.Exec(ctx, `SET syzy.internal = 'off'`); err != nil && execErr == nil {
+		execErr = err
+	}
+	return execErr
+}
+
 // ddlIntentTableName is the decodable spool the event triggers write to (§6).
 // Capture turns its rows into DDL descriptors and prunes them — DDL has no
 // logical-decoding trace of its own, so these trigger-written rows ARE the
