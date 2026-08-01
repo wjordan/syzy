@@ -37,6 +37,9 @@ type applier struct {
 	// catches the schema log up before calling Apply, so a met dep passes. nil
 	// in the pre-DDL phase (no schema log) — then any Deps>0 is unsatisfiable.
 	schemaSeq *atomic.Uint64
+
+	// skew caps how far a peer's clock can drag this node's HLC (skew.go).
+	skew *skewGuard
 }
 
 func (a *applier) Apply(ctx context.Context, cs *crdt.Changeset) error {
@@ -311,7 +314,9 @@ func (a *applier) apply(ctx context.Context, cs *crdt.Changeset, force bool) err
 			cache.PutCellStamp(c.tid, c.pk, c.col, c.stamp)
 		}
 	}
-	cache.MarkApplied(cs.Dot.Origin, cs.Dot.Seq, cs.Stamp.Clock)
+	// The applied frontier and the local HLC take the changeset's clock only up
+	// to the skew bound (skew.go): a peer's broken clock must not become ours.
+	cache.MarkApplied(cs.Dot.Origin, cs.Dot.Seq, a.skew.admit(cs.Dot.Origin, cs.Stamp.Clock))
 	return nil
 }
 

@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"sync/atomic"
+	"time"
 
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5"
@@ -75,6 +76,10 @@ type Config struct {
 	OriginName  string
 
 	Tables []string // schema-qualified replicated set (PK-only phase)
+
+	// MaxClockSkew bounds how far ahead of this node a peer's clock may drag the
+	// local HLC (skew.go). 0 ⇒ 30s; negative disables the cap.
+	MaxClockSkew time.Duration
 
 	// Adopt publishes the rows that already existed when the replication slot
 	// was created, once, so an EXISTING database can join a cluster (§10). It is
@@ -302,7 +307,7 @@ func Open(ctx context.Context, cfg Config) (*Engine, error) {
 	e.prog = &progress{}
 	e.winners = newWinnerStash()
 	e.capt = &capturer{cfg: cfg, cat: cat, prog: e.prog, winners: e.winners}
-	e.appl = &applier{cfg: cfg, cat: cat, conn: apply, winners: e.winners}
+	e.appl = &applier{cfg: cfg, cat: cat, conn: apply, winners: e.winners, skew: newSkewGuard(cfg.MaxClockSkew)}
 	e.orch = newOrchestrator(e.capt, e.appl, e.prog)
 	e.orch.mirror = cfg.Mirror
 	e.orch.selfOrigin = cfg.Origin

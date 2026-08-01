@@ -102,6 +102,10 @@ Identity overrides (defaults derived from -conn dbname):
 Other:
   -repl-conn URL     replication=database URL (default: -conn + "?replication=database")
   -checkpoint-every N  commits between durable checkpoints (default: engine default)
+  -max-clock-skew D  cap on how far ahead of this node a peer's clock may push
+                     the local clock (default 30s; 0 disables). Writes are never
+                     refused — this only stops one broken clock from becoming
+                     the whole cluster's.
 `
 
 func main() {
@@ -289,6 +293,7 @@ func run(args []string) error {
 		ReserveSocketDir:  filepath.Join(cfg.dataDir, "reserve"),
 		DDL:               cfg.ddl,
 		Adopt:             cfg.adopt,
+		MaxClockSkew:      cfg.maxClockSkew,
 		// The origin id is already a cluster-unique, never-reused 1..65535
 		// node number, which is exactly what the id-space slice needs — so it
 		// doubles as the ordinal and auto-increment PKs (bigserial, IDENTITY)
@@ -381,6 +386,7 @@ type sidecarConfig struct {
 	tables          []string
 	ddl             bool
 	adopt           bool
+	maxClockSkew    time.Duration
 	schemaLogPath   string
 	schemaLogDial   string
 	schemaLogS3     string
@@ -412,6 +418,7 @@ func parseFlags(args []string) (*sidecarConfig, error) {
 	tables := fs.String("tables", "", "")
 	ddl := fs.Bool("ddl", false, "")
 	adopt := fs.Bool("adopt", false, "")
+	maxClockSkew := fs.Duration("max-clock-skew", 30*time.Second, "")
 	schemaLog := fs.String("schema-log", "", "")
 	schemaLogDial := fs.String("schema-log-dial", "", "")
 	schemaLogS3 := fs.String("schema-log-s3", "", "")
@@ -492,6 +499,7 @@ func parseFlags(args []string) (*sidecarConfig, error) {
 		tables:          splitCSV(*tables),
 		ddl:             *ddl,
 		adopt:           *adopt,
+		maxClockSkew:    skewBound(*maxClockSkew),
 		schemaLogPath:   *schemaLog,
 		schemaLogDial:   *schemaLogDial,
 		schemaLogS3:     *schemaLogS3,
@@ -543,6 +551,15 @@ func valueOr(v, def string) string {
 		return def
 	}
 	return v
+}
+
+// skewBound maps the flag's "0 disables" convention onto the engine's, where 0
+// means "use the default" and a negative bound disables the guard.
+func skewBound(d time.Duration) time.Duration {
+	if d == 0 {
+		return -1
+	}
+	return d
 }
 
 func splitCSV(s string) []string {
