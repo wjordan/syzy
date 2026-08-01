@@ -7,7 +7,7 @@ PKG      := ./sqlite/cmd/syzy
 # report "devel+<revision>" from the VCS data the toolchain embeds.
 #
 #	make build                  → devel build
-#	make build ext VERSION=v0.1.0 → release build
+#	make build build-pg ext VERSION=v0.1.0 → release build
 VERSION ?=
 LDFLAGS ?= $(if $(VERSION),-s -w -X github.com/wjordan/syzy/internal/buildinfo.version=$(VERSION),)
 

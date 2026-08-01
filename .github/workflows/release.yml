@@ -46,13 +46,15 @@ jobs:
           cache: true
 
       - name: Build
-        run: make build ext VERSION="$TAG"
+        run: make build build-pg ext VERSION="$TAG"
 
       - name: Verify the pair reports one version
         run: |
           set -e
           got=$(./bin/syzy version | head -1)
           [ "$got" = "syzy $TAG" ] || { echo "CLI reports '$got', want 'syzy $TAG'"; exit 1; }
+          got=$(./bin/syzy-pg version | head -1)
+          [ "$got" = "syzy-pg $TAG" ] || { echo "Postgres sidecar reports '$got', want 'syzy-pg $TAG'"; exit 1; }
           # The extension auto-spawns this CLI's daemon and the two
           # refuse to talk across a version mismatch, so a release whose
           # halves disagree is worse than no release.
@@ -64,7 +66,7 @@ jobs:
           set -e
           name="syzy_${TAG}_${TARGET_OS}_${TARGET_ARCH}"
           mkdir -p "dist/$name"
-          cp bin/syzy LICENSE README.md "dist/$name/"
+          cp bin/syzy bin/syzy-pg LICENSE README.md "dist/$name/"
           # `.load syzy` is a bare dlopen: SQLite retries the name with
           # the platform's own suffix appended — "dylib" on darwin, "so"
           # elsewhere — so the file has to carry that exact name or the

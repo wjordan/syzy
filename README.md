@@ -53,13 +53,11 @@ commits, or when a write cannot commit until remote replicas accept it.
 $ curl -fsSL https://github.com/wjordan/syzy/releases/latest/download/install.sh | sh
 ```
 
-This installs the SQLite product into `/usr/local`: the `syzy` command and a
-loadable extension. They are two halves of one build and refuse to talk to each
-other across versions, so always install both together. Set `SYZY_PREFIX` to
-install somewhere else (`SYZY_PREFIX=$HOME/.local`), or see
-[CONTRIBUTING.md](CONTRIBUTING.md) to build from source.
-
-The Postgres sidecar is currently built from source with `make build-pg`.
+This installs `syzy`, `syzy-pg`, and the SQLite loadable extension into
+`/usr/local`. The SQLite command and extension refuse to talk across versions,
+so always install them together. Set `SYZY_PREFIX` to install somewhere else
+(`SYZY_PREFIX=$HOME/.local`), or see [CONTRIBUTING.md](CONTRIBUTING.md) to build
+from source.
 
 Linux and macOS, amd64 and arm64.
 

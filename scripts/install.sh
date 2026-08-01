@@ -1,5 +1,5 @@
 #!/bin/sh
-# Install the syzy CLI and its SQLite loadable extension.
+# Install the syzy CLIs and SQLite loadable extension.
 #
 #   curl -fsSL https://github.com/wjordan/syzy/releases/latest/download/install.sh | sh
 #
@@ -7,7 +7,7 @@
 #   SYZY_VERSION   version to install (default: latest)
 #   SYZY_PREFIX    install prefix (default: /usr/local)
 #
-# The CLI and the extension are two halves of one build and refuse to
+# The SQLite CLI and extension are two halves of one build and refuse to
 # talk to each other across versions, so this always installs both.
 set -eu
 
@@ -102,6 +102,7 @@ fi
 
 $sudo mkdir -p "$PREFIX/bin" "$PREFIX/lib"
 $sudo install -m 0755 "$tmp/$name/syzy" "$PREFIX/bin/syzy"
+$sudo install -m 0755 "$tmp/$name/syzy-pg" "$PREFIX/bin/syzy-pg"
 $sudo install -m 0644 "$tmp/$name/$ext_name" "$PREFIX/lib/$ext_name"
 if [ -f "$tmp/$name/syzy-shim.so" ]; then
 	$sudo install -m 0644 "$tmp/$name/syzy-shim.so" "$PREFIX/lib/syzy-shim.so"
@@ -115,6 +116,7 @@ fi
 
 echo
 "$PREFIX/bin/syzy" version
+"$PREFIX/bin/syzy-pg" version
 
 # The bare `.load syzy` in the docs only works when the loader searches
 # the install prefix. Say so plainly rather than letting the first
