@@ -98,7 +98,7 @@ func TestCounterContributionSums(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CounterDelta: %v", err)
 	}
-	sql := upsertSQL(ti, []crdt.ColValue{intVal(id.cid, 1), textVal(val.cid, "x"), delta})
+	sql := upsertSQL(ti, []crdt.ColValue{intVal(id.cid, 1), textVal(val.cid, "x"), delta}).sql
 	if !strings.Contains(sql, `"n" = "syzy_target"."n" + excluded."n"`) {
 		t.Errorf("counter column is not summed:\n%s", sql)
 	}
@@ -249,6 +249,138 @@ ALTER TABLE public.hits REPLICA IDENTITY FULL`
 	}
 	if n := counterValue(t, "syzy_cntb", 1); n != 7 {
 		t.Errorf("re-delivered counter changeset double-counted: n = %d, want 7", n)
+	}
+}
+
+// TestCellUpdateAppliesWithRequiredColumnAbsent: a cell-group update carries
+// only the columns its transaction changed, so on a table with a NOT NULL column
+// that has no DEFAULT the image cannot build a whole row. Rendering that as
+// INSERT ... ON CONFLICT fails 23502 even though the row exists and the missing
+// column is not being written — Postgres checks the proposed tuple before it
+// detects the conflict — which quarantines an ordinary update on every receiver.
+func TestCellUpdateAppliesWithRequiredColumnAbsent(t *testing.T) {
+	requirePG(t)
+	ctx := context.Background()
+	cluster := crdt.ClusterID{0xd1}
+	schema := schemaKV + `;
+CREATE TABLE public.nn (id bigint PRIMARY KEY, a text, b bigint NOT NULL);
+ALTER TABLE public.nn REPLICA IDENTITY FULL`
+	open := func(db string, origin crdt.Origin) *Engine {
+		t.Helper()
+		createTestDB(t, ctx, db, schema)
+		cfg := baseTestConfig(db, origin, cluster)
+		cfg.Tables = []string{"public.kv", "public.nn"}
+		e, err := Open(ctx, cfg)
+		if err != nil {
+			t.Fatalf("open %s: %v", db, err)
+		}
+		return e
+	}
+	const dbA, dbB = "syzy_reqcol_a", "syzy_reqcol_b"
+	a := open(dbA, 90)
+	defer closeEngine(t, ctx, a)
+	b := open(dbB, 91)
+	defer closeEngine(t, ctx, b)
+
+	appExec(t, dbA, `INSERT INTO public.nn VALUES (1,'x',5)`)
+	for _, cs := range captureAll(t, ctx, a) {
+		if err := b.appl.Apply(ctx, cs); err != nil {
+			t.Fatalf("B apply seed: %v", err)
+		}
+	}
+	appExec(t, dbA, `UPDATE public.nn SET a = 'y' WHERE id = 1`)
+	for _, cs := range captureAll(t, ctx, a) {
+		if err := b.appl.Apply(ctx, cs); err != nil {
+			t.Fatalf("B apply partial cell update: %v", err)
+		}
+	}
+	conn, err := pgx.Connect(ctx, dbURL(dbB))
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer conn.Close(ctx)
+	var gotA string
+	var gotB int64
+	if err := conn.QueryRow(ctx, `SELECT a, b FROM public.nn WHERE id = 1`).Scan(&gotA, &gotB); err != nil {
+		t.Fatalf("read nn on B: %v", err)
+	}
+	if gotA != "y" || gotB != 5 {
+		t.Errorf("B nn = (%q, %d), want (\"y\", 5) — the update lands and the untouched column is left alone", gotA, gotB)
+	}
+}
+
+// TestCertifiedCounterInsertRecreatesDeletedRow covers the redelivery the
+// applied marker certifies when the row it recreates is no longer there.
+//
+// The marker is committed in the apply transaction; the sidecar's row clock is
+// persisted separately, so a crash between the two leaves a node that has the
+// certificate but not the clock — the changeset redelivers and arbitration
+// judges it against pre-apply state, so it reaches DML instead of being skipped.
+// If a local delete removed the row in the meantime and has not folded yet, that
+// DML has to recreate it. Counter columns are NOT NULL, so an image with them
+// stripped out cannot: the INSERT fails outright, or, where the column has a
+// DEFAULT, quietly resurrects the row at zero.
+//
+// What it must not do is count the contribution again — the marker says it
+// already landed — so a row that IS still present keeps its accumulated total.
+func TestCertifiedCounterInsertRecreatesDeletedRow(t *testing.T) {
+	requirePG(t)
+	ctx := context.Background()
+	cluster := crdt.ClusterID{0xc7}
+	// No DEFAULT on n: the stripped INSERT then fails loudly rather than
+	// resurrecting the row at zero.
+	schema := schemaKV + `;
+CREATE TABLE public.hits (id bigint PRIMARY KEY, label text, n bigint NOT NULL);
+ALTER TABLE public.hits REPLICA IDENTITY FULL`
+	const dbA, dbB = "syzy_cntcert_a", "syzy_cntcert_b"
+	a := openCounterEngine(t, ctx, dbA, 82, cluster, schema)
+	defer closeEngine(t, ctx, a)
+	b := openCounterEngine(t, ctx, dbB, 83, cluster, schema)
+
+	appExec(t, dbA, `INSERT INTO public.hits VALUES (1,'x',7)`)
+	cs := captureAll(t, ctx, a)
+	if len(cs) != 1 {
+		t.Fatalf("captured %d changesets, want 1", len(cs))
+	}
+	if err := b.appl.Apply(ctx, cs[0]); err != nil {
+		t.Fatalf("B apply: %v", err)
+	}
+	if n := counterValue(t, dbB, 1); n != 7 {
+		t.Fatalf("B hits.n = %d after first apply, want 7", n)
+	}
+
+	// The crash: row and marker are durable, the row clock is not. A fresh
+	// Cache on the same database is exactly that state.
+	closeEngine(t, ctx, b)
+	cfg := baseTestConfig(dbB, 83, cluster)
+	cfg.Tables = []string{"public.kv", "public.hits"}
+	b2, err := Open(ctx, cfg)
+	if err != nil {
+		t.Fatalf("reopen B: %v", err)
+	}
+	defer closeEngine(t, ctx, b2)
+
+	// Move the live cell off the image's opening value, so "keeps the total it
+	// accumulated" and "re-opens at a value already counted" are distinguishable.
+	appExec(t, dbB, `UPDATE public.hits SET n = n + 4 WHERE id = 1`)
+
+	// Redelivered onto the row that is still there: certified, so the total it
+	// already holds stands.
+	if err := b2.appl.apply(ctx, cs[0], true); err != nil {
+		t.Fatalf("B re-apply onto the live row: %v", err)
+	}
+	if n := counterValue(t, dbB, 1); n != 11 {
+		t.Fatalf("B hits.n = %d after certified re-apply, want 11 (the contribution was already counted)", n)
+	}
+
+	// A local delete that has not been folded yet: gone from the table, and the
+	// row clock reopened above has never seen it.
+	appExec(t, dbB, `DELETE FROM public.hits WHERE id = 1`)
+	if err := b2.appl.apply(ctx, cs[0], true); err != nil {
+		t.Fatalf("B re-apply onto the deleted row: %v", err)
+	}
+	if n := counterValue(t, dbB, 1); n != 7 {
+		t.Errorf("B hits.n = %d, want 7 — the recreated row must carry the generation's opening value", n)
 	}
 }
 

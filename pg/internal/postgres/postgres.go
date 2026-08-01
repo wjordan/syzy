@@ -12,6 +12,7 @@ package postgres
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"sync/atomic"
@@ -277,7 +278,8 @@ func Open(ctx context.Context, cfg Config) (*Engine, error) {
 		e.Close()
 		return nil, fmt.Errorf("origin session: %w", err)
 	}
-	if err := ensureSlot(ctx, cfg.ReplConnURL, cfg.Slot); err != nil {
+	slotCreated, err := ensureSlot(ctx, cfg.ReplConnURL, cfg.Slot)
+	if err != nil {
 		e.Close()
 		return nil, err
 	}
@@ -308,6 +310,10 @@ func Open(ctx context.Context, cfg Config) (*Engine, error) {
 	e.winners = newWinnerStash()
 	e.capt = &capturer{cfg: cfg, cat: cat, prog: e.prog, winners: e.winners}
 	e.appl = &applier{cfg: cfg, cat: cat, conn: apply, winners: e.winners, skew: newSkewGuard(cfg.MaxClockSkew)}
+	// The deterministic fold path (commitTxn) must run winner-repair writes just
+	// like the live one, or a test exercising it would see a fold publish a
+	// record whose repair never reached the table.
+	e.capt.onSelfCorrect = e.appl.applySelfCorrect
 	e.orch = newOrchestrator(e.capt, e.appl, e.prog)
 	e.orch.mirror = cfg.Mirror
 	e.orch.selfOrigin = cfg.Origin
@@ -400,15 +406,26 @@ func Open(ctx context.Context, cfg Config) (*Engine, error) {
 			return nil, err
 		}
 		if ok && lsn > 0 {
-			// confirmed_flush ≤ persisted pg_capture_lsn (meta is written
-			// before the slot ack), so this only advances it — to exactly the
-			// snapshot's coverage point. START_REPLICATION then resumes from
-			// confirmed_flush and re-delivers only txns strictly above it.
-			if _, err := apply.Exec(ctx, `SELECT pg_replication_slot_advance($1, $2::pg_lsn)`, cfg.Slot, lsn.String()); err != nil {
+			// The slot has to still cover the persisted position, or the commits
+			// between them were never captured and never will be (§10).
+			confirmed, err := checkSlotCovers(ctx, apply, cfg.Slot, lsn, slotCreated, cfg.JournalDir != "")
+			if err != nil {
 				e.Close()
-				return nil, fmt.Errorf("realign slot: %w", err)
+				return nil, err
 			}
-			e.capt.confirmed = lsn
+			// Realign the slot to exactly the snapshot's coverage point, so
+			// START_REPLICATION resumes there and re-delivers only txns strictly
+			// above it. Skipped when confirmed_flush is already past it: a slot only
+			// moves forward, and in live mode the ack runs ahead of the snapshot by
+			// design (the self-log, replayed below, is what covers the gap).
+			if lsn > confirmed {
+				if _, err := apply.Exec(ctx, `SELECT pg_replication_slot_advance($1, $2::pg_lsn)`, cfg.Slot, lsn.String()); err != nil {
+					e.Close()
+					return nil, fmt.Errorf("realign slot: %w", err)
+				}
+				confirmed = lsn
+			}
+			e.capt.confirmed = confirmed
 		}
 	}
 
@@ -608,10 +625,77 @@ func ensureOrigin(ctx context.Context, conn *pgx.Conn, name string) error {
 	return nil
 }
 
-func ensureSlot(ctx context.Context, replURL, slot string) error {
+// checkSlotCovers fails startup unless the replication slot can still deliver
+// the commits this node's persisted state does not already cover (§10). It
+// returns the slot's confirmed_flush so the caller can realign without
+// attempting a backwards advance.
+//
+// The slot IS the durable resume position, and nothing else on the node can
+// reconstruct the commits it held: a replacement slot begins at the current WAL
+// head, so every commit between the checkpoint and now is unreadable — never
+// captured, never published, and invisible to the peers that keep replicating
+// everything after it. Realigning cannot help, because a slot only moves
+// forward.
+//
+// Postgres already refuses the backwards advance (55000) and a lost slot fails
+// at START_REPLICATION, so the node does not silently diverge today — but it
+// fails with an error naming neither the cause nor the remedy, and the lost-slot
+// case only surfaces once streaming starts. This states the condition where it
+// is diagnosable, covers invalidation (wal_status 'lost', which is what
+// max_slot_wal_keep_size produces under a dead sidecar) at Open rather than
+// mid-stream, and answers the only question the operator actually has: this node
+// cannot resume, re-clone it from a peer.
+//
+// created says Open had to create the slot, which is the whole unrecoverable
+// class — dropped, or invalidated and replaced — in one unambiguous fact. A
+// confirmed_flush ahead of the checkpoint is NOT that: with a self-log the ack
+// tracks the shipped position while the snapshot is checkpointed only every
+// CheckpointEvery folds, so a crash in between leaves the slot legitimately
+// ahead and the self-log replay covers the gap. Without a self-log the
+// checkpoint IS written before the ack, so there it does mean lost commits.
+func checkSlotCovers(ctx context.Context, conn *pgx.Conn, slot string, covered pglogrepl.LSN,
+	created, selfLog bool) (pglogrepl.LSN, error) {
+	reclone := func(why string) error {
+		return fmt.Errorf("postgres: replication slot %q %s; this node's state stops at %s "+
+			"and the commits after it cannot be recovered — re-clone this node from a peer", slot, why, covered)
+	}
+	if created {
+		return 0, reclone("was missing and had to be recreated at the current WAL head")
+	}
+	var confirmed, walStatus *string
+	err := conn.QueryRow(ctx, `SELECT confirmed_flush_lsn::text, wal_status
+		FROM pg_replication_slots WHERE slot_name = $1`, slot).Scan(&confirmed, &walStatus)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, reclone("is gone")
+	}
+	if err != nil {
+		return 0, fmt.Errorf("postgres: read slot %q: %w", slot, err)
+	}
+	if walStatus != nil && *walStatus == "lost" {
+		return 0, reclone("was invalidated (WAL discarded past it, see max_slot_wal_keep_size)")
+	}
+	if confirmed == nil {
+		// A slot that never reached a consistent point has no confirmed_flush.
+		return 0, reclone("has no confirmed position")
+	}
+	pos, err := pglogrepl.ParseLSN(*confirmed)
+	if err != nil {
+		return 0, fmt.Errorf("postgres: parse confirmed_flush_lsn %q: %w", *confirmed, err)
+	}
+	if pos > covered && !selfLog {
+		return 0, reclone(fmt.Sprintf("has advanced to %s, past this node's checkpoint", pos))
+	}
+	return pos, nil
+}
+
+// ensureSlot creates the replication slot if it is missing, reporting whether
+// it had to. created=true on a node that already has persisted state is the
+// unrecoverable case checkSlotCovers refuses: the replacement begins at the
+// current WAL head, so nothing between the checkpoint and now was ever captured.
+func ensureSlot(ctx context.Context, replURL, slot string) (created bool, err error) {
 	repl, err := pgconn.Connect(ctx, replURL)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer repl.Close(ctx)
 	// CreateReplicationSlot errors if it exists; check first via a normal query
@@ -620,9 +704,9 @@ func ensureSlot(ctx context.Context, replURL, slot string) error {
 		pglogrepl.CreateReplicationSlotOptions{Mode: pglogrepl.LogicalReplication})
 	if err != nil {
 		if pgErr, ok := err.(*pgconn.PgError); ok && pgErr.Code == "42710" { // duplicate_object
-			return nil
+			return false, nil
 		}
-		return fmt.Errorf("create slot: %w", err)
+		return false, fmt.Errorf("create slot: %w", err)
 	}
-	return nil
+	return true, nil
 }

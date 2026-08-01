@@ -84,12 +84,14 @@ func (a *applier) apply(ctx context.Context, cs *crdt.Changeset, force bool) err
 	// contributions already landed, leaving only the idempotent remainder to
 	// re-apply (§8).
 	records := cs.Records
+	var certified bool // this changeset's counter contributions already landed
 	if a.counterBearing(records) {
 		present, err := appliedMarkerPresent(ctx, tx, cs.Dot)
 		if err != nil {
 			return err
 		}
 		if present {
+			certified = true
 			records = a.stripCounterContributions(records)
 		} else if err := writeAppliedMarker(ctx, tx, cache, cs.Dot); err != nil {
 			return err
@@ -159,7 +161,8 @@ func (a *applier) apply(ctx context.Context, cs *crdt.Changeset, force bool) err
 					conflicts = append(conflicts, inboundLosses(ti, r, rs, cs.Stamp, h.CL)...)
 					continue
 				}
-				out, err := a.applyCellUpdate(ctx, tx, cache, ti, upd, rs, cs.Stamp, prevCL > 0 && h.CL > prevCL)
+				out, err := a.applyCellUpdate(ctx, tx, cache, ti, upd, rs, cs.Stamp,
+					prevCL > 0 && h.CL > prevCL, certified)
 				if err != nil {
 					return err
 				}
@@ -208,12 +211,12 @@ func (a *applier) apply(ctx context.Context, cs *crdt.Changeset, force bool) err
 		// so any cell clock on the prior generation is stale and about to be cleared
 		// by PutRowState's CL-bump — the §5 cell-LWW pass must not gate against it.
 		genBumped := prevCL > 0 && h.CL > prevCL
-		var sql string
+		var w rowWrite
 		// winnerInsertImg / winnerUpdate gate the winner-repair stash for this
 		// record. Both are zeroed and assigned per-iteration; the stash is pushed
-		// only AFTER sql=="" and tx.Exec guards pass (Defect 1 burndown), and an
-		// Update's full post-UPSERT image is then read in-tx (Defect 3 / slice 2 —
-		// changeset Update carries only Changed columns).
+		// only AFTER the empty-render and exec guards pass (Defect 1 burndown),
+		// and an Update's full post-UPSERT image is then read in-tx (Defect 3 /
+		// slice 2 — changeset Update carries only Changed columns).
 		var winnerInsertImg []crdt.ColValue
 		var winnerUpdate bool
 		switch rec := r.(type) {
@@ -227,16 +230,26 @@ func (a *applier) apply(ctx context.Context, cs *crdt.Changeset, force bool) err
 			}
 			cellStamps = append(cellStamps, stolen...)
 			arbImg := arb.(crdt.Insert).Image
-			if merged, ok := counterMergeImage(ti, arbImg, rs, h.CL); ok {
+			if certified && ti.hasCounters() {
+				// Redelivery the applied marker certifies: the contributions in
+				// this image already landed, so it must not add them again —
+				// which rules out the additive merge below as well as a plain
+				// overwrite. It still has to be able to recreate the row, whose
+				// counter columns are NOT NULL. The stash then needs the row read
+				// back like the additive merge below: on a row that was still
+				// present the write kept a total this image does not carry.
+				w = upsertSQLKeepingCounters(ti, arbImg)
+				winnerUpdate = true
+			} else if merged, ok := counterMergeImage(ti, arbImg, rs, h.CL); ok {
 				// Generation-establishing Insert on a row this node's clock does
 				// not cover yet: its counter columns merge additively instead of
 				// erasing physical content every peer is summing (§8). The stash
 				// then needs the post-UPSERT row read back, since the merged row
 				// is not the image.
-				sql = upsertSQL(ti, merged)
+				w = upsertSQL(ti, merged)
 				winnerUpdate = true
 			} else {
-				sql = upsertSQL(ti, arbImg)
+				w = upsertSQL(ti, arbImg)
 				winnerInsertImg = arbImg
 			}
 		case crdt.Update:
@@ -245,17 +258,17 @@ func (a *applier) apply(ctx context.Context, cs *crdt.Changeset, force bool) err
 				return err
 			}
 			cellStamps = append(cellStamps, stolen...)
-			sql = upsertSQL(ti, arb.(crdt.Update).Changed)
+			w = upsertSQL(ti, arb.(crdt.Update).Changed)
 			winnerUpdate = true
 		case crdt.Delete:
-			sql = deleteSQL(ti, h.PK)
+			w = deleteSQL(ti, h.PK)
 		default:
 			continue
 		}
-		if sql == "" {
+		if w.sql == "" {
 			continue // arbitration left no columns to write (cell-LWW loss); row unchanged
 		}
-		if _, err := tx.Exec(ctx, sql); err != nil {
+		if err := execRowWrite(ctx, tx, w); err != nil {
 			return fmt.Errorf("apply %T %s: %w", r, ti.name, err)
 		}
 		done = append(done, rowClockWrite{tid: h.Table, pk: h.PK, state: crdt.RowState{CL: h.CL, Base: cs.Stamp}})
@@ -276,7 +289,12 @@ func (a *applier) apply(ctx context.Context, cs *crdt.Changeset, force bool) err
 			}
 		default:
 			// A winning Delete: the row is gone, so every value it held is lost.
+			// Stashed with a nil image — there is nothing to repair TO, but the
+			// fold still needs to know a peer removed this row, both to drop a
+			// losing local write and to re-assert a winning one that this delete
+			// may have erased before it was folded.
 			op, postImage = "delete", nil
+			pendingWinners = append(pendingWinners, pendingWinner{h.Table, h.PK, h.CL, nil, nil})
 		}
 		conflicts = append(conflicts, localLosses(ti, h.PK, preImage, postImage, rs, cs.Stamp, h.CL, op)...)
 	}
@@ -332,14 +350,23 @@ func (a *applier) currentWALLSN(ctx context.Context) (pglogrepl.LSN, error) {
 	return pglogrepl.ParseLSN(lsnStr)
 }
 
-// applySelfCorrect runs the winner-repair UPSERTs the fold path deferred
-// (§9 Option A). Each op upserts its row's full winner image into the local
-// table — the apply conn is the same one the orchestrator owns, so this
-// runs serialized with the rest of the actor. One transaction so a mid-
-// batch error rolls back cleanly; capture re-decodes the UPSERTed bytes on
-// the next pass and re-folds them at a higher stamp (now dominating the
-// stash). A WAL summarizer/heap-only-tuple write here is benign: it carries
-// the winner's value at our new stamp.
+// applySelfCorrect runs the winner-repair writes the fold path deferred (§9
+// Option A): an UPSERT of the row's repaired image, or a DELETE when the row is
+// not to survive. The apply conn is the same one the orchestrator owns, so this
+// runs serialized with the rest of the actor and — being origin-tagged — is
+// filtered out of the capture stream, so a repair never folds back as a fresh
+// local write. One transaction, so a mid-batch error rolls back cleanly.
+//
+// An error here is FATAL to capture, deliberately, and is the one apply-side
+// write with no quarantine behind it. Quarantine works for an inbound changeset
+// because setting it aside is safe: the node keeps serving, and the frontier
+// records that those bytes still owe. A repair cannot be set aside. It exists
+// because the cluster's winner is already in this node's Cache while its value
+// is no longer in this node's table, so skipping it leaves the table
+// contradicting the clock that node publishes — silent, permanent divergence
+// that no retry sweep would ever revisit. Halting is the fail-closed choice, and
+// a transient failure recovers on restart: the local commit is re-decoded,
+// re-folded, and the repair re-runs.
 func (a *applier) applySelfCorrect(ctx context.Context, ops []selfCorrectOp) error {
 	if len(ops) == 0 {
 		return nil
@@ -355,12 +382,15 @@ func (a *applier) applySelfCorrect(ctx context.Context, ops []selfCorrectOp) err
 		if ti == nil {
 			return fmt.Errorf("postgres: self-correct unknown table %x", op.tid[:8])
 		}
-		sql := upsertSQL(ti, op.image)
-		if sql == "" {
+		w := deleteSQL(ti, op.pk)
+		if !op.del {
+			w = upsertSQL(ti, op.image)
+		}
+		if w.sql == "" {
 			continue // image had no columns to write (shouldn't happen for a stashed winner)
 		}
-		if _, err := tx.Exec(ctx, sql); err != nil {
-			return fmt.Errorf("postgres: self-correct upsert: %w", err)
+		if err := execRowWrite(ctx, tx, w); err != nil {
+			return fmt.Errorf("postgres: self-correct write: %w", err)
 		}
 		// This repair is the one place a LOCAL committed write is discarded
 		// outright, so it is exactly what the audit log exists to show (§9).
@@ -379,6 +409,37 @@ func (a *applier) applySelfCorrect(ctx context.Context, ops []selfCorrectOp) err
 // the committed row it sums onto (`n = <alias>.n + excluded.n`).
 const upsertTarget = "syzy_target"
 
+// rowWrite is one row's rendered DML: the statement to run, plus the statement
+// to fall back to when it turns out the row is not physically there.
+type rowWrite struct {
+	sql string
+	// materialize is the INSERT … ON CONFLICT rendering of the SAME image, set
+	// only when sql is the plain-UPDATE form of a partial image (updateSQL). That
+	// UPDATE cannot create the row it names, so a zero-row result means the row
+	// is absent — the record that creates it has not landed (cross-origin
+	// delivery is not causally gated, and a quarantined Insert lets later seqs
+	// flow past it). Falling back to the INSERT lets Postgres itself decide:
+	// where the physical schema can fill the columns the image lacks the row
+	// materializes, and where it cannot the constraint violation is deterministic
+	// and routes to quarantine — retried once the row exists. Either way the
+	// write is never counted as applied when nothing was written.
+	materialize string
+}
+
+// execRowWrite runs one rendered write inside the apply transaction, falling
+// back to the materializing INSERT when the partial UPDATE found no row.
+func execRowWrite(ctx context.Context, tx pgx.Tx, w rowWrite) error {
+	tag, err := tx.Exec(ctx, w.sql)
+	if err != nil {
+		return err
+	}
+	if w.materialize == "" || tag.RowsAffected() > 0 {
+		return nil
+	}
+	_, err = tx.Exec(ctx, w.materialize)
+	return err
+}
+
 // upsertSQL renders INSERT … ON CONFLICT (pk) DO UPDATE for a full-image row.
 // Values are cast from text literals to each column's local type — exactly how
 // the real adapter binds via local typinput (§5). Omitted columns (e.g.
@@ -389,14 +450,46 @@ const upsertTarget = "syzy_target"
 // rather than overwriting it, so concurrent increments accumulate; on the INSERT
 // side it lands verbatim as the generation's opening value. The arithmetic runs
 // in Postgres, where bigint overflow raises rather than silently changing type.
-func upsertSQL(ti *tableInfo, image []crdt.ColValue) string {
+func upsertSQL(ti *tableInfo, image []crdt.ColValue) rowWrite {
+	return renderUpsert(ti, image, false)
+}
+
+// upsertSQLKeepingCounters renders an Insert whose counter contributions the
+// applied marker already certifies (§8). The counter columns stay in the INSERT
+// list, so a row that is no longer physically present is recreated with the
+// generation's opening value instead of failing NOT NULL — but they are left out
+// of the ON CONFLICT SET, so a row that IS present keeps the total it has
+// accumulated rather than being re-opened at a value already counted.
+func upsertSQLKeepingCounters(ti *tableInfo, image []crdt.ColValue) rowWrite {
+	return renderUpsert(ti, image, true)
+}
+
+func renderUpsert(ti *tableInfo, image []crdt.ColValue, keepCounters bool) rowWrite {
 	if len(image) == 0 {
-		return "" // arbitration dropped every column (cell-LWW loss); nothing to write
+		return rowWrite{} // arbitration dropped every column (cell-LWW loss); nothing to write
 	}
 	byID := make(map[crdt.ColumnID]crdt.ColValue, len(image))
 	for _, cv := range image {
 		byID[cv.Column] = cv
 	}
+	insert := insertSQL(ti, byID, keepCounters)
+	// A partial image is written as an UPDATE — but only if it names the row.
+	// Without every PK column there is nothing to target, so fall through and let
+	// the INSERT fail loudly rather than issue an UPDATE that silently matches
+	// nothing.
+	if hasWholePK(ti, byID) && !coversWholeRow(ti, byID) {
+		if upd := updateSQL(ti, byID, keepCounters); upd != "" {
+			return rowWrite{sql: upd, materialize: insert}
+		}
+		// Nothing left to set once PK and certified counter columns are excluded.
+		// The INSERT alone is then the whole write: it creates the row if it is
+		// absent and does nothing if it is not.
+	}
+	return rowWrite{sql: insert}
+}
+
+// insertSQL renders the INSERT … ON CONFLICT (pk) DO UPDATE form of an image.
+func insertSQL(ti *tableInfo, byID map[crdt.ColumnID]crdt.ColValue, keepCounters bool) string {
 	var cols, vals, sets []string
 	overriding := ""
 	for _, c := range ti.cols {
@@ -406,6 +499,9 @@ func upsertSQL(ti *tableInfo, image []crdt.ColValue) string {
 		}
 		cols = append(cols, quoteIdent(c.name))
 		vals = append(vals, literal(cv, c.typeName))
+		if keepCounters && c.counter {
+			continue // insert-if-absent only; a live row keeps its accumulated total
+		}
 		if cv.Format == crdt.FormatDelta {
 			sets = append(sets, fmt.Sprintf("%s = %s.%s + excluded.%s",
 				quoteIdent(c.name), quoteIdent(upsertTarget), quoteIdent(c.name), quoteIdent(c.name)))
@@ -431,8 +527,93 @@ func upsertSQL(ti *tableInfo, image []crdt.ColValue) string {
 		strings.Join(vals, ", "), strings.Join(pkIdents(ti), ", "), conflict)
 }
 
-func deleteSQL(ti *tableInfo, pk crdt.PKBlob) string {
-	return fmt.Sprintf("DELETE FROM %s WHERE %s", tableRef(ti), pkWhere(ti, pk))
+// hasWholePK reports whether an image names the row — every PK column present.
+func hasWholePK(ti *tableInfo, byID map[crdt.ColumnID]crdt.ColValue) bool {
+	for _, c := range ti.pk {
+		if _, ok := byID[c.cid]; !ok {
+			return false
+		}
+	}
+	return len(ti.pk) > 0
+}
+
+// coversWholeRow reports whether an image carries every column apply can write:
+// all non-PK columns except generated ones, whose values Postgres computes.
+//
+// Deliberately a plain completeness test rather than a model of which columns
+// are *required* (NOT NULL without a default). Postgres has more ways to make a
+// column required than a column's own attributes show — a NOT NULL declared on a
+// DOMAIN leaves attnotnull false, and a CHECK (col IS NOT NULL) is not a column
+// attribute at all — and every one this side fails to predict routes a partial
+// image back to the INSERT and reinstates the 23502 this all exists to avoid.
+// The two errors are not symmetric: under-routing breaks ordinary updates, while
+// over-routing costs at most one extra statement on a row that turns out to be
+// absent, since the zero-row fallback materializes it. So the cheap direction is
+// the safe one, and the schema is not modelled at all.
+func coversWholeRow(ti *tableInfo, byID map[crdt.ColumnID]crdt.ColValue) bool {
+	for _, c := range ti.cols {
+		if c.isPK || c.generated {
+			continue
+		}
+		if _, ok := byID[c.cid]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// updateSQL writes a partial image — one that cannot construct a whole row — as
+// a plain UPDATE.
+//
+// It cannot go through INSERT ... ON CONFLICT: Postgres builds and checks the
+// proposed tuple BEFORE it detects the conflict, so an image missing a NOT NULL
+// column that has no default raises 23502 even when the row already exists and
+// that column is not being written. Every cell-group update is a partial image
+// by construction (it carries only the columns the transaction changed), so on
+// such a table an ordinary update to one column would otherwise fail on every
+// receiver — deterministically, which quarantines it, which diverges the node
+// that could not apply it.
+//
+// The trade is that a partial write no longer creates a row that is physically
+// absent — while the row IS there. When it is not, execRowWrite falls back to
+// the INSERT (rowWrite.materialize), which either materializes the row from the
+// physical schema's defaults or raises the constraint violation that sends the
+// changeset to quarantine to be retried. A zero-row UPDATE is never mistaken for
+// an apply.
+func updateSQL(ti *tableInfo, byID map[crdt.ColumnID]crdt.ColValue, keepCounters bool) string {
+	var sets []string
+	for _, c := range ti.cols {
+		cv, ok := byID[c.cid]
+		// A PK column identifies the row rather than being written to it, and an
+		// identity column's value is immutable and identical on every node.
+		if !ok || c.isPK || c.identity == 'a' {
+			continue
+		}
+		if keepCounters && c.counter {
+			continue // certified redelivery: the contribution already landed
+		}
+		if cv.Format == crdt.FormatDelta {
+			sets = append(sets, fmt.Sprintf("%s = %s + %s",
+				quoteIdent(c.name), quoteIdent(c.name), literal(cv, c.typeName)))
+			continue
+		}
+		sets = append(sets, fmt.Sprintf("%s = %s", quoteIdent(c.name), literal(cv, c.typeName)))
+	}
+	if len(sets) == 0 {
+		return ""
+	}
+	preds := make([]string, len(ti.pk))
+	for i, c := range ti.pk {
+		preds[i] = fmt.Sprintf("%s = %s", quoteIdent(c.name), literal(byID[c.cid], c.typeName))
+	}
+	return fmt.Sprintf("UPDATE %s SET %s WHERE %s",
+		tableRef(ti), strings.Join(sets, ", "), strings.Join(preds, " AND "))
+}
+
+// deleteSQL removes the row. Matching nothing is a legitimate outcome — the row
+// may already be gone — so it never carries a materializing fallback.
+func deleteSQL(ti *tableInfo, pk crdt.PKBlob) rowWrite {
+	return rowWrite{sql: fmt.Sprintf("DELETE FROM %s WHERE %s", tableRef(ti), pkWhere(ti, pk))}
 }
 
 // pkWhere renders the "pk1 = v1 AND pk2 = v2" predicate for a PKBlob, each

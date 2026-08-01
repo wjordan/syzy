@@ -337,6 +337,74 @@ func (c *Cluster) WaitConverge(deadline time.Duration) error {
 	}
 }
 
+// WaitIdle blocks until the cluster has genuinely stopped: every node's inbox
+// is drained, every producer head is covered by every peer, and no head has
+// moved for idleWindow.
+//
+// It observes only — no writes. That matters for any test of what the cluster
+// settles on after a contention burst, because winner-repair is triggered by
+// peer traffic: a probe that writes a marker row to establish a happens-after
+// fence would supply exactly the message that repairs the state it is trying
+// to measure, and would report convergence the quiet system does not have.
+//
+// The idle window is what makes this sound. A commit still undecoded in the
+// WAL is in no producer head, so a burst's tail is invisible to a counter check
+// sampled once; requiring the heads to hold still across a window long enough
+// to cover decode-and-fold latency is what separates "finished" from
+// "mid-flight".
+func (c *Cluster) WaitIdle(idleWindow, deadline time.Duration) error {
+	end := time.Now().Add(deadline)
+	var prev map[crdt.Origin]crdt.Seq
+	stableSince := time.Now()
+	for {
+		heads := make(map[crdt.Origin]crdt.Seq, len(c.Nodes))
+		drained := true
+		for _, p := range c.Nodes {
+			heads[p.Origin] = p.Cache.SenderNextSeq(p.Origin)
+			if p.InboxDepth() > 0 {
+				drained = false
+			}
+		}
+		if !sameHeads(prev, heads) {
+			stableSince = time.Now()
+		}
+		prev = heads
+		if drained && time.Since(stableSince) >= idleWindow {
+			if err := c.WaitConverge(time.Until(end)); err != nil {
+				return err
+			}
+			// Converging can itself publish (a winner-repair fold), so only a run
+			// that leaves every head where it was counts as idle.
+			settled := true
+			for _, p := range c.Nodes {
+				if p.Cache.SenderNextSeq(p.Origin) != heads[p.Origin] {
+					settled = false
+				}
+			}
+			if settled {
+				return nil
+			}
+			stableSince = time.Now()
+		}
+		if time.Now().After(end) {
+			return fmt.Errorf("pgtestcluster: cluster still moving after %s", deadline)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func sameHeads(a, b map[crdt.Origin]crdt.Seq) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
 // Connect opens a fresh pgx conn against node n. Caller closes.
 func (n *Node) Connect(ctx context.Context) (*pgx.Conn, error) {
 	return pgx.Connect(ctx, n.ConnURL)

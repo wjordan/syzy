@@ -94,7 +94,7 @@ ALTER TABLE public.hits REPLICA IDENTITY FULL`
 	defer tx.Rollback(ctx)
 	stamp := crdt.Stamp{Clock: crdt.Clock{WallTime: 99}, Origin: 184}
 	out, err := e.appl.applyCellUpdate(ctx, tx, e.cfg.Cache, ti,
-		crdt.Update{Table: ti.tid, PK: pk, CL: 3}, crdt.RowState{CL: 1}, stamp, false)
+		crdt.Update{Table: ti.tid, PK: pk, CL: 3}, crdt.RowState{CL: 1}, stamp, false, false)
 	if err != nil {
 		t.Fatalf("applyCellUpdate: %v", err)
 	}

@@ -94,6 +94,33 @@ A decoded peer changeset is written in one Postgres transaction under
 4. **Unique arbitration** (§7), then the DML: an upsert for an image, a
    delete for a tombstone.
 
+An image that cannot construct a whole row — one missing a `NOT NULL` column
+that has no default, which every cell-group update is by construction, since
+it carries only the columns its transaction changed — is written as a plain
+`UPDATE` instead. It cannot go through the upsert: Postgres builds and checks
+the proposed tuple *before* it detects the conflict, so the write would fail
+`23502` even though the row exists and the missing column is not being
+written.
+
+That `UPDATE` cannot create a row that is not there, and it does not report
+that as a failure — it simply matches nothing. So a zero-row result falls back
+to the upsert. Cross-origin delivery is not causally gated and quarantine
+advances a per-origin frontier past a failed changeset, so an update really can
+arrive before the Insert that created its row; counting it as applied there
+loses it twice over, because the cell stamp it writes then beats the Insert's
+own value for that column. The fallback lets Postgres decide: where the
+physical schema can fill the columns the image lacks, the row materializes;
+where it cannot, the `23502` is deterministic, so the changeset quarantines and
+the retry sweep re-applies it once the row exists. The SQLite broker resolves
+the same question the same way (`internal/broker` `applyCellUpdate`).
+
+A redelivery the applied marker certifies (§8) keeps its counter columns in the
+image, so it can still recreate a row that is gone, and leaves them out of the
+conflict `SET`, so a row that is present keeps the total it accumulated. That
+rendering has to be reached on both routes: `crdt.AsCellUpdate` normalizes a
+same-generation Insert into an update whose counter columns are *contributions*,
+which would sum a second time.
+
 Cache mutations are applied **after** the transaction commits, so a
 rolled-back apply leaves no clock the SQL did not also roll back.
 
@@ -358,22 +385,124 @@ fold path. The pre-image read that identifies the *specific* overwritten
 values is taken only on rows another origin has actually written, so
 uncontended apply keeps its single round trip.
 
+### Winner-repair, in both directions
+
+Postgres decodes local commits *asynchronously*, which is the structural
+difference from the SQLite engine's synchronous hooks: a transaction is
+committed and visible in the table for some interval before it is folded and
+given a stamp. The orchestrator narrows that window by draining local drafts up
+to the current WAL head before arbitrating a peer changeset, but it cannot close
+it — a commit landing after that position is read is already in the table with
+no stamp and no row clock.
+
+So a fold and the local table can disagree in either direction, and the fold
+reconciles both against the winner stash (the post-arbitration image of the
+latest peer write applied to each contended row):
+
+- **The local write loses.** The cluster's winner is in our row clock but its
+  values are no longer in our table — the local commit overwrote them. The
+  losing record is dropped from the outbound changeset and the winner's image is
+  written back.
+- **The local write wins.** The peer's apply may have overwritten a commit that
+  had not been folded yet, in which case the outbound record is the only
+  surviving copy of it: every peer would take those values and the node that
+  produced them would be the only one without them. The fold re-asserts its own
+  record locally. The write is idempotent when the apply came first, at the cost
+  of one redundant UPSERT on a genuinely contended row.
+
+Counter cells are excluded from both repairs. The local cell is the running sum
+of every contribution applied so far, and a stamped absolute image is not
+entitled to roll that back — the exception being a row the peer deleted, where
+there is nothing left to preserve and the image must define the row whole.
+
+A peer's applied **Delete** is stashed with a nil image, both to drop a losing
+local write and to mark the row as peer-touched for a winning one. Against it, an
+update that does not carry every column is dropped whichever way the clocks fall:
+it cannot define the row it would have to bring back (an untouched NOT NULL
+column has no value in it), and it could only ever have run against the
+generation the delete ended. That covers a cell-group update, which ships only
+what it changed, and any update with an elided unchanged-TOAST column. The delete
+stands, and any counter contribution the update carried goes with it — there is
+no row left to sum onto. An INSERT always carries every column, so a genuine
+recreate after the delete still wins and resurrects the row whole.
+
+Without the second direction, a symmetric contention burst can end with each
+node holding a different value and no further message to reconcile them; that is
+what `TestClusterLWWAgreement` in `pg/internal/pgtestcluster` asserts against.
+
 ---
 
-## 10. Bootstrap and adoption
+## 10. Bootstrap, adoption, and the operational failure modes
 
-Joining a node is deliberately boring: take a physical base backup from a
-peer (or restore from the bucket), create the slot, initialize the frontier.
+Joining an **empty** node is deliberately boring: take a physical base backup
+from a peer (or restore from the bucket), create the slot, initialize the
+frontier.
 
-Adopting an **existing** database publishes a consistent initial snapshot
-coordinated with the slot's starting LSN, so no write is missed or
-double-counted between snapshot and stream.
+### Adopting an existing database
 
-**Slot and WAL retention** is the operational hazard to understand: a dead
-sidecar pins its replication slot and the WAL accumulates. Size
-`max_slot_wal_keep_size` so Postgres invalidates the slot rather than filling
-the disk; an invalidated slot puts the node into the fail-closed path and it
-re-clones, which is strictly better than the database going down.
+`-adopt` publishes the rows that were already in the database, once, so a
+database with history can join a cluster:
+
+```
+syzy-pg -conn ... -origin 2 -cluster-id ... -data-dir ... -adopt
+```
+
+The snapshot is read in a `REPEATABLE READ` transaction taken *after* the
+replication slot exists, so there is no gap between the snapshot and the
+stream: a row written in between is published twice, and the second copy
+converges by stamp rather than being lost. Rows are published as `Insert`s at
+causal length 1 in batches, and a durable marker records that adoption ran —
+so it is idempotent and safe to leave the flag set. It requires `-data-dir`
+(the marker has to outlive the process) and it is always an explicit operator
+action: a node that adopted when it should have cloned would republish an
+entire stale database into a live cluster.
+
+### The slot is the durable resume position
+
+This is the operational hazard to understand. A dead sidecar pins its
+replication slot and WAL accumulates until the disk fills, so
+`max_slot_wal_keep_size` should be set — Postgres then *invalidates* the slot
+instead of filling the disk.
+
+But an invalidated or dropped slot is not a recoverable state, and the engine
+does not pretend otherwise. A replacement slot begins at the current WAL head,
+so every commit between the node's last checkpoint and now is unreadable:
+never captured, never published, and invisible to peers who keep replicating
+everything after it. A slot only moves forward, so realignment cannot reach
+back for them.
+
+Postgres refuses the backwards advance on its own, so this never silently
+diverges — but it surfaces as `cannot advance replication slot … minimum is …`,
+and an invalidated slot only fails once streaming starts. `Open` therefore
+checks the condition where it is diagnosable and **refuses to start** if the
+slot cannot deliver what the persisted state does not already cover: it was
+missing and had to be recreated, it is `wal_status = 'lost'`, or it has no
+confirmed position. The error names the checkpoint and says to re-clone this
+node from a peer.
+
+`confirmed_flush` running *ahead* of the checkpoint is not that case. With a
+self-log the ack tracks the shipped position while the snapshot is checkpointed
+only every `-checkpoint-every` folds, so an ordinary crash in between leaves the
+slot legitimately ahead — the self-log replay covers the gap, and the realign is
+simply skipped. Without a self-log the checkpoint is written before the ack, so
+there an advanced slot does mean lost commits and startup refuses.
+
+Journals also grow without bound when no `-bucket` is configured, which is why
+object storage is effectively required in production rather than optional.
+
+### Clock skew
+
+Applying a changeset merges its HLC into the local clock, which is what keeps
+stamps monotonic cluster-wide — and also what lets one broken clock become
+everyone's problem, since an HLC never moves backwards. `-max-clock-skew`
+(default 30s, `0` disables) caps the value a peer's stamp can push this node's
+clock to at `now + bound`, and logs a rate-limited warning naming the origin.
+
+It deliberately does **not** refuse the changeset: LWW arbitrates on the
+record's stamp, and dropping peer writes over a clock complaint would trade a
+clock problem for a data problem. A skewed peer still wins the rows it writes.
+What the cap buys is that the damage stays bounded and ends when that peer's
+clock is fixed, instead of being permanent and cluster-wide.
 
 ---
 

@@ -250,14 +250,30 @@ func applyAddColumn(ctx context.Context, conn *pgx.Conn, cat *catalog, op crdt.C
 	if err := execDDLApply(ctx, conn, fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s", tableRef(ti), renderPGColumnDef(c))); err != nil {
 		return fmt.Errorf("apply add column %s.%s: %w", ti.name, c.Name, err)
 	}
-	attnum, err := columnAttnum(ctx, conn, ti.oid, c.Name)
+	// Bind from what Postgres actually created, not from what the op declared.
+	// The two differ: a serial ships as the CREATE-shaped pseudo-type with an
+	// empty Default, while the column it produces here holds nextval(...) — so
+	// copying the op's fields leaves this node's catalog describing a column that
+	// does not exist, and disagreeing with the originator about the same one.
+	// Only the stable ID and the counter role come from the op; the rest is the
+	// same introspection CREATE TABLE binds through.
+	local, err := introspectColumns(ctx, conn, ti.oid)
 	if err != nil {
-		return err
+		return fmt.Errorf("apply add column %s.%s: %w", ti.name, c.Name, err)
+	}
+	var ci *colInfo
+	for _, pc := range local {
+		if pc.name == c.Name {
+			ci = pc.colInfo(c.ID)
+			break
+		}
+	}
+	if ci == nil {
+		return fmt.Errorf("apply add column %s.%s: column absent after ALTER", ti.name, c.Name)
 	}
 	counter := c.ClockGroup == metadata.ClockGroupCounter
-	ci := &colInfo{name: c.Name, typeName: pgColumnType(c.Type), cid: c.ID, isPK: c.IsPK, attnum: attnum,
-		notNull: c.NotNull, def: c.Default, generated: c.Generated, counter: counter}
 	if counter {
+		ci.counter = true
 		ci.typeName = counterTypeName
 	}
 	ti.cols = append(ti.cols, ci)
@@ -583,14 +599,4 @@ func relationOID(ctx context.Context, conn *pgx.Conn, schema, name string) (uint
 		return 0, fmt.Errorf("resolve oid %s.%s: %w", schema, name, err)
 	}
 	return oid, nil
-}
-
-func columnAttnum(ctx context.Context, conn *pgx.Conn, relOID uint32, col string) (int, error) {
-	var attnum int
-	if err := conn.QueryRow(ctx, `
-		SELECT attnum FROM pg_attribute WHERE attrelid = $1 AND attname = $2 AND NOT attisdropped`,
-		relOID, col).Scan(&attnum); err != nil {
-		return 0, fmt.Errorf("resolve attnum %d.%s: %w", relOID, col, err)
-	}
-	return attnum, nil
 }

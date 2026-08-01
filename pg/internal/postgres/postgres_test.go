@@ -212,6 +212,25 @@ func appExec(t *testing.T, db, sql string) {
 	}
 }
 
+// dropOrigin releases a replication origin by name, retrying because the
+// session release after a disconnect is asynchronous.
+func dropOrigin(t *testing.T, origin string) {
+	t.Helper()
+	ctx := context.Background()
+	admin, err := pgx.Connect(ctx, pgtest.URL()+"postgres")
+	if err != nil {
+		return
+	}
+	defer admin.Close(ctx)
+	for i := 0; i < 50; i++ {
+		if _, err := admin.Exec(ctx,
+			`SELECT pg_replication_origin_drop($1) WHERE pg_replication_origin_oid($1) IS NOT NULL`, origin); err == nil {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 func dumpKV(t *testing.T, db string) map[int64]string {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

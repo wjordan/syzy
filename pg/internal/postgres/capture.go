@@ -58,6 +58,11 @@ type capturer struct {
 	// schema log is configured. nil disables DDL handling.
 	onDDLIntents func(context.Context, []ddlIntent) error
 
+	// onSelfCorrect runs the winner-repair writes a fold scheduled (the
+	// orchestrator's own path calls applier.applySelfCorrect directly). Set so
+	// the deterministic fold path repairs the table exactly as the live one does.
+	onSelfCorrect func(context.Context, []selfCorrectOp) error
+
 	// schemaSeq, when set, is the node's current schema-log head; foldCommit
 	// stamps it as a built changeset's Deps[SchemaChain] so a follower holds the
 	// DML until its catalog has caught up to that schema event (§6). nil ⇒ 0
@@ -638,8 +643,12 @@ type stagedClock struct {
 // selfCorrectOp is one row's winner-repair write: the orchestrator UPSERTs
 // image into table at pk via the apply conn, repairing a local loser.
 type selfCorrectOp struct {
-	tid   crdt.TableID
-	pk    crdt.PKBlob
+	tid crdt.TableID
+	pk  crdt.PKBlob
+	// del removes the row instead of writing image: either the local write lost
+	// to a peer's Delete, or it IS a winning local delete whose row a peer's
+	// apply put back before the delete was folded.
+	del   bool
 	image []crdt.ColValue
 	// The audit facts for the local write this repair discards (§9): the values
 	// dropped, and the two stamps that arbitrated.
@@ -779,54 +788,90 @@ func (c *capturer) foldCommit(t *txnAccum) (*crdt.Changeset, *localFold, error) 
 			cl = rs.NextLiveCL()
 			rec = crdt.Insert{Table: a.tid, PK: a.pk, CL: cl, Image: a.image}
 		}
-		// Winner-repair (§9 Option A): if a peer-applied stash dominates this
-		// local (cl, stamp), the local write would ship as a loser and the
-		// cluster's known winner sits in our Cache but its IMAGE never got
-		// written to our table (apply wrote it; the app's subsequent UPDATE
-		// overwrote it). Drop the loser, schedule a self-correct UPSERT of the
-		// winner image, and don't stage RowState (the winner stamp stays). The
+		// Winner-repair (§9 Option A). A stash means a peer's apply physically
+		// wrote this row here since the last local fold of it, so this record and
+		// the local table can disagree in EITHER direction, and the fold has to
+		// reconcile them: losing to the stash means the cluster's winner is in our
+		// Cache but its image is no longer in our table (apply wrote it, this
+		// commit overwrote it), so the loser is dropped and the winner restored;
+		// beating it means the opposite risk, handled in the re-assert arm. The
 		// d-then-i recreate pair always bumps CL past any Insert-shaped stash
-		// (CL ≥ rs.CL+1), so it isn't gated here.
-		if !isRecreate {
-			if w, ok := c.winners.winner(a.tid, a.pk); ok {
-				local := crdt.RowState{CL: cl, Base: stampOnce()}
-				if local.DominatedBy(w.CL, w.Stamp) {
-					// A cell-group loss is per column: only the columns the winning
-					// record actually carried are lost, and the rest of this write
-					// still wins on every peer, so only those are repaired + dropped.
-					// Counter contributions are never lost in either shape — every
-					// node sums every contribution, so dropping one here would erase
-					// it cluster-wide rather than just from this record.
-					var kept, lost []crdt.ColValue
-					var repair []crdt.ColValue
-					if cellUpdate {
-						kept, lost = splitCellLosers(rec.(crdt.Update).Changed, w.Cols)
-						repair = repairImage(ti, w.Image, lost)
-					} else {
-						// Whole-record loss (an Insert, a Delete, or any row-group
-						// write): the winner owns the row. A carried contribution is
-						// not the winner's to own, so it rides on as an update.
-						_, isDelete := rec.(crdt.Delete)
-						kept = counterContributions(ti, recordImage(rec))
-						repair = repairRow(ti, w.Image, isDelete)
-					}
-					if len(lost) > 0 || !cellUpdate {
-						// The values this repair discards are the one place a LOCAL
-						// committed write is dropped outright, so they are recorded
-						// in the conflict log (§9) alongside the repair itself.
-						selfCorrect = append(selfCorrect, selfCorrectOp{tid: a.tid, pk: a.pk, image: repair,
-							lost:   lostColumns(ti, pickLost(cellUpdate, lost, recordImage(rec)), kept),
-							winner: w.Stamp, winnerCL: w.CL, loser: stampOnce(), loserCL: cl})
-					}
-					if len(kept) == 0 {
-						continue
-					}
-					rec = crdt.Update{Table: a.tid, PK: a.pk, CL: cl, Changed: kept}
-					cellUpdate = true
+		// (CL ≥ rs.CL+1), so it always takes that arm. The one shape neither
+		// direction can serve — a partial cell update against a row a peer
+		// deleted — is carved out first.
+		if w, ok := c.winners.winner(a.tid, a.pk); ok {
+			local := crdt.RowState{CL: cl, Base: stampOnce()}
+			switch {
+			case w.Image == nil && op != 'd' && ti != nil && !crdt.CoversAllNonPK(ti, recordImage(rec)):
+				// A peer's Delete removed the row, and this record does not carry
+				// every column — so it cannot define the row it would have to bring
+				// back, and an untouched NOT NULL column has no value in it. A
+				// cell-group update ships only what it changed, and pgoutput elides
+				// an unchanged-TOAST column from any update; either way the write
+				// could only ever have run against the generation the delete ended.
+				// So the delete stands whichever way (CL, stamp) falls: drop the
+				// write and leave the row deleted, exactly as the losing arm does.
+				// (An Insert always carries every column, so a genuine recreate
+				// after the delete is unaffected.)
+				selfCorrect = append(selfCorrect, selfCorrectOp{tid: a.tid, pk: a.pk, del: true,
+					lost:   lostColumns(ti, recordImage(rec), nil),
+					winner: w.Stamp, winnerCL: w.CL, loser: stampOnce(), loserCL: cl})
+				continue
+			case isRecreate || !local.DominatedBy(w.CL, w.Stamp):
+				// Local dominates, so peers will adopt this write — but the stash
+				// also says a peer's apply physically wrote this row here, and if
+				// that apply landed after our commit it overwrote values that were
+				// committed but not yet folded (the window drainToWALTarget cannot
+				// close: a commit reaching the table after the WAL target is read is
+				// visible to the apply but has no stamp yet). This record would then
+				// be the only surviving copy of them, so re-assert it locally. The
+				// write is idempotent when the apply came first, at the cost of one
+				// redundant UPSERT on a genuinely contended row.
+				selfCorrect = append(selfCorrect, selfCorrectOp{tid: a.tid, pk: a.pk,
+					del:   op == 'd',
+					image: reassertImage(ti, a.pk, rec, cellUpdate, w.Image == nil)})
+				c.winners.clear(a.tid, a.pk)
+			case w.Image == nil:
+				// Lost to a peer's Delete: the row is gone cluster-wide, so this
+				// write is dropped whole and the row removed here too. Counter
+				// contributions go with it — there is no row left to sum onto.
+				selfCorrect = append(selfCorrect, selfCorrectOp{tid: a.tid, pk: a.pk, del: true,
+					lost:   lostColumns(ti, recordImage(rec), nil),
+					winner: w.Stamp, winnerCL: w.CL, loser: stampOnce(), loserCL: cl})
+				continue
+			default:
+				// A cell-group loss is per column: only the columns the winning
+				// record actually carried are lost, and the rest of this write
+				// still wins on every peer, so only those are repaired + dropped.
+				// Counter contributions are never lost in either shape — every
+				// node sums every contribution, so dropping one here would erase
+				// it cluster-wide rather than just from this record.
+				var kept, lost []crdt.ColValue
+				var repair []crdt.ColValue
+				if cellUpdate {
+					kept, lost = splitCellLosers(rec.(crdt.Update).Changed, w.Cols)
+					repair = repairImage(ti, w.Image, lost)
 				} else {
-					// Local dominates — winner stash is stale; peers will adopt this write.
-					c.winners.clear(a.tid, a.pk)
+					// Whole-record loss (an Insert, a Delete, or any row-group
+					// write): the winner owns the row. A carried contribution is
+					// not the winner's to own, so it rides on as an update.
+					_, isDelete := rec.(crdt.Delete)
+					kept = counterContributions(ti, recordImage(rec))
+					repair = repairRow(ti, w.Image, isDelete)
 				}
+				if len(lost) > 0 || !cellUpdate {
+					// The values this repair discards are the one place a LOCAL
+					// committed write is dropped outright, so they are recorded
+					// in the conflict log (§9) alongside the repair itself.
+					selfCorrect = append(selfCorrect, selfCorrectOp{tid: a.tid, pk: a.pk, image: repair,
+						lost:   lostColumns(ti, pickLost(cellUpdate, lost, recordImage(rec)), kept),
+						winner: w.Stamp, winnerCL: w.CL, loser: stampOnce(), loserCL: cl})
+				}
+				if len(kept) == 0 {
+					continue
+				}
+				rec = crdt.Update{Table: a.tid, PK: a.pk, CL: cl, Changed: kept}
+				cellUpdate = true
 			}
 		}
 		records = append(records, rec)
@@ -858,9 +903,9 @@ func (c *capturer) foldCommit(t *txnAccum) (*crdt.Changeset, *localFold, error) 
 		}
 		// Self-correct-only fold: every local effect lost to a stashed winner, so
 		// there is no changeset to broadcast. The caller still runs the repair
-		// UPSERTs from lf.selfCorrect against the apply conn, and capture picks
-		// the UPSERTed bytes up on the next decode + folds them at the now-higher
-		// stamp (a normal local commit that will dominate the winner stash).
+		// writes from lf.selfCorrect against the apply conn — which the loopback
+		// filter keeps out of the capture stream, so the repair puts the cluster's
+		// winner back in the table without re-entering the fold as a local write.
 		return nil, &localFold{selfCorrect: selfCorrect}, nil
 	}
 
@@ -891,9 +936,14 @@ func (c *capturer) foldCommit(t *txnAccum) (*crdt.Changeset, *localFold, error) 
 // emitted=false when the net effect was empty. The fold is split out as the
 // step the orchestrator will own; sink + prune stay on the capture side.
 func (c *capturer) commitTxn(ctx context.Context, sink engine.Sink, t *txnAccum) (emitted bool, err error) {
-	cs, _, err := c.foldCommit(t)
+	cs, lf, err := c.foldCommit(t)
 	if err != nil {
 		return false, err
+	}
+	if lf != nil && len(lf.selfCorrect) > 0 && c.onSelfCorrect != nil {
+		if err := c.onSelfCorrect(ctx, lf.selfCorrect); err != nil {
+			return false, err
+		}
 	}
 	// DDL command descriptors (§6) are handled BEFORE the DML sink, so a hook
 	// failure can't leave the DML half-delivered for the same committed txn, and

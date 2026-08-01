@@ -49,8 +49,16 @@ type rowClockWrite struct {
 // winning columns' DML inside the apply transaction. The caller has already
 // admitted the record on causal length (and, for register-only records, on the
 // row-level stamp); the per-column refinement happens here.
+//
+// certified is the applied marker's verdict (§8): this changeset's counter
+// contributions have already landed once. It reaches here because a redelivered
+// INSERT is normalized by crdt.AsCellUpdate — which re-tags the image's counter
+// columns as contributions — so the row-level certified renderer never sees it.
+// Summing them again is exactly what the marker exists to prevent, but the
+// record must still be able to recreate a row that is no longer physically
+// there, so the counters are rendered insert-if-absent rather than dropped.
 func (a *applier) applyCellUpdate(ctx context.Context, tx pgx.Tx, cache *nodestate.Cache,
-	ti *tableInfo, upd crdt.Update, rs crdt.RowState, stamp crdt.Stamp, genBumped bool) (cellOutcome, error) {
+	ti *tableInfo, upd crdt.Update, rs crdt.RowState, stamp crdt.Stamp, genBumped, certified bool) (cellOutcome, error) {
 	var out cellOutcome
 	if err := validateCounterValues(ti, upd.Changed); err != nil {
 		return out, err
@@ -119,8 +127,8 @@ func (a *applier) applyCellUpdate(ctx context.Context, tx pgx.Tx, cache *nodesta
 	if len(arbUpd.Changed) == 0 {
 		return out, nil // arbitration dropped every column; row unchanged
 	}
-	sql := upsertSQL(ti, cellImage(ti, upd.PK, arbUpd.Changed))
-	if _, err := tx.Exec(ctx, sql); err != nil {
+	w := renderUpsert(ti, cellImage(ti, upd.PK, arbUpd.Changed), certified)
+	if err := execRowWrite(ctx, tx, w); err != nil {
 		return out, fmt.Errorf("apply cell update %s: %w", ti.name, err)
 	}
 	out.applied = true

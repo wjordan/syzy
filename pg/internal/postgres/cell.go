@@ -190,46 +190,33 @@ func (a *applier) counterBearing(records []crdt.Record) bool {
 	return false
 }
 
-// stripCounterContributions returns records with their counter contributions
-// removed: FormatDelta update values dropped, counter columns omitted from an
-// insert image (the partial-image UPSERT then leaves the committed cell
-// untouched). Used when the applied marker certifies the contributions already
-// landed, so only the idempotent remainder re-applies.
+// stripCounterContributions drops the FormatDelta values from Updates, leaving
+// only the idempotent remainder to re-apply. Used when the applied marker
+// certifies the contributions already landed.
+//
+// Insert images are left intact: their counter columns are the generation's
+// opening value and are NOT NULL, so removing them would leave an image that
+// cannot recreate a row that is no longer physically present (a local delete
+// that has not folded yet is exactly that, and the marker only outlives the
+// sidecar frontier in the crash window where the row clock still says live).
+// Not re-counting them is the renderer's job instead — upsertSQLKeepingCounters
+// inserts them if the row is gone and leaves them alone if it is not.
 func (a *applier) stripCounterContributions(records []crdt.Record) []crdt.Record {
 	out := make([]crdt.Record, len(records))
 	for i, rec := range records {
-		ti := a.cat.table(rec.Header().Table)
-		if ti == nil {
+		r, ok := rec.(crdt.Update)
+		if !ok {
 			out[i] = rec
 			continue
 		}
-		switch r := rec.(type) {
-		case crdt.Update:
-			kept := make([]crdt.ColValue, 0, len(r.Changed))
-			for _, v := range r.Changed {
-				if v.Format != crdt.FormatDelta {
-					kept = append(kept, v)
-				}
-			}
-			r.Changed = kept
-			out[i] = r
-		case crdt.Insert:
-			if !ti.hasCounters() {
-				out[i] = rec
-				continue
-			}
-			kept := make([]crdt.ColValue, 0, len(r.Image))
-			for _, v := range r.Image {
-				if c := ti.colByID(v.Column); c != nil && c.counter {
-					continue
-				}
+		kept := make([]crdt.ColValue, 0, len(r.Changed))
+		for _, v := range r.Changed {
+			if v.Format != crdt.FormatDelta {
 				kept = append(kept, v)
 			}
-			r.Image = kept
-			out[i] = r
-		default:
-			out[i] = rec
 		}
+		r.Changed = kept
+		out[i] = r
 	}
 	return out
 }

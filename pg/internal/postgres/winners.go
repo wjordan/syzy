@@ -22,7 +22,16 @@ import (
 // apply so a later losing local fold can self-correct. Image is the post-
 // arbitration full row image (Insert: from the changeset; Update: the row
 // read back from the local table inside the apply transaction, so it
-// reflects any §5 cell-LWW stealing applied to it).
+// reflects any §5 cell-LWW stealing applied to it). A nil Image means the
+// winner REMOVED the row (an applied Delete) — a losing local write there is
+// dropped and the row deleted locally, rather than repaired to an image.
+//
+// An entry also serves as the marker that a peer physically wrote this row
+// since the last local fold of it, which the fold needs in both directions:
+// losing to it means repairing to its image, and beating it means re-asserting
+// the local record (the apply may have overwritten a commit that had not been
+// folded yet). That is why applied Deletes are stashed even though they have no
+// image to repair to.
 type winnerEntry struct {
 	Dot   crdt.Dot
 	CL    uint64
@@ -92,6 +101,30 @@ func repairImage(ti *tableInfo, image []crdt.ColValue, lost []crdt.ColValue) []c
 		if _, ok := want[v.Column]; ok || c.isPK {
 			out = append(out, v)
 		}
+	}
+	return out
+}
+
+// reassertImage is the row content a WINNING local fold must re-write to the
+// local table. Counter cells are excluded for the same reason repairRow
+// excludes them: the local cell is the running sum of every contribution
+// applied so far — including this commit's own — and re-writing an absolute
+// image would erase the peer contributions that were summed onto it while
+// every peer keeps them. resurrect (the row was deleted by the peer whose apply
+// this write beat) is the exception: nothing is left to preserve, so the image
+// has to define the row whole, NOT NULL counter included — which is why the
+// fold only reaches here on a resurrect for a record that carries every column.
+//
+// A cell-group update carries only its changed columns, so the PK is prefixed
+// to address the row. nil means there is nothing to re-assert — a counter-only
+// write, whose value no overwrite can have lost.
+func reassertImage(ti *tableInfo, pk crdt.PKBlob, rec crdt.Record, cellUpdate, resurrect bool) []crdt.ColValue {
+	out := repairRow(ti, recordImage(rec), resurrect)
+	if len(out) == 0 {
+		return nil
+	}
+	if cellUpdate {
+		return cellImage(ti, pk, out)
 	}
 	return out
 }
