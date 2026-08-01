@@ -59,11 +59,14 @@ The public [`catalog`](../catalog) package owns ID allocation, canonical key
 tuples, and catalog helpers. Operations are encoded through
 [`crdt.CatalogOp`](../crdt/catalog_op.go).
 
-Catalog-operation bytes are durable schema-log records, so the native SQLite
-operation set retains its established key layouts. The high bits of the kind
-byte select the coordinated-key and partial-key extensions; operations that do
-not need those extensions keep the original layout. Decoders accept all three
-layouts so an existing schema log remains replayable after a binary upgrade.
+Catalog-operation bytes are durable schema-log records. Encoders emit a framed
+envelope — a sentinel byte, a version, the operation kind, the body, then a
+skippable extension area — so a decoder either understands an operation
+completely or fails closed on its version; it can never misparse an unknown
+field as a different valid operation. Fields that change replay semantics bump
+the envelope version; only advisory data a decoder may safely ignore rides in
+the extension area. Decoders also accept the pre-envelope layouts forever, so
+an existing schema log remains replayable after a binary upgrade.
 
 ## Catalog operations
 

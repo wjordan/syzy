@@ -531,6 +531,11 @@ func decodePredExpr(buf []byte, n *int) (*PredExpr, []byte, error) {
 			return nil, nil, ErrShortBuffer
 		}
 		buf = buf[sz:]
+		// Each kid costs ≥ 1 byte, so a count beyond the remaining
+		// bytes is malformed — checked before it sizes an allocation.
+		if cnt > uint64(len(buf)) {
+			return nil, nil, ErrShortBuffer
+		}
 		e.Kids = make([]*PredExpr, 0, cnt)
 		for range cnt {
 			var k *PredExpr
@@ -570,6 +575,9 @@ func decodePredExpr(buf []byte, n *int) (*PredExpr, []byte, error) {
 			return nil, nil, ErrShortBuffer
 		}
 		buf = buf[sz:]
+		if cnt > uint64(len(buf)) {
+			return nil, nil, ErrShortBuffer
+		}
 		e.Lits = make([]ColValue, 0, cnt)
 		for range cnt {
 			var lit ColValue

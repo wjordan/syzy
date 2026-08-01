@@ -227,15 +227,19 @@ func (b *Broker) ReconcileSchemaToSQLite(ctx context.Context) (int, error) {
 			return repaired, ctx.Err()
 		default:
 		}
-		// Best-effort per event: an op that can't be decoded, prechecked, or
-		// re-applied is logged and skipped, never aborting the pass. Ops
-		// predating a catalog-op wire-format change no longer decode, but the
-		// tables/columns they created already exist in app.db, so skipping them
-		// is safe; a later event that DOES decode (the recent ADD COLUMN the
-		// node is actually missing) still gets healed. A reconcile must
-		// never wedge the whole pass on one stale op, nor block the node from
-		// serving (see the Open call site).
+		// Best-effort per event for CORRUPT ops only: legacy layouts
+		// decode forever, and the structural effects of an applied event
+		// already exist in app.db, so skipping an unreadable one never
+		// loses a heal a later event still provides. A version the
+		// decoder doesn't speak is different: the schema log has moved
+		// beyond this binary (e.g. metadata restored from a newer node),
+		// and serving with catalog state we cannot interpret is the
+		// silent divergence this pass exists to prevent — fail closed.
 		op, err := crdt.DecodeCatalogOp(e.CatalogOp)
+		if errors.Is(err, crdt.ErrCatalogOpVersion) {
+			return repaired, b.markSchemaUnhealthy(e.SchemaSeq,
+				fmt.Errorf("reconcile decode seq=%d: %w", e.SchemaSeq, err))
+		}
 		if err != nil {
 			skipped++
 			b.log.Debug("broker: reconcile skipping undecodable op",

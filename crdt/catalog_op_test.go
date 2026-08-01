@@ -3,6 +3,7 @@ package crdt
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"reflect"
 	"testing"
 )
@@ -179,9 +180,17 @@ func TestCatalogOp_UnknownColumnFlagsRejected(t *testing.T) {
 	if _, err := DecodeCatalogOp(buf); err == nil {
 		t.Fatal("decode retired column flags: want error")
 	}
+	// Same body under a framed envelope must be rejected identically.
+	framed := []byte{catalogOpSentinel}
+	framed = binary.AppendUvarint(framed, catalogOpVersion)
+	framed = binary.AppendUvarint(framed, uint64(OpAddColumn))
+	framed = append(framed, buf[1:]...)
+	if _, err := DecodeCatalogOp(framed); err == nil {
+		t.Fatal("decode retired column flags (framed): want error")
+	}
 }
 
-func TestCatalogOp_KeyLayoutsRemainReplayable(t *testing.T) {
+func TestCatalogOp_LegacyKeyLayoutDecodes(t *testing.T) {
 	tid := tabID(0x11)
 	kid := opKeyID(0x22)
 	cid := colID(0x33)
@@ -202,36 +211,51 @@ func TestCatalogOp_KeyLayoutsRemainReplayable(t *testing.T) {
 	if len(op.Keys) != 1 || op.Keys[0].Coordinated || op.Keys[0].Predicate.Root != nil {
 		t.Fatalf("decoded original key = %+v", op.Keys)
 	}
-	got, err := EncodeCatalogOp(op)
-	if err != nil {
-		t.Fatalf("re-encode original layout: %v", err)
-	}
-	if !bytes.Equal(got, v1) {
-		t.Fatalf("original layout drifted:\n got=%x\nwant=%x", got, v1)
-	}
+}
 
-	op.Keys[0].Coordinated = true
-	v2, err := EncodeCatalogOp(op)
-	if err != nil {
-		t.Fatalf("encode coordinated layout: %v", err)
+func TestCatalogOp_VersionGateFailsClosed(t *testing.T) {
+	buf := []byte{catalogOpSentinel}
+	buf = binary.AppendUvarint(buf, catalogOpMaxVersion+1)
+	buf = binary.AppendUvarint(buf, uint64(OpDropTable))
+	tid := tabID(1)
+	buf = append(buf, tid[:]...)
+	if _, err := DecodeCatalogOp(buf); !errors.Is(err, ErrCatalogOpVersion) {
+		t.Fatalf("future version: got %v, want ErrCatalogOpVersion", err)
 	}
-	if v2[0] != byte(OpAddUniqueKey)|catalogOpV2Flag {
-		t.Fatalf("coordinated kind byte = %#x", v2[0])
-	}
-	if _, err := DecodeCatalogOp(v2); err != nil {
-		t.Fatalf("decode coordinated layout: %v", err)
-	}
+}
 
-	op.Keys[0].Predicate = UniquePredicate{Root: &PredExpr{Op: PredIsNull, Col: cid}}
-	v3, err := EncodeCatalogOp(op)
+func TestCatalogOp_ExtensionSkipped(t *testing.T) {
+	op := CatalogOp{Kind: OpDropTable, TableID: tabID(1)}
+	buf, err := EncodeCatalogOp(op)
 	if err != nil {
-		t.Fatalf("encode partial layout: %v", err)
+		t.Fatal(err)
 	}
-	if v3[0] != byte(OpAddUniqueKey)|catalogOpV2Flag|catalogOpV3Flag {
-		t.Fatalf("partial kind byte = %#x", v3[0])
+	buf = binary.AppendUvarint(buf, 7) // unassigned advisory tag
+	buf = binary.AppendUvarint(buf, 3)
+	buf = append(buf, 0xDE, 0xAD, 0xBF)
+	got, err := DecodeCatalogOp(buf)
+	if err != nil {
+		t.Fatalf("decode with extension: %v", err)
 	}
-	if _, err := DecodeCatalogOp(v3); err != nil {
-		t.Fatalf("decode partial layout: %v", err)
+	if !reflect.DeepEqual(got, op) {
+		t.Fatalf("extension changed op: %+v", got)
+	}
+}
+
+func TestCatalogOp_MalformedExtensionRejected(t *testing.T) {
+	op := CatalogOp{Kind: OpDropTable, TableID: tabID(1)}
+	full, err := EncodeCatalogOp(op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, tail := range map[string][]byte{
+		"zero tag":      {0x00},
+		"truncated len": {0x01},
+		"short value":   {0x01, 0x05, 0xAA},
+	} {
+		if _, err := DecodeCatalogOp(append(append([]byte{}, full...), tail...)); err == nil {
+			t.Errorf("%s: want error", name)
+		}
 	}
 }
 

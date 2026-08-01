@@ -7,8 +7,11 @@ import (
 )
 
 // CatalogOpKind tags one shape of CatalogOp on the wire and in
-// syzy_schema_event.catalog_op. Stable across versions; do not
-// reorder existing values.
+// syzy_schema_event.catalog_op. Values are durable; never reuse or
+// reorder them. Allocation plan: 1–31 core relational ops, 32–63
+// reserved for engine-specific ops (each engine's typed DDL shapes,
+// ordinal claims), 64+ unassigned. Kinds are encoded as uvarint in the
+// framed format, so the space is open-ended.
 type CatalogOpKind uint8
 
 const (
@@ -33,13 +36,52 @@ const (
 	OpSetClockGroup      CatalogOpKind = 18
 )
 
-// Catalog key layouts are durable schema-log formats. The high bits of the
-// kind byte extend the original layout with coordinated-key and partial-key
-// fields while leaving operations that need neither byte-identical.
+// CatalogOp encoding
+//
+// Two formats exist. Encoders emit only the framed format; decoders
+// accept both forever, because ops are written durably into
+// syzy_schema_event and state of arbitrary age can wake.
+//
+// Framed format (versions ≥ 4):
+//
+//	1 byte   0xC0 sentinel (impossible first byte in the legacy format:
+//	         legacy kind bits are never zero)
+//	uvarint  version — a required-reader gate. A decoder that does not
+//	         support the version fails closed (ErrCatalogOpVersion);
+//	         the schema-health path quarantines rather than misparses.
+//	uvarint  kind
+//	body     kind-specific fields; key layouts always carry the
+//	         coordinated flag and predicate (no conditional fields)
+//	ext      repeated {uvarint tag ≥ 1, uvarint len, len bytes} to end
+//	         of buffer; unknown tags are skipped
+//
+// Evolution rules: a new field that changes replay semantics MUST bump
+// the version (old decoders then fail closed — safe, since silently
+// ignoring a semantic field would diverge the catalog). Only advisory
+// data that every decoder may safely ignore goes in the ext area.
+//
+// Legacy format (decode-only): the kind byte's high bits are flags
+// (0x80 = keys carry a coordinated bool, 0x40 = keys carry a
+// predicate) with the kind in the low 6 bits, followed by the body.
+// Optional fields hide behind flag bits with no length framing — the
+// misparse hazard the framed format exists to end.
 const (
-	catalogOpV2Flag = 0x80
-	catalogOpV3Flag = 0x40
+	catalogOpSentinel = 0xC0
+	// catalogOpVersion is what encoders write. Versions 1–3 name the
+	// legacy layout lineage (base / +coordinated / +predicate) and
+	// never appear in an envelope.
+	catalogOpVersion = 4
+	// catalogOpMaxVersion is the newest version this decoder reads.
+	catalogOpMaxVersion = 4
+
+	legacyCoordFlag   = 0x80
+	legacyPartialFlag = 0x40
 )
+
+// ErrCatalogOpVersion is returned when an op's version postdates this
+// decoder. Callers must treat it as "cannot participate" (schema
+// unhealthy / quarantine), never skip the event.
+var ErrCatalogOpVersion = errors.New("crdt: CatalogOp version not supported")
 
 // String returns a stable human-readable name for the op kind. Used by
 // logging, status output, and catalog_op debug dumps.
@@ -186,36 +228,24 @@ type CatalogKey struct {
 	Predicate UniquePredicate
 }
 
-// EncodeCatalogOp returns the canonical wire bytes for op. Errors only
-// for unsupported kinds or oversized strings (uvarint length tags are
-// generous; the limits exist to fail loudly on malformed input rather
-// than silently truncate).
+// EncodeCatalogOp returns the canonical framed bytes for op. Errors
+// only for unsupported kinds or oversized strings (uvarint length tags
+// are generous; the limits exist to fail loudly on malformed input
+// rather than silently truncate).
 func EncodeCatalogOp(op CatalogOp) ([]byte, error) {
 	if op.Kind == OpUnknown {
 		return nil, errors.New("crdt: cannot encode CatalogOp with Kind=Unknown")
 	}
-	var buf []byte
-	partial := opCarriesPartialKey(op)
-	versioned := opCarriesCoordinatedKey(op) || partial
-	kindByte := byte(op.Kind)
-	if versioned {
-		kindByte |= catalogOpV2Flag
-	}
-	if partial {
-		kindByte |= catalogOpV3Flag
-	}
-	buf = append(buf, kindByte)
+	buf := []byte{catalogOpSentinel}
+	buf = binary.AppendUvarint(buf, catalogOpVersion)
+	buf = binary.AppendUvarint(buf, uint64(op.Kind))
 	switch op.Kind {
 	case OpCreateTable:
 		buf = appendBytes16(buf, op.TableID[:])
 		buf = appendString(buf, op.TableName)
 		buf = appendColumns(buf, op.Columns)
-		buf = appendKeys(buf, op.Keys, versioned, partial)
-		if op.WithoutRowid {
-			buf = append(buf, 1)
-		} else {
-			buf = append(buf, 0)
-		}
+		buf = appendKeys(buf, op.Keys)
+		buf = appendBool(buf, op.WithoutRowid)
 	case OpAddColumn:
 		buf = appendBytes16(buf, op.TableID[:])
 		buf = appendColumns(buf, op.Columns)
@@ -237,7 +267,7 @@ func EncodeCatalogOp(op CatalogOp) ([]byte, error) {
 	case OpAddUniqueKey:
 		buf = appendBytes16(buf, op.TableID[:])
 		buf = appendBytes16(buf, op.KeyID[:])
-		buf = appendKeyMembers(buf, op.Keys, versioned, partial)
+		buf = appendKeyMembers(buf, op.Keys)
 	case OpDropUniqueKey:
 		buf = appendBytes16(buf, op.TableID[:])
 		buf = appendBytes16(buf, op.KeyID[:])
@@ -273,147 +303,228 @@ func EncodeCatalogOp(op CatalogOp) ([]byte, error) {
 	return buf, nil
 }
 
-// DecodeCatalogOp parses the bytes produced by EncodeCatalogOp.
+// DecodeCatalogOp parses the bytes produced by EncodeCatalogOp, current
+// or legacy.
 func DecodeCatalogOp(buf []byte) (CatalogOp, error) {
+	return decodeCatalogOp(buf, true)
+}
+
+// decodeCatalogOp dispatches on format. allowBundle is false when
+// decoding a bundle's sub-ops, so a nested bundle is rejected before
+// its own sub-ops are walked (bounding recursion at depth one).
+func decodeCatalogOp(buf []byte, allowBundle bool) (CatalogOp, error) {
 	if len(buf) < 1 {
 		return CatalogOp{}, ErrShortBuffer
 	}
-	versioned := buf[0]&catalogOpV2Flag != 0
-	partial := buf[0]&catalogOpV3Flag != 0
-	kind := CatalogOpKind(buf[0] &^ (catalogOpV2Flag | catalogOpV3Flag))
-	rest := buf[1:]
-	op := CatalogOp{Kind: kind}
-	var err error
-	switch kind {
-	case OpCreateTable:
-		if rest, err = readBytes16(rest, op.TableID[:]); err != nil {
-			return CatalogOp{}, err
+	if buf[0] == catalogOpSentinel {
+		return decodeFramedCatalogOp(buf[1:], allowBundle)
+	}
+	return decodeLegacyCatalogOp(buf, allowBundle)
+}
+
+func decodeFramedCatalogOp(buf []byte, allowBundle bool) (CatalogOp, error) {
+	version, sz := binary.Uvarint(buf)
+	if sz <= 0 {
+		return CatalogOp{}, ErrShortBuffer
+	}
+	buf = buf[sz:]
+	if version < catalogOpVersion {
+		return CatalogOp{}, fmt.Errorf("crdt: malformed CatalogOp envelope: version %d", version)
+	}
+	if version > catalogOpMaxVersion {
+		return CatalogOp{}, fmt.Errorf("%w: version %d, decoder supports ≤ %d",
+			ErrCatalogOpVersion, version, catalogOpMaxVersion)
+	}
+	kindU, sz := binary.Uvarint(buf)
+	if sz <= 0 {
+		return CatalogOp{}, ErrShortBuffer
+	}
+	buf = buf[sz:]
+	if kindU == 0 || kindU > 0xFF {
+		return CatalogOp{}, fmt.Errorf("crdt: unknown CatalogOpKind %d", kindU)
+	}
+	op, rest, err := decodeCatalogOpBody(CatalogOpKind(kindU), buf, true, true, allowBundle)
+	if err != nil {
+		return CatalogOp{}, err
+	}
+	// Extension area: advisory-only {tag, len, bytes} entries. Unknown
+	// tags are skipped by construction; no tags are assigned yet.
+	for len(rest) > 0 {
+		tag, sz := binary.Uvarint(rest)
+		if sz <= 0 || tag == 0 {
+			return CatalogOp{}, fmt.Errorf("crdt: malformed CatalogOp extension tag")
 		}
-		if op.TableName, rest, err = readString(rest); err != nil {
-			return CatalogOp{}, err
-		}
-		if op.Columns, rest, err = readColumns(rest); err != nil {
-			return CatalogOp{}, err
-		}
-		if op.Keys, rest, err = readKeys(rest, versioned, partial); err != nil {
-			return CatalogOp{}, err
-		}
-		if len(rest) < 1 {
-			return CatalogOp{}, ErrShortBuffer
-		}
-		op.WithoutRowid = rest[0] != 0
-		rest = rest[1:]
-	case OpAddColumn:
-		if rest, err = readBytes16(rest, op.TableID[:]); err != nil {
-			return CatalogOp{}, err
-		}
-		if op.Columns, rest, err = readColumns(rest); err != nil {
-			return CatalogOp{}, err
-		}
-	case OpRenameTable:
-		if rest, err = readBytes16(rest, op.TableID[:]); err != nil {
-			return CatalogOp{}, err
-		}
-		if op.TableName, rest, err = readString(rest); err != nil {
-			return CatalogOp{}, err
-		}
-	case OpRenameColumn:
-		if rest, err = readBytes16(rest, op.TableID[:]); err != nil {
-			return CatalogOp{}, err
-		}
-		if rest, err = readBytes16(rest, op.ColumnID[:]); err != nil {
-			return CatalogOp{}, err
-		}
-		if op.ColumnName, rest, err = readString(rest); err != nil {
-			return CatalogOp{}, err
-		}
-	case OpDropColumn:
-		if rest, err = readBytes16(rest, op.TableID[:]); err != nil {
-			return CatalogOp{}, err
-		}
-		if rest, err = readBytes16(rest, op.ColumnID[:]); err != nil {
-			return CatalogOp{}, err
-		}
-	case OpDropTable:
-		if rest, err = readBytes16(rest, op.TableID[:]); err != nil {
-			return CatalogOp{}, err
-		}
-	case OpSetClockGroup:
-		if rest, err = readBytes16(rest, op.TableID[:]); err != nil {
-			return CatalogOp{}, err
-		}
-		if op.ClockGroup, rest, err = readString(rest); err != nil {
-			return CatalogOp{}, err
-		}
-	case OpAddUniqueKey:
-		if rest, err = readBytes16(rest, op.TableID[:]); err != nil {
-			return CatalogOp{}, err
-		}
-		if rest, err = readBytes16(rest, op.KeyID[:]); err != nil {
-			return CatalogOp{}, err
-		}
-		if op.Keys, rest, err = readKeyMembers(rest, op.KeyID, versioned, partial); err != nil {
-			return CatalogOp{}, err
-		}
-	case OpDropUniqueKey:
-		if rest, err = readBytes16(rest, op.TableID[:]); err != nil {
-			return CatalogOp{}, err
-		}
-		if rest, err = readBytes16(rest, op.KeyID[:]); err != nil {
-			return CatalogOp{}, err
-		}
-	case OpCreateIndex, OpDropIndex,
-		OpCreateView, OpDropView,
-		OpCreateVirtualTable, OpDropVirtualTable:
-		if op.ObjectName, rest, err = readString(rest); err != nil {
-			return CatalogOp{}, err
-		}
-		if op.RawSQL, rest, err = readString(rest); err != nil {
-			return CatalogOp{}, err
-		}
-	case OpCreateTrigger, OpDropTrigger:
-		if rest, err = readBytes16(rest, op.TableID[:]); err != nil {
-			return CatalogOp{}, err
-		}
-		if op.ObjectName, rest, err = readString(rest); err != nil {
-			return CatalogOp{}, err
-		}
-		if op.RawSQL, rest, err = readString(rest); err != nil {
-			return CatalogOp{}, err
-		}
-	case OpBundle:
+		rest = rest[sz:]
 		n, sz := binary.Uvarint(rest)
 		if sz <= 0 {
 			return CatalogOp{}, ErrShortBuffer
 		}
 		rest = rest[sz:]
-		op.SubOps = make([]CatalogOp, 0, n)
-		for range n {
-			subLen, sz := binary.Uvarint(rest)
-			if sz <= 0 {
-				return CatalogOp{}, ErrShortBuffer
-			}
-			rest = rest[sz:]
-			if uint64(len(rest)) < subLen {
-				return CatalogOp{}, ErrShortBuffer
-			}
-			sub, err := DecodeCatalogOp(rest[:subLen])
-			if err != nil {
-				return CatalogOp{}, fmt.Errorf("crdt: decode bundle sub-op: %w", err)
-			}
-			if sub.Kind == OpBundle {
-				return CatalogOp{}, errors.New("crdt: nested OpBundle is not allowed")
-			}
-			op.SubOps = append(op.SubOps, sub)
-			rest = rest[subLen:]
+		if uint64(len(rest)) < n {
+			return CatalogOp{}, ErrShortBuffer
 		}
-	default:
-		return CatalogOp{}, fmt.Errorf("crdt: unknown CatalogOpKind %d", kind)
+		rest = rest[n:]
+	}
+	return op, nil
+}
+
+// decodeLegacyCatalogOp parses the pre-envelope format: flag bits in
+// the kind byte gate the coordinated/predicate key fields. Decode-only;
+// retained forever for durable schema events written before the framed
+// format.
+func decodeLegacyCatalogOp(buf []byte, allowBundle bool) (CatalogOp, error) {
+	withCoord := buf[0]&legacyCoordFlag != 0
+	withPred := buf[0]&legacyPartialFlag != 0
+	kind := CatalogOpKind(buf[0] &^ (legacyCoordFlag | legacyPartialFlag))
+	op, rest, err := decodeCatalogOpBody(kind, buf[1:], withCoord, withPred, allowBundle)
+	if err != nil {
+		return CatalogOp{}, err
 	}
 	if len(rest) != 0 {
 		return CatalogOp{}, fmt.Errorf("crdt: %d trailing bytes after CatalogOp", len(rest))
 	}
 	return op, nil
+}
+
+// decodeCatalogOpBody parses one op body. withCoord/withPred select
+// whether key layouts carry the coordinated flag and predicate: always
+// true in the framed format, flag-dependent in the legacy format.
+func decodeCatalogOpBody(kind CatalogOpKind, rest []byte, withCoord, withPred, allowBundle bool) (CatalogOp, []byte, error) {
+	op := CatalogOp{Kind: kind}
+	var err error
+	switch kind {
+	case OpCreateTable:
+		if rest, err = readBytes16(rest, op.TableID[:]); err != nil {
+			return CatalogOp{}, nil, err
+		}
+		if op.TableName, rest, err = readString(rest); err != nil {
+			return CatalogOp{}, nil, err
+		}
+		if op.Columns, rest, err = readColumns(rest); err != nil {
+			return CatalogOp{}, nil, err
+		}
+		if op.Keys, rest, err = readKeys(rest, withCoord, withPred); err != nil {
+			return CatalogOp{}, nil, err
+		}
+		if op.WithoutRowid, rest, err = readBool(rest); err != nil {
+			return CatalogOp{}, nil, err
+		}
+	case OpAddColumn:
+		if rest, err = readBytes16(rest, op.TableID[:]); err != nil {
+			return CatalogOp{}, nil, err
+		}
+		if op.Columns, rest, err = readColumns(rest); err != nil {
+			return CatalogOp{}, nil, err
+		}
+	case OpRenameTable:
+		if rest, err = readBytes16(rest, op.TableID[:]); err != nil {
+			return CatalogOp{}, nil, err
+		}
+		if op.TableName, rest, err = readString(rest); err != nil {
+			return CatalogOp{}, nil, err
+		}
+	case OpRenameColumn:
+		if rest, err = readBytes16(rest, op.TableID[:]); err != nil {
+			return CatalogOp{}, nil, err
+		}
+		if rest, err = readBytes16(rest, op.ColumnID[:]); err != nil {
+			return CatalogOp{}, nil, err
+		}
+		if op.ColumnName, rest, err = readString(rest); err != nil {
+			return CatalogOp{}, nil, err
+		}
+	case OpDropColumn:
+		if rest, err = readBytes16(rest, op.TableID[:]); err != nil {
+			return CatalogOp{}, nil, err
+		}
+		if rest, err = readBytes16(rest, op.ColumnID[:]); err != nil {
+			return CatalogOp{}, nil, err
+		}
+	case OpDropTable:
+		if rest, err = readBytes16(rest, op.TableID[:]); err != nil {
+			return CatalogOp{}, nil, err
+		}
+	case OpSetClockGroup:
+		if rest, err = readBytes16(rest, op.TableID[:]); err != nil {
+			return CatalogOp{}, nil, err
+		}
+		if op.ClockGroup, rest, err = readString(rest); err != nil {
+			return CatalogOp{}, nil, err
+		}
+	case OpAddUniqueKey:
+		if rest, err = readBytes16(rest, op.TableID[:]); err != nil {
+			return CatalogOp{}, nil, err
+		}
+		if rest, err = readBytes16(rest, op.KeyID[:]); err != nil {
+			return CatalogOp{}, nil, err
+		}
+		if op.Keys, rest, err = readKeyMembers(rest, op.KeyID, withCoord, withPred); err != nil {
+			return CatalogOp{}, nil, err
+		}
+	case OpDropUniqueKey:
+		if rest, err = readBytes16(rest, op.TableID[:]); err != nil {
+			return CatalogOp{}, nil, err
+		}
+		if rest, err = readBytes16(rest, op.KeyID[:]); err != nil {
+			return CatalogOp{}, nil, err
+		}
+	case OpCreateIndex, OpDropIndex,
+		OpCreateView, OpDropView,
+		OpCreateVirtualTable, OpDropVirtualTable:
+		if op.ObjectName, rest, err = readString(rest); err != nil {
+			return CatalogOp{}, nil, err
+		}
+		if op.RawSQL, rest, err = readString(rest); err != nil {
+			return CatalogOp{}, nil, err
+		}
+	case OpCreateTrigger, OpDropTrigger:
+		if rest, err = readBytes16(rest, op.TableID[:]); err != nil {
+			return CatalogOp{}, nil, err
+		}
+		if op.ObjectName, rest, err = readString(rest); err != nil {
+			return CatalogOp{}, nil, err
+		}
+		if op.RawSQL, rest, err = readString(rest); err != nil {
+			return CatalogOp{}, nil, err
+		}
+	case OpBundle:
+		if !allowBundle {
+			// Rejected before this bundle's sub-ops are walked, so a
+			// nesting chain cannot recurse past depth one.
+			return CatalogOp{}, nil, errors.New("crdt: nested OpBundle is not allowed")
+		}
+		n, sz := binary.Uvarint(rest)
+		if sz <= 0 {
+			return CatalogOp{}, nil, ErrShortBuffer
+		}
+		rest = rest[sz:]
+		// Every sub-op costs at least one length byte, so a count
+		// beyond the remaining bytes is malformed — checked before the
+		// count sizes an allocation.
+		if n > uint64(len(rest)) {
+			return CatalogOp{}, nil, ErrShortBuffer
+		}
+		op.SubOps = make([]CatalogOp, 0, n)
+		for range n {
+			subLen, sz := binary.Uvarint(rest)
+			if sz <= 0 {
+				return CatalogOp{}, nil, ErrShortBuffer
+			}
+			rest = rest[sz:]
+			if uint64(len(rest)) < subLen {
+				return CatalogOp{}, nil, ErrShortBuffer
+			}
+			sub, err := decodeCatalogOp(rest[:subLen], false)
+			if err != nil {
+				return CatalogOp{}, nil, fmt.Errorf("crdt: decode bundle sub-op: %w", err)
+			}
+			op.SubOps = append(op.SubOps, sub)
+			rest = rest[subLen:]
+		}
+	default:
+		return CatalogOp{}, nil, fmt.Errorf("crdt: unknown CatalogOpKind %d", kind)
+	}
+	return op, rest, nil
 }
 
 // appendBytes16 appends a fixed 16-byte ID without any length prefix.
@@ -483,6 +594,11 @@ func readColumns(buf []byte) ([]CatalogColumn, []byte, error) {
 		return nil, nil, ErrShortBuffer
 	}
 	buf = buf[sz:]
+	// Each column costs ≥ 1 byte, so a count beyond the remaining bytes
+	// is malformed — checked before the count sizes an allocation.
+	if n > uint64(len(buf)) {
+		return nil, nil, ErrShortBuffer
+	}
 	out := make([]CatalogColumn, 0, n)
 	for range n {
 		var c CatalogColumn
@@ -535,40 +651,12 @@ func readColumns(buf []byte) ([]CatalogColumn, []byte, error) {
 	return out, buf, nil
 }
 
-func opCarriesCoordinatedKey(op CatalogOp) bool {
-	switch op.Kind {
-	case OpCreateTable, OpAddUniqueKey:
-		for _, k := range op.Keys {
-			if k.Coordinated {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func opCarriesPartialKey(op CatalogOp) bool {
-	switch op.Kind {
-	case OpCreateTable, OpAddUniqueKey:
-		for _, k := range op.Keys {
-			if k.Predicate.Root != nil {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func appendKeys(buf []byte, keys []CatalogKey, versioned, partial bool) []byte {
+func appendKeys(buf []byte, keys []CatalogKey) []byte {
 	buf = binary.AppendUvarint(buf, uint64(len(keys)))
 	for _, k := range keys {
 		buf = appendBytes16(buf, k.KeyID[:])
-		if versioned {
-			buf = appendBool(buf, k.Coordinated)
-		}
-		if partial {
-			buf = appendPredicate(buf, k.Predicate)
-		}
+		buf = appendBool(buf, k.Coordinated)
+		buf = appendPredicate(buf, k.Predicate)
 		buf = binary.AppendUvarint(buf, uint64(len(k.Members)))
 		for _, m := range k.Members {
 			buf = appendBytes16(buf, m.ColumnID[:])
@@ -578,12 +666,15 @@ func appendKeys(buf []byte, keys []CatalogKey, versioned, partial bool) []byte {
 	return buf
 }
 
-func readKeys(buf []byte, versioned, partial bool) ([]CatalogKey, []byte, error) {
+func readKeys(buf []byte, withCoord, withPred bool) ([]CatalogKey, []byte, error) {
 	n, sz := binary.Uvarint(buf)
 	if sz <= 0 {
 		return nil, nil, ErrShortBuffer
 	}
 	buf = buf[sz:]
+	if n > uint64(len(buf)) {
+		return nil, nil, ErrShortBuffer
+	}
 	out := make([]CatalogKey, 0, n)
 	for range n {
 		var k CatalogKey
@@ -591,12 +682,12 @@ func readKeys(buf []byte, versioned, partial bool) ([]CatalogKey, []byte, error)
 		if buf, err = readBytes16(buf, k.KeyID[:]); err != nil {
 			return nil, nil, err
 		}
-		if versioned {
+		if withCoord {
 			if k.Coordinated, buf, err = readBool(buf); err != nil {
 				return nil, nil, err
 			}
 		}
-		if partial {
+		if withPred {
 			if k.Predicate, buf, err = readPredicate(buf); err != nil {
 				return nil, nil, err
 			}
@@ -606,6 +697,9 @@ func readKeys(buf []byte, versioned, partial bool) ([]CatalogKey, []byte, error)
 			return nil, nil, ErrShortBuffer
 		}
 		buf = buf[sz:]
+		if mc > uint64(len(buf)) {
+			return nil, nil, ErrShortBuffer
+		}
 		k.Members = make([]CatalogKeyMember, 0, mc)
 		for range mc {
 			var m CatalogKeyMember
@@ -628,17 +722,13 @@ func readKeys(buf []byte, versioned, partial bool) ([]CatalogKey, []byte, error)
 // appendKeyMembers writes one key's member list (no surrounding count).
 // AddUniqueKey carries one key per op, so the surrounding "count of
 // keys" is implicit (=1).
-func appendKeyMembers(buf []byte, keys []CatalogKey, versioned, partial bool) []byte {
+func appendKeyMembers(buf []byte, keys []CatalogKey) []byte {
 	if len(keys) != 1 {
 		panic(fmt.Sprintf("crdt: appendKeyMembers expects 1 key, got %d", len(keys)))
 	}
 	k := keys[0]
-	if versioned {
-		buf = appendBool(buf, k.Coordinated)
-	}
-	if partial {
-		buf = appendPredicate(buf, k.Predicate)
-	}
+	buf = appendBool(buf, k.Coordinated)
+	buf = appendPredicate(buf, k.Predicate)
 	buf = binary.AppendUvarint(buf, uint64(len(k.Members)))
 	for _, m := range k.Members {
 		buf = appendBytes16(buf, m.ColumnID[:])
@@ -647,16 +737,16 @@ func appendKeyMembers(buf []byte, keys []CatalogKey, versioned, partial bool) []
 	return buf
 }
 
-func readKeyMembers(buf []byte, keyID KeyID, versioned, partial bool) ([]CatalogKey, []byte, error) {
+func readKeyMembers(buf []byte, keyID KeyID, withCoord, withPred bool) ([]CatalogKey, []byte, error) {
 	var coordinated bool
 	var predicate UniquePredicate
 	var err error
-	if versioned {
+	if withCoord {
 		if coordinated, buf, err = readBool(buf); err != nil {
 			return nil, nil, err
 		}
 	}
-	if partial {
+	if withPred {
 		if predicate, buf, err = readPredicate(buf); err != nil {
 			return nil, nil, err
 		}
@@ -666,6 +756,9 @@ func readKeyMembers(buf []byte, keyID KeyID, versioned, partial bool) ([]Catalog
 		return nil, nil, ErrShortBuffer
 	}
 	buf = buf[sz:]
+	if n > uint64(len(buf)) {
+		return nil, nil, ErrShortBuffer
+	}
 	members := make([]CatalogKeyMember, 0, n)
 	for range n {
 		var m CatalogKeyMember
