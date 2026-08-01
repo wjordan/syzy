@@ -660,3 +660,40 @@ schema-unhealthy, which is the outcome the first layer exists to prevent.
   install (event triggers, replica role, replication slot).
 - **A bucket is effectively required** in production: without one, journals
   grow unboundedly (§5).
+- **A large transaction is buffered whole.** Postgres does not stream a
+  transaction until it commits, so a bulk backfill arrives as one decode burst
+  and becomes one changeset — 200k rows costs roughly 300 MiB of heap and
+  stalls that node's apply of peer traffic for the duration (§13). Split large
+  backfills.
+
+---
+
+## 13. Performance
+
+Measured on the test container (single host, both databases on one server, so
+network is excluded). Reproduce with:
+
+```
+SYZY_PG_PERF=1 go test ./internal/postgres/ -run TestPerf -v -p 1
+```
+
+| Path | Throughput |
+| --- | --- |
+| Decode + fold (capture side) | ~164k rows/sec |
+| Apply (inbound, arbitrated) | ~18k rows/sec |
+| Postgres native logical replication, same workload | ~245k rows/sec |
+
+The comparison against Postgres's own logical replication is the one that
+means anything: the engine reads the same WAL through the same slot machinery,
+so native throughput is the ceiling and the gap is what multi-master costs.
+
+**Apply is the bottleneck, and it is not arbitration.** Folding runs at nearly
+Postgres's own rate, while apply is ~13× slower than native — because apply
+issues one `UPSERT` round trip per row inside the apply transaction. Batching
+that is the obvious optimization and has not been done; until it is, a node
+absorbs peer traffic at roughly 18k rows/sec, which is the number to size
+against rather than the fold rate.
+
+The bulk-transaction shape is worth planning for separately: 200k rows in one
+transaction fold in ~1.2s at ~164k rows/sec, but the node applies nothing from
+its peers during it and holds the whole changeset in memory.
