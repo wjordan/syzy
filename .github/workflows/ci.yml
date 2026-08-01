@@ -35,16 +35,36 @@ jobs:
           fi
 
       - name: go vet
-        run: go vet ./...
+        run: make vet
 
       # Builds the CLI and the loadable extension; the extension is a
       # cgo c-shared build, so this is also the check that the release
       # artifacts still link.
       - name: build
-        run: make build ext
+        run: make build ext build-pg
+
+      # Live Postgres for the PG engine suite (Linux only; macOS runners
+      # have no docker). Exporting SYZY_PG_TEST_URL makes PG tests
+      # mandatory on Linux: with the variable set they fail — not skip —
+      # if the server is unreachable.
+      - name: start postgres
+        if: runner.os == 'Linux'
+        run: |
+          chmod +x scripts/pg-test-container.sh
+          echo "SYZY_PG_TEST_URL=$(scripts/pg-test-container.sh start)" >> "$GITHUB_ENV"
 
       - name: test
         run: go test -race -count=1 ./...
+
+      # The pg module is separate, so ./... above does not reach it.
+      - name: test (postgres module)
+        run: make test-pg
+
+      # Downstream consumers import the root module without this repo's
+      # go.work, so the workspace must never be what makes root resolve.
+      # GOWORK=off is how CI proves root stands alone.
+      - name: root module builds without the workspace
+        run: GOWORK=off go build ./...
 
   bench-smoke:
     name: bench (smoke)
