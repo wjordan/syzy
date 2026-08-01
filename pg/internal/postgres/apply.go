@@ -169,6 +169,9 @@ func (a *applier) apply(ctx context.Context, cs *crdt.Changeset, force bool) err
 					done = append(done, *out.rowUpdate)
 				}
 				cellStamps = append(cellStamps, out.cellStamps...)
+				if len(out.winnerCols) == 0 {
+					continue // no DML ran; nothing this record can claim to have won
+				}
 				img, err := readRowImage(ctx, tx, ti, h.PK)
 				if err != nil {
 					return fmt.Errorf("winner-repair: read post-UPSERT row %s: %w", ti.name, err)
@@ -184,8 +187,17 @@ func (a *applier) apply(ctx context.Context, cs *crdt.Changeset, force bool) err
 			conflicts = append(conflicts, inboundLosses(ti, r, rs, cs.Stamp, h.CL)...)
 			continue // local/seen write dominates
 		}
-		if ins, isIns := r.(crdt.Insert); isIns {
-			if err := validateInsertCounterImage(ti, ins.Image); err != nil {
+		switch rec := r.(type) {
+		case crdt.Insert:
+			if err := validateInsertCounterImage(ti, rec.Image); err != nil {
+				return err
+			}
+		case crdt.Update:
+			// The row-level path renders a FormatDelta value as SQL addition
+			// (upsertSQL), so the wire contract has to be checked here too —
+			// otherwise a payload naming a non-counter column would silently add
+			// to it instead of quarantining.
+			if err := validateCounterValues(ti, rec.Changed); err != nil {
 				return err
 			}
 		}
@@ -212,8 +224,18 @@ func (a *applier) apply(ctx context.Context, cs *crdt.Changeset, force bool) err
 			}
 			cellStamps = append(cellStamps, stolen...)
 			arbImg := arb.(crdt.Insert).Image
-			sql = upsertSQL(ti, arbImg)
-			winnerInsertImg = arbImg
+			if merged, ok := counterMergeImage(ti, arbImg, rs, h.CL); ok {
+				// Generation-establishing Insert on a row this node's clock does
+				// not cover yet: its counter columns merge additively instead of
+				// erasing physical content every peer is summing (§8). The stash
+				// then needs the post-UPSERT row read back, since the merged row
+				// is not the image.
+				sql = upsertSQL(ti, merged)
+				winnerUpdate = true
+			} else {
+				sql = upsertSQL(ti, arbImg)
+				winnerInsertImg = arbImg
+			}
 		case crdt.Update:
 			arb, stolen, err := arbitrateUnique(ctx, tx, cache, ti, rec, cs.Stamp, genBumped)
 			if err != nil {

@@ -193,6 +193,9 @@ func introspectCatalog(ctx context.Context, conn *pgx.Conn, tables []string) (*c
 		if err := rejectUnreplicable(schema, name, pgcols); err != nil {
 			return nil, err
 		}
+		if err := rejectCounterShape(ctx, conn, schema, name, oid, replIdentByte(replident), pgcols); err != nil {
+			return nil, err
+		}
 		ti := &tableInfo{schema: schema, name: name, oid: oid, tid: deriveTableID(schema, name),
 			byName: map[string]*colInfo{}, clockGroup: clockGroupForReplIdent(replIdentByte(replident))}
 		var pks []pkEntry

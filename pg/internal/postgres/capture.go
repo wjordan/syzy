@@ -794,24 +794,35 @@ func (c *capturer) foldCommit(t *txnAccum) (*crdt.Changeset, *localFold, error) 
 					// A cell-group loss is per column: only the columns the winning
 					// record actually carried are lost, and the rest of this write
 					// still wins on every peer, so only those are repaired + dropped.
-					if upd, isUpd := rec.(crdt.Update); isUpd && cellUpdate {
-						kept, lost := splitCellLosers(upd.Changed, w.Cols)
-						if len(lost) > 0 {
-							selfCorrect = append(selfCorrect, selfCorrectOp{
-								tid: a.tid, pk: a.pk, image: repairImage(ti, w.Image, lost),
-								lost: lost, winner: w.Stamp, winnerCL: w.CL, loser: stampOnce(), loserCL: cl,
-							})
-						}
-						if len(kept) == 0 {
-							continue
-						}
-						upd.Changed = kept
-						rec = upd
+					// Counter contributions are never lost in either shape — every
+					// node sums every contribution, so dropping one here would erase
+					// it cluster-wide rather than just from this record.
+					var kept, lost []crdt.ColValue
+					var repair []crdt.ColValue
+					if cellUpdate {
+						kept, lost = splitCellLosers(rec.(crdt.Update).Changed, w.Cols)
+						repair = repairImage(ti, w.Image, lost)
 					} else {
-						selfCorrect = append(selfCorrect, selfCorrectOp{tid: a.tid, pk: a.pk, image: w.Image,
-							lost: localValues(rec), winner: w.Stamp, winnerCL: w.CL, loser: stampOnce(), loserCL: cl})
+						// Whole-record loss (an Insert, a Delete, or any row-group
+						// write): the winner owns the row. A carried contribution is
+						// not the winner's to own, so it rides on as an update.
+						_, isDelete := rec.(crdt.Delete)
+						kept = counterContributions(ti, recordImage(rec))
+						repair = repairRow(ti, w.Image, isDelete)
+					}
+					if len(lost) > 0 || !cellUpdate {
+						// The values this repair discards are the one place a LOCAL
+						// committed write is dropped outright, so they are recorded
+						// in the conflict log (§9) alongside the repair itself.
+						selfCorrect = append(selfCorrect, selfCorrectOp{tid: a.tid, pk: a.pk, image: repair,
+							lost:   lostColumns(ti, pickLost(cellUpdate, lost, recordImage(rec)), kept),
+							winner: w.Stamp, winnerCL: w.CL, loser: stampOnce(), loserCL: cl})
+					}
+					if len(kept) == 0 {
 						continue
 					}
+					rec = crdt.Update{Table: a.tid, PK: a.pk, CL: cl, Changed: kept}
+					cellUpdate = true
 				} else {
 					// Local dominates — winner stash is stale; peers will adopt this write.
 					c.winners.clear(a.tid, a.pk)

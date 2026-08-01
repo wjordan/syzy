@@ -56,6 +56,21 @@ func (a *applier) applyCellUpdate(ctx context.Context, tx pgx.Tx, cache *nodesta
 		return out, err
 	}
 	newGen := upd.CL > rs.CL
+	if len(upd.Changed) == 0 {
+		if !newGen {
+			return out, nil
+		}
+		// A redelivered counter-only update whose sole contribution the applied
+		// marker stripped. It carries nothing left to write, but the committed
+		// transaction it certifies DID advance this row to a new generation:
+		// dropping that advance would leave the row clock a generation behind,
+		// and the resurrecting Insert would then arrive as a row-level write and
+		// overwrite the contribution that already landed.
+		out.applied = true
+		out.rowUpdate = &rowClockWrite{tid: upd.Table, pk: upd.PK,
+			state: crdt.RowState{CL: upd.CL}, clearCells: true}
+		return out, nil
+	}
 
 	// Per-column gate. A new generation (the writer saw a resurrection we have
 	// not) wins every carried column; within the current generation each column
@@ -189,7 +204,7 @@ func writeAppliedMarker(ctx context.Context, tx pgx.Tx, cache *nodestate.Cache, 
 		int64(dot.Origin), int64(dot.Seq)); err != nil {
 		return fmt.Errorf("postgres: write applied marker: %w", err)
 	}
-	if bound := cache.PersistedFrontierBound(dot.Origin); bound > 0 {
+	if bound := nodestate.MarkerPruneBound(cache.PersistedFrontierBound(dot.Origin), dot.Seq); bound > 0 {
 		if _, err := tx.Exec(ctx, `DELETE FROM `+appliedMarkerTable+` WHERE origin = $1 AND seq <= $2`,
 			int64(dot.Origin), int64(bound)); err != nil {
 			return fmt.Errorf("postgres: prune applied markers: %w", err)

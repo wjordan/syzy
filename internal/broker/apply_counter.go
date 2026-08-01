@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/wjordan/syzy/crdt"
+	"github.com/wjordan/syzy/internal/nodestate"
 	"github.com/wjordan/syzy/internal/sqlitecatalog"
 	"github.com/wjordan/syzy/sqlitebridge"
 )
@@ -337,9 +338,10 @@ func (b *Broker) appliedMarkerPresent(origin crdt.Origin, seq crdt.Seq) (bool, e
 }
 
 // writeAppliedMarker inserts the (origin, seq) marker and prunes
-// entries the persisted snapshot frontier already covers. Runs inside
-// the apply transaction so the marker commits atomically with the
-// counter DML it certifies.
+// entries the persisted snapshot frontier already covers, never
+// reaching the seq this transaction is certifying (MarkerPruneBound).
+// Runs inside the apply transaction so the marker commits atomically
+// with the counter DML it certifies.
 func (b *Broker) writeAppliedMarker(origin crdt.Origin, seq crdt.Seq) error {
 	if err := b.ensureAppliedMarkerTable(); err != nil {
 		return err
@@ -349,7 +351,7 @@ func (b *Broker) writeAppliedMarker(origin crdt.Origin, seq crdt.Seq) error {
 		origin, seq); err != nil {
 		return err
 	}
-	if bound := b.cfg.Cache.PersistedFrontierBound(origin); bound > 0 {
+	if bound := nodestate.MarkerPruneBound(b.cfg.Cache.PersistedFrontierBound(origin), seq); bound > 0 {
 		return b.execMarker(
 			fmt.Sprintf(`DELETE FROM %s WHERE origin = ? AND seq <= ?`, appliedMarkerTable),
 			origin, crdt.Seq(bound))

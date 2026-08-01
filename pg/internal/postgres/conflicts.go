@@ -154,16 +154,14 @@ func inboundLosses(ti *tableInfo, r crdt.Record, rs crdt.RowState, loser crdt.St
 // rs2pk is the record's primary key, which every Record header carries.
 func rs2pk(r crdt.Record) crdt.PKBlob { return r.Header().PK }
 
-// localValues is the values a local record carries — what a fold discards when
-// winner-repair drops it whole.
-func localValues(r crdt.Record) []crdt.ColValue {
-	switch rec := r.(type) {
-	case crdt.Insert:
-		return rec.Image
-	case crdt.Update:
-		return rec.Changed
+// pickLost selects the values a winner-repair discarded: the split-out losing
+// columns for a cell-group write, or everything the record carried when the
+// winner takes the whole row.
+func pickLost(cellUpdate bool, lost, image []crdt.ColValue) []crdt.ColValue {
+	if cellUpdate {
+		return lost
 	}
-	return nil
+	return image
 }
 
 // writtenByOtherOrigin reports whether any part of the row's current state came

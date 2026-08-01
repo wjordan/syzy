@@ -579,3 +579,21 @@ func TestCacheClearCellsForRow(t *testing.T) {
 		t.Errorf("snap.Cells after clear+put = %+v", snap.Cells)
 	}
 }
+
+// TestMarkerPruneBound: a forced retry of a quarantined counter changeset runs
+// after the persisted frontier already covers its seq — the prune must never
+// reach the certificate the same transaction just wrote. Both engines' apply
+// paths share this bound.
+func TestMarkerPruneBound(t *testing.T) {
+	for _, tc := range []struct{ persisted, seq, want crdt.Seq }{
+		{0, 5, 0}, // nothing persisted yet
+		{3, 5, 3}, // prune behind the frontier
+		{5, 5, 4}, // retry at the frontier head: stop one short
+		{9, 5, 4}, // retry well behind the frontier
+		{9, 1, 0}, // first seq: nothing to prune
+	} {
+		if got := MarkerPruneBound(tc.persisted, tc.seq); got != tc.want {
+			t.Errorf("MarkerPruneBound(%d, %d) = %d, want %d", tc.persisted, tc.seq, got, tc.want)
+		}
+	}
+}

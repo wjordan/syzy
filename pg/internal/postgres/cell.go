@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 
@@ -83,7 +84,12 @@ func clockGroupForColumn(counter bool) string {
 
 func (ti *tableInfo) cellGroup() bool { return ti.clockGroup == metadata.ClockGroupCell }
 
+// hasCounters reports whether any of the table's columns merges by summation.
+// Nil-receiver-safe: the fold consults it on rows whose table it may not have.
 func (ti *tableInfo) hasCounters() bool {
+	if ti == nil {
+		return false
+	}
 	for _, c := range ti.cols {
 		if c.counter {
 			return true
@@ -226,6 +232,107 @@ func (a *applier) stripCounterContributions(records []crdt.Record) []crdt.Record
 		}
 	}
 	return out
+}
+
+// rejectCounterShape is the bootstrap-table floor under sql/ddl.sql's
+// syzy_ddl_admit_cells: a table listed in Config.Tables was created before this
+// node had event triggers, so nothing has ever checked its counter columns.
+// The rules are the gate's — a counter cell has to be a real number every peer
+// can add into, on a table whose merge unit is per column — and violating them
+// silently produces counters that overwrite instead of accumulating.
+func rejectCounterShape(ctx context.Context, conn *pgx.Conn, schema, name string, oid uint32, ri byte, pgcols []pgColumn) error {
+	qname := schema + "." + name
+	var counters []string
+	for _, pc := range pgcols {
+		if !pc.counter {
+			continue
+		}
+		counters = append(counters, pc.name)
+		switch {
+		case !pc.notNull:
+			return unsupportedDDLf("postgres: %s: counter column %q must be NOT NULL — a NULL cell has no value to sum contributions into", qname, pc.name)
+		case pc.pkpos > 0:
+			return unsupportedDDLf("postgres: %s: counter column %q cannot be part of the PRIMARY KEY — row identity must not change when a contribution is summed in", qname, pc.name)
+		case pc.generated || pc.identity != 0:
+			return unsupportedDDLf("postgres: %s: counter column %q cannot be GENERATED or an IDENTITY column — its value is the sum of replicated contributions, not a node-local expression", qname, pc.name)
+		}
+	}
+	if len(counters) == 0 {
+		return nil
+	}
+	if clockGroupForReplIdent(ri) != metadata.ClockGroupCell {
+		return unsupportedDDLf("postgres: %s: counter column(s) %s require the cell clock group; run ALTER TABLE %s REPLICA IDENTITY FULL",
+			qname, strings.Join(counters, ", "), qname)
+	}
+	var inKey string
+	if err := conn.QueryRow(ctx, `
+		SELECT COALESCE(min(a.attname), '')
+		FROM pg_index i, unnest(i.indkey) AS x(attnum)
+		JOIN pg_attribute a ON a.attrelid = $1 AND a.attnum = x.attnum
+		WHERE i.indrelid = $1 AND i.indisunique AND a.attname = ANY($2)`, oid, counters).Scan(&inKey); err != nil {
+		return fmt.Errorf("postgres: check counter unique keys on %s: %w", qname, err)
+	}
+	if inKey != "" {
+		return unsupportedDDLf("postgres: %s: counter column %q cannot be part of a UNIQUE key — concurrent contributions sum to a value no writer reserved", qname, inKey)
+	}
+	return nil
+}
+
+// counterMergeImage marks a generation-establishing Insert's counter columns as
+// contributions so the UPSERT sums them onto whatever the row already holds
+// instead of overwriting it. It applies when this node's row clock does not yet
+// cover the row (an undrained local commit — capture folds a transaction well
+// after Postgres committed it — or a row adopted from before replication
+// started): the physical content is a same-generation contribution every peer
+// sums, so an absolute image would erase it here while the cluster adds both.
+//
+// No probe for the row's existence is needed: on a row that is genuinely absent
+// the INSERT arm lands the contribution verbatim as the generation's opening
+// value, which is the same result.
+func counterMergeImage(ti *tableInfo, image []crdt.ColValue, rs crdt.RowState, cl uint64) ([]crdt.ColValue, bool) {
+	if !ti.hasCounters() || rs.IsLive() || cl != rs.NextLiveCL() {
+		return nil, false
+	}
+	out := make([]crdt.ColValue, len(image))
+	for i, v := range image {
+		if c := ti.colByID(v.Column); c != nil && c.counter {
+			v.Format = crdt.FormatDelta
+		}
+		out[i] = v
+	}
+	return out, true
+}
+
+// counterContributions extracts a row image's counter cells as the summable
+// contributions they are on the wire — the shape crdt.AsCellUpdate gives a
+// same-generation Insert, reused when a losing local fold has to keep its
+// contributions alive after the rest of the record is dropped (capture.go).
+func counterContributions(ti *tableInfo, image []crdt.ColValue) []crdt.ColValue {
+	if !ti.hasCounters() {
+		return nil
+	}
+	var out []crdt.ColValue
+	for _, v := range image {
+		c := ti.colByID(v.Column)
+		if c == nil || !c.counter || v.TypeTag != crdt.ColInt || len(v.Bytes) != 8 {
+			continue
+		}
+		v.Format = crdt.FormatDelta
+		out = append(out, v)
+	}
+	return out
+}
+
+// recordImage returns the column values a record carries, or nil for a record
+// shape that carries none (a Delete).
+func recordImage(rec crdt.Record) []crdt.ColValue {
+	switch r := rec.(type) {
+	case crdt.Insert:
+		return r.Image
+	case crdt.Update:
+		return r.Changed
+	}
+	return nil
 }
 
 // validateCounterValues rejects wire values that violate the counter contract

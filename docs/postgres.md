@@ -297,10 +297,27 @@ contribution writes `(origin, seq)` into `public.syzy_applied` *inside that
 same transaction*, so the marker is exactly as durable as the sum it
 certifies. On redelivery the marker is found and the contributions are
 stripped; only the idempotent remainder of the changeset re-applies. Markers
-are pruned behind the persisted frontier. Summation itself runs in Postgres
+are pruned strictly *behind* the persisted frontier — never up to the seq the
+same transaction is certifying, which a retry of a quarantined changeset would
+otherwise delete. Summation itself runs in Postgres
 (`SET n = target.n + excluded.n`), so it inherits row locking and needs no
 read-modify-write in the sidecar; `bigint` overflow surfaces as `22003` and
 quarantines the changeset deterministically.
+
+**A contribution is never arbitrated away.** Two places would otherwise drop
+one. An `INSERT` that establishes a row's generation but lands on a row this
+node's clock does not cover yet — an undrained local commit (capture folds a
+transaction well after Postgres committed it) or a row adopted from before
+replication started — merges its counter cells additively instead of
+overwriting content the rest of the cluster is summing. And when winner-repair
+(§9) finds a local write lost, the contribution it carried still ships: the
+registers lose, the counter does not.
+
+The admission rules above are enforced by the `ddl_command_end` gate, which a
+table listed in `Config.Tables` never passed — it was created before this node
+had event triggers. Introspection re-checks them at `Open` and refuses to bind
+a table whose counter columns could not merge, rather than replicating absolute
+values that silently overwrite concurrent increments.
 
 ---
 

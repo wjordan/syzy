@@ -39,18 +39,41 @@ type winnerEntry struct {
 // splitCellLosers partitions a cell-group record's carried columns against the
 // stashed winner's column set: kept still wins on every peer, lost is what the
 // winner already owns.
+//
+// A counter contribution is never lost. Contributions do not arbitrate by stamp
+// — every node sums every one of them — so dropping one here would erase it
+// from the whole cluster, not just from this record.
 func splitCellLosers(changed []crdt.ColValue, winnerCols map[crdt.ColumnID]struct{}) (kept, lost []crdt.ColValue) {
-	if len(winnerCols) == 0 {
-		return nil, changed // whole-row winner: everything loses
-	}
 	for _, v := range changed {
-		if _, ok := winnerCols[v.Column]; ok {
+		_, owned := winnerCols[v.Column]
+		// len(winnerCols) == 0 is a whole-row winner: it owns every column.
+		if v.Format != crdt.FormatDelta && (owned || len(winnerCols) == 0) {
 			lost = append(lost, v)
-		} else {
-			kept = append(kept, v)
+			continue
 		}
+		kept = append(kept, v)
 	}
 	return kept, lost
+}
+
+// repairRow restricts a stashed winner's full row image to what a whole-record
+// repair may write. Counter cells are excluded: the local cell is the running
+// sum of every contribution applied so far, and a stamped absolute image is not
+// entitled to roll that back. A losing DELETE is the exception — the row is
+// gone, so the winner's image has to resurrect it whole (its NOT NULL counter
+// included) exactly as every peer's apply of that winner did.
+func repairRow(ti *tableInfo, image []crdt.ColValue, resurrect bool) []crdt.ColValue {
+	if resurrect || !ti.hasCounters() {
+		return image
+	}
+	out := make([]crdt.ColValue, 0, len(image))
+	for _, v := range image {
+		if c := ti.colByID(v.Column); c != nil && c.counter {
+			continue
+		}
+		out = append(out, v)
+	}
+	return out
 }
 
 // repairImage restricts a stashed winner's full row image to the lost columns,

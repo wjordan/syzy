@@ -140,6 +140,22 @@ func (c *Cache) PersistedFrontierBound(origin crdt.Origin) crdt.Seq {
 	return c.prevPersistedFrontier[origin]
 }
 
+// MarkerPruneBound is the highest seq an apply may prune counter
+// applied-markers up to: whatever PersistedFrontierBound already covers,
+// but never the seq being certified by the same transaction.
+//
+// A forced retry of a quarantined changeset runs after the frontier has
+// advanced past its seq, so an uncapped bound would delete the
+// exactly-once certificate the transaction just wrote — and a later
+// redelivery would contribute a second time. Shared by both engines'
+// apply paths, which prune identically.
+func MarkerPruneBound(persisted, seq crdt.Seq) crdt.Seq {
+	if persisted >= seq {
+		return seq - 1
+	}
+	return persisted
+}
+
 // Self returns this node's origin id. Set at construction.
 func (c *Cache) Self() crdt.Origin { return c.self }
 
