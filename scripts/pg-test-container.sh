@@ -10,6 +10,9 @@
 # fsync=off is a test-only speed setting. synchronous_commit=off must
 # NOT be added: it breaks the keepalive-LSN coherence the capture path
 # relies on.
+#
+# One container can serve several concurrent `go test` runs: every fixture
+# database, slot and origin is namespaced per run (pgtest.Name).
 set -euo pipefail
 
 NAME=syzy-pg-test

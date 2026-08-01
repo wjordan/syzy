@@ -108,7 +108,7 @@ func TestAdoptIsIdempotent(t *testing.T) {
 		t.Fatalf("first run adopted %d rows, want 1", first.adoptedRows)
 	}
 	_ = first.Close()
-	waitSlotInactive(t, ctx, dbURL(db), "syzy_slot_"+db)
+	waitSlotInactive(t, ctx, dbURL(db), slotName(db))
 
 	second := open()
 	defer closeEngine(t, ctx, second)

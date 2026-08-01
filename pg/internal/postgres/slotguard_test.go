@@ -150,7 +150,7 @@ func TestOpenAllowsSlotAheadOfCheckpointWithSelfLog(t *testing.T) {
 	if err := e.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	ackSlot(t, ctx, db, "syzy_slot_"+db, ahead)
+	ackSlot(t, ctx, db, slotName(db), ahead)
 
 	again, err := openEngineAt()
 	if err != nil {

@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/wjordan/syzy/pg/internal/pgtest"
@@ -23,8 +26,23 @@ import (
 // wal_level=logical, selected by the pgtest contract. Run
 // scripts/pg-test-container.sh for the canonical server.
 
-func dbURL(db string) string   { return pgtest.URL() + db }
-func replURL(db string) string { return pgtest.URL() + db + "?replication=database" }
+// Fixture names are compile-time constants, so every server-side object a
+// test creates is mapped into this run's namespace (pgtest.Name) — one
+// Postgres server is routinely shared by concurrent `go test` runs.
+func pgDB(db string) string       { return pgtest.Name(db) }
+func slotName(db string) string   { return "syzy_slot_" + pgtest.Name(db) }
+func originName(db string) string { return "syzy_origin_" + pgtest.Name(db) }
+
+func dbURL(db string) string   { return pgtest.URL() + pgDB(db) }
+func replURL(db string) string { return pgtest.URL() + pgDB(db) + "?replication=database" }
+
+// TestMain drops this run's databases, slots and origins on the way out;
+// per-run names would otherwise pile up on a long-lived shared server.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	pgtest.DropRunFixtures()
+	os.Exit(code)
+}
 
 const schemaKV = `CREATE TABLE public.kv (id bigint PRIMARY KEY, val text)`
 
@@ -42,22 +60,23 @@ func createTestDB(t *testing.T, ctx context.Context, db, schemaSQL string) {
 		t.Fatalf("admin connect: %v", err)
 	}
 	defer admin.Close(ctx)
-	_, _ = admin.Exec(ctx, `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$1`, db)
+	name := pgDB(db)
+	_, _ = admin.Exec(ctx, `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$1`, name)
 	for i := 0; i < 50; i++ {
 		var n int
-		if err := admin.QueryRow(ctx, `SELECT count(*) FROM pg_replication_slots WHERE database=$1`, db).Scan(&n); err != nil {
+		if err := admin.QueryRow(ctx, `SELECT count(*) FROM pg_replication_slots WHERE database=$1`, name).Scan(&n); err != nil {
 			t.Fatalf("count slots: %v", err)
 		}
 		if n == 0 {
 			break
 		}
-		_, _ = admin.Exec(ctx, `SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE database=$1 AND NOT active`, db)
+		_, _ = admin.Exec(ctx, `SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE database=$1 AND NOT active`, name)
 		time.Sleep(20 * time.Millisecond)
 	}
-	if _, err := admin.Exec(ctx, fmt.Sprintf(`DROP DATABASE IF EXISTS %q WITH (FORCE)`, db)); err != nil {
+	if _, err := admin.Exec(ctx, fmt.Sprintf(`DROP DATABASE IF EXISTS %q WITH (FORCE)`, name)); err != nil {
 		t.Fatalf("drop db: %v", err)
 	}
-	if _, err := admin.Exec(ctx, fmt.Sprintf(`CREATE DATABASE %q`, db)); err != nil {
+	if _, err := admin.Exec(ctx, fmt.Sprintf(`CREATE DATABASE %q`, name)); err != nil {
 		t.Fatalf("create db: %v", err)
 	}
 	app, err := pgx.Connect(ctx, dbURL(db))
@@ -78,15 +97,15 @@ func newTestEngine(t *testing.T, ctx context.Context, db string, origin crdt.Ori
 // starts from; callers set their extra fields on the returned value.
 func baseTestConfig(db string, origin crdt.Origin, cluster crdt.ClusterID) Config {
 	return Config{
-		Name:        db,
+		Name:        pgDB(db),
 		Origin:      origin,
 		Cluster:     cluster,
 		Cache:       nodestate.New(origin),
 		ConnURL:     dbURL(db),
 		ReplConnURL: replURL(db),
 		Publication: "syzy_pub",
-		Slot:        "syzy_slot_" + db,
-		OriginName:  "syzy_origin_" + db,
+		Slot:        slotName(db),
+		OriginName:  originName(db),
 		Tables:      []string{"public.kv"},
 	}
 }
@@ -360,6 +379,14 @@ func TestConvergence(t *testing.T) {
 
 	csA := captureBacklog(t, ctx, a, 3) // 1, 2, 10:from-A
 	csB := captureBacklog(t, ctx, b, 2) // 3, 10:from-B
+	// Everything B wrote locally is behind this position, and everything the
+	// apply below writes is ahead of it — so the loopback capture can start
+	// here and see only applied writes. Without the pin it would restart from
+	// the slot's confirmed position, which these Meta-less test engines do not
+	// keep in step with their in-memory Cache: an ack that has not landed yet
+	// makes B re-read (and re-fold) its OWN commit, which is a harness artifact,
+	// not a loopback.
+	localHead := walHead(t, ctx, "syzy_b")
 	applyAll(t, ctx, b, csA)
 	applyAll(t, ctx, a, csB)
 
@@ -372,11 +399,13 @@ func TestConvergence(t *testing.T) {
 	idleCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
 	defer cancel()
 	var leaked []*crdt.Changeset
-	if err := b.capt.run(idleCtx, collectProcess(b, &leaked), runOpts{}); err != nil {
+	if err := b.capt.run(idleCtx, collectProcess(b, &leaked), runOpts{startLSN: localHead}); err != nil {
 		t.Fatalf("idle capture: %v", err)
 	}
 	if len(leaked) != 0 {
-		t.Fatalf("loopback leak: re-captured %d applied changesets", len(leaked))
+		// Say WHAT leaked: every id here came from A, so a record means the
+		// origin filter missed one of the applied writes.
+		t.Fatalf("loopback leak: re-captured %d changesets: %s", len(leaked), describeChangesets(leaked))
 	}
 
 	// Update + delete propagate.
@@ -648,8 +677,8 @@ func openDurable(t *testing.T, ctx context.Context, db string, origin crdt.Origi
 		ConnURL:         dbURL(db),
 		ReplConnURL:     replURL(db),
 		Publication:     "syzy_pub",
-		Slot:            "syzy_slot_" + db,
-		OriginName:      "syzy_origin_" + db,
+		Slot:            slotName(db),
+		OriginName:      originName(db),
 		Tables:          []string{"public.kv"},
 		Meta:            meta,
 		CheckpointEvery: 1, // checkpoint every commit for deterministic restart
@@ -783,15 +812,15 @@ func TestAutoIncrementPartition(t *testing.T) {
 	openOrd := func(db string, origin crdt.Origin, ord uint16) *Engine {
 		createTestDB(t, ctx, db, schema)
 		e, err := Open(ctx, Config{
-			Name:        db,
+			Name:        pgDB(db),
 			Origin:      origin,
 			Cluster:     cluster,
 			Cache:       nodestate.New(origin),
 			ConnURL:     dbURL(db),
 			ReplConnURL: replURL(db),
 			Publication: "syzy_pub",
-			Slot:        "syzy_slot_" + db,
-			OriginName:  "syzy_origin_" + db,
+			Slot:        slotName(db),
+			OriginName:  originName(db),
 			Tables:      []string{"public.items"},
 			NodeOrdinal: ord,
 		})
@@ -844,15 +873,15 @@ func TestPartitionSkipsNarrowColumn(t *testing.T) {
 		ALTER TABLE public.mism ALTER COLUMN id SET DEFAULT nextval('public.mism_seq')`
 	createTestDB(t, ctx, db, schema)
 	e, err := Open(ctx, Config{
-		Name:        db,
+		Name:        pgDB(db),
 		Origin:      61,
 		Cluster:     crdt.ClusterID{0x77, 0x88},
 		Cache:       nodestate.New(61),
 		ConnURL:     dbURL(db),
 		ReplConnURL: replURL(db),
 		Publication: "syzy_pub",
-		Slot:        "syzy_slot_" + db,
-		OriginName:  "syzy_origin_" + db,
+		Slot:        slotName(db),
+		OriginName:  originName(db),
 		Tables:      []string{"public.mism"},
 		NodeOrdinal: 1,
 	})
@@ -889,3 +918,47 @@ func TestPartitionSkipsNarrowColumn(t *testing.T) {
 }
 
 var _ engine.Engine = (*Engine)(nil)
+
+// describeChangesets renders records as "Insert(pk=…, cl=…)" so a failure says
+// which rows a capture produced rather than only how many.
+func describeChangesets(css []*crdt.Changeset) string {
+	var b strings.Builder
+	for _, cs := range css {
+		for _, r := range cs.Records {
+			if b.Len() > 0 {
+				b.WriteString(", ")
+			}
+			switch v := r.(type) {
+			case crdt.Insert:
+				fmt.Fprintf(&b, "Insert(pk=%x, cl=%d)", v.PK, v.CL)
+			case crdt.Update:
+				fmt.Fprintf(&b, "Update(pk=%x, cl=%d)", v.PK, v.CL)
+			case crdt.Delete:
+				fmt.Fprintf(&b, "Delete(pk=%x, cl=%d)", v.PK, v.CL)
+			default:
+				fmt.Fprintf(&b, "%T", r)
+			}
+		}
+	}
+	return b.String()
+}
+
+// walHead returns the database's current WAL insert position, for pinning a
+// capture's start so it cannot re-read commits made before this point.
+func walHead(t *testing.T, ctx context.Context, db string) pglogrepl.LSN {
+	t.Helper()
+	c, err := pgx.Connect(ctx, dbURL(db))
+	if err != nil {
+		t.Fatalf("wal-head connect: %v", err)
+	}
+	defer c.Close(ctx)
+	var s string
+	if err := c.QueryRow(ctx, `SELECT pg_current_wal_lsn()::text`).Scan(&s); err != nil {
+		t.Fatalf("wal head: %v", err)
+	}
+	lsn, err := pglogrepl.ParseLSN(s)
+	if err != nil {
+		t.Fatalf("parse lsn %q: %v", s, err)
+	}
+	return lsn
+}

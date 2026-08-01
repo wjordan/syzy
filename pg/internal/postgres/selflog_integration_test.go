@@ -27,8 +27,8 @@ func openSelfLog(t *testing.T, ctx context.Context, db string, origin crdt.Origi
 		ConnURL:         dbURL(db),
 		ReplConnURL:     replURL(db),
 		Publication:     "syzy_pub",
-		Slot:            "syzy_slot_" + db,
-		OriginName:      "syzy_origin_" + db,
+		Slot:            slotName(db),
+		OriginName:      originName(db),
 		Tables:          []string{"public.kv"},
 		Meta:            meta,
 		JournalDir:      journalDir,
@@ -144,7 +144,7 @@ func TestSelfLogDurableRestart(t *testing.T) {
 	if err := meta1.Close(); err != nil {
 		t.Fatalf("meta1 close: %v", err)
 	}
-	waitSlotInactive(t, ctx, dbURL(db), "syzy_slot_"+db)
+	waitSlotInactive(t, ctx, dbURL(db), slotName(db))
 
 	// --- run 2: fresh Cache + reopened metadata, same db/slot/journal ---
 	meta2, err := metadata.Open(metaPath)

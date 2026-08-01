@@ -158,8 +158,8 @@ func newCoordFixture(t *testing.T, db string) *coordFixture {
 	f.admin = admin
 
 	conninfo := fmt.Sprintf("host=%s port=%d dbname=%s user=postgres password=syzy connect_timeout=5",
-		sockDir, port, db)
-	if err := ensureCoordSchema(ctx, admin, db, conninfo); err != nil {
+		sockDir, port, pgDB(db))
+	if err := ensureCoordSchema(ctx, admin, pgDB(db), conninfo); err != nil {
 		t.Fatalf("ensureCoordSchema: %v", err)
 	}
 

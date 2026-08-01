@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/wjordan/syzy/crdt"
+	"github.com/wjordan/syzy/pg/internal/pgtest"
 )
 
 // Performance baseline (§10). These are manual-run: they take tens of seconds
@@ -81,6 +82,10 @@ func TestPerfVersusNativeLogical(t *testing.T) {
 	createTestDB(t, ctx, src, schemaKV)
 	createTestDB(t, ctx, dst, schemaKV)
 
+	// Subscriptions and slots are cluster-wide names, so they need this
+	// run's namespace just as the databases do.
+	sub := pgtest.Name("perf_sub")
+
 	pubConn := connectDB(t, ctx, src)
 	defer pubConn.Close(ctx)
 	if _, err := pubConn.Exec(ctx, `CREATE PUBLICATION perf_pub FOR TABLE public.kv`); err != nil {
@@ -92,7 +97,7 @@ func TestPerfVersusNativeLogical(t *testing.T) {
 	// waits for every in-progress transaction — including that one. Create the
 	// slot up front and hand it to the subscription instead.
 	if _, err := pubConn.Exec(ctx,
-		`SELECT pg_create_logical_replication_slot('perf_sub', 'pgoutput')`); err != nil {
+		fmt.Sprintf(`SELECT pg_create_logical_replication_slot(%s, 'pgoutput')`, quoteLiteral(sub))); err != nil {
 		t.Fatalf("create slot: %v", err)
 	}
 	subConn := connectDB(t, ctx, dst)
@@ -103,18 +108,18 @@ func TestPerfVersusNativeLogical(t *testing.T) {
 	// even dropping the database.
 	t.Cleanup(func() {
 		c := context.Background()
-		sub, err := pgx.Connect(c, dbURL(dst))
+		s, err := pgx.Connect(c, dbURL(dst))
 		if err == nil {
-			defer sub.Close(c)
-			_, _ = sub.Exec(c, `ALTER SUBSCRIPTION perf_sub DISABLE`)
-			_, _ = sub.Exec(c, `ALTER SUBSCRIPTION perf_sub SET (slot_name = NONE)`)
-			_, _ = sub.Exec(c, `DROP SUBSCRIPTION perf_sub`)
+			defer s.Close(c)
+			_, _ = s.Exec(c, fmt.Sprintf(`ALTER SUBSCRIPTION %s DISABLE`, quoteIdent(sub)))
+			_, _ = s.Exec(c, fmt.Sprintf(`ALTER SUBSCRIPTION %s SET (slot_name = NONE)`, quoteIdent(sub)))
+			_, _ = s.Exec(c, fmt.Sprintf(`DROP SUBSCRIPTION %s`, quoteIdent(sub)))
 		}
 		pub, err := pgx.Connect(c, dbURL(src))
 		if err == nil {
 			defer pub.Close(c)
 			_, _ = pub.Exec(c, `DROP PUBLICATION perf_pub`)
-			_, _ = pub.Exec(c, `SELECT pg_drop_replication_slot('perf_sub')`)
+			_, _ = pub.Exec(c, fmt.Sprintf(`SELECT pg_drop_replication_slot(%s)`, quoteLiteral(sub)))
 		}
 	})
 	// The subscriber dials from INSIDE the server, so it cannot use the
@@ -123,9 +128,11 @@ func TestPerfVersusNativeLogical(t *testing.T) {
 	// subscription exists, so this measures streaming apply, which is what the
 	// engine's number is.
 	if _, err := subConn.Exec(ctx, fmt.Sprintf(
-		`CREATE SUBSCRIPTION perf_sub CONNECTION %s PUBLICATION perf_pub
-		 WITH (create_slot = false, slot_name = 'perf_sub', copy_data = false)`,
-		quoteLiteral("host=/var/run/postgresql user=postgres dbname="+src))); err != nil {
+		`CREATE SUBSCRIPTION %s CONNECTION %s PUBLICATION perf_pub
+		 WITH (create_slot = false, slot_name = %s, copy_data = false)`,
+		quoteIdent(sub),
+		quoteLiteral("host=/var/run/postgresql user=postgres dbname="+pgDB(src)),
+		quoteLiteral(sub))); err != nil {
 		t.Fatalf("create subscription: %v", err)
 	}
 

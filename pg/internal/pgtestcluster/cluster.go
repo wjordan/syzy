@@ -140,9 +140,12 @@ func New(t testing.TB, cfg Config) *Cluster {
 	return c
 }
 
-// dbName builds a per-node DB name (DBPrefix + "_n<i>"). Lowercase and
-// valid PG identifier component.
-func (c *Cluster) dbName(i int) string { return fmt.Sprintf("%s_n%d", c.cfg.DBPrefix, i) }
+// dbName builds a per-node DB name (DBPrefix + "_n<i>"), in this run's
+// fixture namespace so concurrent `go test` runs cannot collide. Lowercase
+// and a valid PG identifier component.
+func (c *Cluster) dbName(i int) string {
+	return pgtest.Name(fmt.Sprintf("%s_n%d", c.cfg.DBPrefix, i))
+}
 
 // makeNode builds one Node: fresh DB + schema, fresh metadata + mirror +
 // self-log dir, a memtransport peer, and an open postgres.Engine.

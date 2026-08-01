@@ -206,7 +206,7 @@ func waitForAuto(db string, want map[string]bool, deadline time.Duration) error 
 }
 
 func selectAuto(ctx context.Context, db string) (map[int64]string, error) {
-	c, err := pgx.Connect(ctx, pgtest.URL()+db)
+	c, err := pgx.Connect(ctx, pgURL(db))
 	if err != nil {
 		return nil, err
 	}
@@ -229,6 +229,14 @@ func selectAuto(ctx context.Context, db string) (map[int64]string, error) {
 }
 
 // --- helpers ---
+
+// Fixture names are compile-time constants, so every server-side object a
+// test creates is mapped into this run's namespace (pgtest.Name) — one
+// Postgres server is routinely shared by concurrent `go test` runs.
+func pgDB(db string) string       { return pgtest.Name(db) }
+func pgURL(db string) string      { return pgtest.URL() + pgDB(db) }
+func slotName(db string) string   { return "syzy_slot_" + pgDB(db) }
+func originName(db string) string { return "syzy_origin_" + pgDB(db) }
 
 func requirePG(t *testing.T) {
 	t.Helper()
@@ -278,7 +286,7 @@ func (p *sidecarProc) stderr() string {
 func startSidecar(t *testing.T, ctx context.Context, bin string, a sidecarArgs) *sidecarProc {
 	t.Helper()
 	args := []string{
-		"-conn", pgtest.URL() + a.db,
+		"-conn", pgURL(a.db),
 		"-origin", fmt.Sprintf("%d", a.origin),
 		"-cluster-id", testClusterID,
 		"-data-dir", a.dataDir,
@@ -400,7 +408,7 @@ func waitForRow(db string, id int64, val string, deadline time.Duration) error {
 }
 
 func selectOne(ctx context.Context, db string, id int64) (string, error) {
-	c, err := pgx.Connect(ctx, pgtest.URL()+db)
+	c, err := pgx.Connect(ctx, pgURL(db))
 	if err != nil {
 		return "", err
 	}
@@ -419,21 +427,21 @@ func createPGDB(t *testing.T, db string) {
 		t.Fatalf("admin connect: %v", err)
 	}
 	defer admin.Close(ctx)
-	_, _ = admin.Exec(ctx, `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$1`, db)
+	_, _ = admin.Exec(ctx, `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$1`, pgDB(db))
 	for i := 0; i < 50; i++ {
 		var n int
-		_ = admin.QueryRow(ctx, `SELECT count(*) FROM pg_replication_slots WHERE database=$1`, db).Scan(&n)
+		_ = admin.QueryRow(ctx, `SELECT count(*) FROM pg_replication_slots WHERE database=$1`, pgDB(db)).Scan(&n)
 		if n == 0 {
 			break
 		}
-		_, _ = admin.Exec(ctx, `SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE database=$1 AND NOT active`, db)
+		_, _ = admin.Exec(ctx, `SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE database=$1 AND NOT active`, pgDB(db))
 		time.Sleep(20 * time.Millisecond)
 	}
-	_, _ = admin.Exec(ctx, fmt.Sprintf(`DROP DATABASE IF EXISTS %q WITH (FORCE)`, db))
-	if _, err := admin.Exec(ctx, fmt.Sprintf(`CREATE DATABASE %q`, db)); err != nil {
+	_, _ = admin.Exec(ctx, fmt.Sprintf(`DROP DATABASE IF EXISTS %q WITH (FORCE)`, pgDB(db)))
+	if _, err := admin.Exec(ctx, fmt.Sprintf(`CREATE DATABASE %q`, pgDB(db))); err != nil {
 		t.Fatalf("create %s: %v", db, err)
 	}
-	app, err := pgx.Connect(ctx, pgtest.URL()+db)
+	app, err := pgx.Connect(ctx, pgURL(db))
 	if err != nil {
 		t.Fatalf("schema connect %s: %v", db, err)
 	}
@@ -455,18 +463,18 @@ func createEmptyPGDB(t *testing.T, db string) {
 		t.Fatalf("admin connect: %v", err)
 	}
 	defer admin.Close(ctx)
-	_, _ = admin.Exec(ctx, `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$1`, db)
+	_, _ = admin.Exec(ctx, `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$1`, pgDB(db))
 	for i := 0; i < 50; i++ {
 		var n int
-		_ = admin.QueryRow(ctx, `SELECT count(*) FROM pg_replication_slots WHERE database=$1`, db).Scan(&n)
+		_ = admin.QueryRow(ctx, `SELECT count(*) FROM pg_replication_slots WHERE database=$1`, pgDB(db)).Scan(&n)
 		if n == 0 {
 			break
 		}
-		_, _ = admin.Exec(ctx, `SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE database=$1 AND NOT active`, db)
+		_, _ = admin.Exec(ctx, `SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE database=$1 AND NOT active`, pgDB(db))
 		time.Sleep(20 * time.Millisecond)
 	}
-	_, _ = admin.Exec(ctx, fmt.Sprintf(`DROP DATABASE IF EXISTS %q WITH (FORCE)`, db))
-	if _, err := admin.Exec(ctx, fmt.Sprintf(`CREATE DATABASE %q`, db)); err != nil {
+	_, _ = admin.Exec(ctx, fmt.Sprintf(`DROP DATABASE IF EXISTS %q WITH (FORCE)`, pgDB(db)))
+	if _, err := admin.Exec(ctx, fmt.Sprintf(`CREATE DATABASE %q`, pgDB(db))); err != nil {
 		t.Fatalf("create %s: %v", db, err)
 	}
 }
@@ -479,8 +487,8 @@ func dropPGDB(db string) {
 		return
 	}
 	defer admin.Close(ctx)
-	_, _ = admin.Exec(ctx, `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$1`, db)
-	_, _ = admin.Exec(ctx, fmt.Sprintf(`DROP DATABASE IF EXISTS %q WITH (FORCE)`, db))
+	_, _ = admin.Exec(ctx, `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$1`, pgDB(db))
+	_, _ = admin.Exec(ctx, fmt.Sprintf(`DROP DATABASE IF EXISTS %q WITH (FORCE)`, pgDB(db)))
 }
 
 func dropPGSlot(db string) {
@@ -491,7 +499,7 @@ func dropPGSlot(db string) {
 		return
 	}
 	defer admin.Close(ctx)
-	slot := "syzy_slot_" + db
+	slot := slotName(db)
 	// Terminate the slot's active session first — the sidecar's
 	// SIGTERM-driven shutdown closes its conn, but the WAL sender
 	// release can lag long enough that a plain pg_drop here returns
@@ -516,7 +524,7 @@ func dropPGOrigin(db string) {
 	}
 	defer admin.Close(ctx)
 	for i := 0; i < 50; i++ {
-		_, err := admin.Exec(ctx, `SELECT pg_replication_origin_drop($1) WHERE pg_replication_origin_oid($1) IS NOT NULL`, "syzy_origin_"+db)
+		_, err := admin.Exec(ctx, `SELECT pg_replication_origin_drop($1) WHERE pg_replication_origin_oid($1) IS NOT NULL`, originName(db))
 		if err == nil {
 			return
 		}
@@ -528,7 +536,7 @@ func pgExec(t *testing.T, db, sql string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	c, err := pgx.Connect(ctx, pgtest.URL()+db)
+	c, err := pgx.Connect(ctx, pgURL(db))
 	if err != nil {
 		t.Fatalf("pgExec connect: %v", err)
 	}

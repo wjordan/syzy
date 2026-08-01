@@ -12,11 +12,16 @@
 //
 // scripts/pg-test-container.sh is the canonical server recipe and prints
 // the URL to set.
+//
+// One server is routinely shared by more than one `go test` run, so every
+// server-side object a test creates is namespaced per run — see Name.
 package pgtest
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -89,6 +94,68 @@ func URL() string {
 		url += "/"
 	}
 	return url
+}
+
+// runSuffix namespaces this test process's server-side objects. The pid
+// is enough: one server is only ever shared by runs on this machine, and
+// two live runs cannot hold the same pid.
+var runSuffix = fmt.Sprintf("_r%d", os.Getpid())
+
+// Name maps a fixture object name (database, slot, replication origin) into
+// this run's namespace.
+//
+// Fixture names are compile-time constants, and the setup helpers force-drop
+// by name before recreating. Shared unchanged, that makes two concurrent runs
+// destroy each other's live databases mid-test — which surfaces as a stray,
+// unreproducible failure that reads like a product bug.
+//
+// The mapping is idempotent so it can be applied at every server-facing
+// boundary without tracing which caller already applied it; a constant cannot
+// collide with the pid-bearing suffix by accident.
+func Name(base string) string {
+	if strings.HasSuffix(base, runSuffix) {
+		return base
+	}
+	return base + runSuffix
+}
+
+// DropRunFixtures drops every database this run created, and any slots
+// pinning them. Call it from TestMain after m.Run(): per-run names would
+// otherwise pile up on a long-lived shared server instead of being reused.
+// A crashed run leaks until the container is recycled.
+func DropRunFixtures() {
+	url := URL()
+	if url == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	admin, err := pgx.Connect(ctx, url+"postgres")
+	if err != nil {
+		return
+	}
+	defer admin.Close(ctx)
+	var dbs []string
+	rows, err := admin.Query(ctx, `SELECT datname FROM pg_database WHERE datname LIKE '%' || $1`, runSuffix)
+	if err != nil {
+		return
+	}
+	for rows.Next() {
+		var db string
+		if err := rows.Scan(&db); err == nil {
+			dbs = append(dbs, db)
+		}
+	}
+	rows.Close()
+	for _, db := range dbs {
+		_, _ = admin.Exec(ctx, `SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE database=$1 AND active`, db)
+		_, _ = admin.Exec(ctx, `SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE database=$1`, db)
+		_, _ = admin.Exec(ctx, fmt.Sprintf(`DROP DATABASE IF EXISTS %q WITH (FORCE)`, db))
+	}
+	// Replication origins are cluster-wide, not per-database, so they
+	// outlive the databases they were named for.
+	_, _ = admin.Exec(ctx,
+		`SELECT pg_replication_origin_drop(roname) FROM pg_replication_origin WHERE roname LIKE '%' || $1`, runSuffix)
 }
 
 // SocketDir returns a directory visible to both this process and the

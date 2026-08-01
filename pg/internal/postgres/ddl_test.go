@@ -31,8 +31,8 @@ func openDDLEngine(t *testing.T, ctx context.Context, db string, origin crdt.Ori
 		ConnURL:     dbURL(db),
 		ReplConnURL: replURL(db),
 		Publication: "syzy_pub",
-		Slot:        "syzy_slot_" + db,
-		OriginName:  "syzy_origin_" + db,
+		Slot:        slotName(db),
+		OriginName:  originName(db),
 		Tables:      []string{"public.kv"},
 		DDL:         true,
 	})
@@ -63,8 +63,8 @@ func openDDLEngineLogMeta(t *testing.T, ctx context.Context, db string, origin c
 		ConnURL:     dbURL(db),
 		ReplConnURL: replURL(db),
 		Publication: "syzy_pub",
-		Slot:        "syzy_slot_" + db,
-		OriginName:  "syzy_origin_" + db,
+		Slot:        slotName(db),
+		OriginName:  originName(db),
 		Tables:      []string{"public.kv"},
 		DDL:         true,
 		SchemaLog:   log,
@@ -90,8 +90,8 @@ func openLeaseEngine(t *testing.T, ctx context.Context, db string, origin crdt.O
 		ConnURL:     dbURL(db),
 		ReplConnURL: replURL(db),
 		Publication: "syzy_pub",
-		Slot:        "syzy_slot_" + db,
-		OriginName:  "syzy_origin_" + db,
+		Slot:        slotName(db),
+		OriginName:  originName(db),
 		Tables:      []string{"public.kv"},
 		DDL:         true,
 		SchemaLog:   log,
@@ -1231,8 +1231,8 @@ func TestSchemaCatalogRestoredOnRestart(t *testing.T) {
 			ConnURL:     dbURL(db),
 			ReplConnURL: replURL(db),
 			Publication: "syzy_pub",
-			Slot:        "syzy_slot_" + db,
-			OriginName:  "syzy_origin_" + db,
+			Slot:        slotName(db),
+			OriginName:  originName(db),
 			Tables:      []string{"public.kv"},
 			DDL:         true,
 			SchemaLog:   log,
@@ -1268,7 +1268,7 @@ func TestSchemaCatalogRestoredOnRestart(t *testing.T) {
 	if err := meta1.Close(); err != nil {
 		t.Fatalf("meta1 close: %v", err)
 	}
-	waitSlotInactive(t, ctx, dbURL(db), "syzy_slot_"+db)
+	waitSlotInactive(t, ctx, dbURL(db), slotName(db))
 
 	// run 2: reopen against the same db + metadata file, WITHOUT recreating the
 	// database. A fresh Cache resets schemaSeq to 0; restore must rebuild it.
@@ -1326,8 +1326,8 @@ func TestUniqueKeyRestoredOnRestart(t *testing.T) {
 			ConnURL:     dbURL(db),
 			ReplConnURL: replURL(db),
 			Publication: "syzy_pub",
-			Slot:        "syzy_slot_" + db,
-			OriginName:  "syzy_origin_" + db,
+			Slot:        slotName(db),
+			OriginName:  originName(db),
 			Tables:      []string{"public.kv"},
 			DDL:         true,
 			SchemaLog:   log,
@@ -1366,7 +1366,7 @@ func TestUniqueKeyRestoredOnRestart(t *testing.T) {
 	if err := meta1.Close(); err != nil {
 		t.Fatalf("meta1 close: %v", err)
 	}
-	waitSlotInactive(t, ctx, dbURL(db), "syzy_slot_"+db)
+	waitSlotInactive(t, ctx, dbURL(db), slotName(db))
 
 	meta2, err := metadata.Open(metaPath)
 	if err != nil {
@@ -1464,8 +1464,8 @@ func TestSchemaCatchUpAtStartup(t *testing.T) {
 			ConnURL:     dbURL(dbB),
 			ReplConnURL: replURL(dbB),
 			Publication: "syzy_pub",
-			Slot:        "syzy_slot_" + dbB,
-			OriginName:  "syzy_origin_" + dbB,
+			Slot:        slotName(dbB),
+			OriginName:  originName(dbB),
 			Tables:      []string{"public.kv"},
 			DDL:         true,
 			SchemaLog:   log,
@@ -1493,7 +1493,7 @@ func TestSchemaCatchUpAtStartup(t *testing.T) {
 	if err := metaB1.Close(); err != nil {
 		t.Fatalf("metaB1 close: %v", err)
 	}
-	waitSlotInactive(t, ctx, dbURL(dbB), "syzy_slot_"+dbB)
+	waitSlotInactive(t, ctx, dbURL(dbB), slotName(dbB))
 
 	// While B is down, A appends event 2 (CREATE u).
 	appExec(t, "syzy_startup_a", `CREATE TABLE public.u (id bigint PRIMARY KEY)`)
@@ -1550,8 +1550,8 @@ func TestBootstrapTableDropRecreateRestart(t *testing.T) {
 			ConnURL:     dbURL(db),
 			ReplConnURL: replURL(db),
 			Publication: "syzy_pub",
-			Slot:        "syzy_slot_" + db,
-			OriginName:  "syzy_origin_" + db,
+			Slot:        slotName(db),
+			OriginName:  originName(db),
 			Tables:      []string{"public.kv"},
 			DDL:         true,
 			SchemaLog:   log,
@@ -1587,7 +1587,7 @@ func TestBootstrapTableDropRecreateRestart(t *testing.T) {
 	if err := meta1.Close(); err != nil {
 		t.Fatalf("meta1 close: %v", err)
 	}
-	waitSlotInactive(t, ctx, dbURL(db), "syzy_slot_"+db)
+	waitSlotInactive(t, ctx, dbURL(db), slotName(db))
 
 	meta2, err := metadata.Open(metaPath)
 	if err != nil {
@@ -1643,8 +1643,8 @@ func TestSchemaRestoreToleratesCrashMidDDL(t *testing.T) {
 			ConnURL:     dbURL(db),
 			ReplConnURL: replURL(db),
 			Publication: "syzy_pub",
-			Slot:        "syzy_slot_" + db,
-			OriginName:  "syzy_origin_" + db,
+			Slot:        slotName(db),
+			OriginName:  originName(db),
 			Tables:      []string{"public.kv"},
 			DDL:         true,
 			SchemaLog:   log,
@@ -1687,7 +1687,7 @@ func TestSchemaRestoreToleratesCrashMidDDL(t *testing.T) {
 	if err := meta1.Close(); err != nil {
 		t.Fatalf("meta1 close: %v", err)
 	}
-	waitSlotInactive(t, ctx, dbURL(db), "syzy_slot_"+db)
+	waitSlotInactive(t, ctx, dbURL(db), slotName(db))
 
 	// The crash window: physical schema advances past the recorded metadata.
 	appExec(t, db, `ALTER TABLE public.gadget RENAME TO widget`)
@@ -1772,8 +1772,8 @@ func TestSchemaUnhealthyOnUnreplicableDDL(t *testing.T) {
 			ConnURL:     dbURL(db),
 			ReplConnURL: replURL(db),
 			Publication: "syzy_pub",
-			Slot:        "syzy_slot_" + db,
-			OriginName:  "syzy_origin_" + db,
+			Slot:        slotName(db),
+			OriginName:  originName(db),
 			Tables:      []string{"public.kv"},
 			DDL:         true,
 			SchemaLog:   log,
@@ -1815,7 +1815,7 @@ func TestSchemaUnhealthyOnUnreplicableDDL(t *testing.T) {
 	if err := meta1.Close(); err != nil {
 		t.Fatalf("meta1 close: %v", err)
 	}
-	waitSlotInactive(t, ctx, dbURL(db), "syzy_slot_"+db)
+	waitSlotInactive(t, ctx, dbURL(db), slotName(db))
 
 	// A restart refuses to resume: the divergence is durable until syzy_clone.
 	meta2, err := metadata.Open(metaPath)

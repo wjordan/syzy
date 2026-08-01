@@ -542,7 +542,7 @@ func TestSchemaRestorePropagatesCrashWindowAlterColumn(t *testing.T) {
 	if err := meta1.Close(); err != nil {
 		t.Fatalf("meta1 close: %v", err)
 	}
-	waitSlotInactive(t, ctx, dbURL(db), "syzy_slot_"+db)
+	waitSlotInactive(t, ctx, dbURL(db), slotName(db))
 
 	// The crash window: both attribute changes commit with the sidecar down.
 	appExec(t, db, `ALTER TABLE public.gizmo ALTER COLUMN qty TYPE bigint`)
@@ -559,8 +559,8 @@ func TestSchemaRestorePropagatesCrashWindowAlterColumn(t *testing.T) {
 		ConnURL:     dbURL(db),
 		ReplConnURL: replURL(db),
 		Publication: "syzy_pub",
-		Slot:        "syzy_slot_" + db,
-		OriginName:  "syzy_origin_" + db,
+		Slot:        slotName(db),
+		OriginName:  originName(db),
 		Tables:      []string{"public.kv"},
 		DDL:         true,
 		SchemaLog:   log,
