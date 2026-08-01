@@ -1,7 +1,7 @@
 # Changeset Protocol
 
-This document specifies the canonical changeset bytes used by Syzy's SQLite
-runtime, transports, journals, and object storage. The format is
+This document specifies the canonical changeset bytes used by Syzy's SQLite and
+Postgres runtimes, transports, journals, and object storage. The format is
 **spec-authoritative**: any encoder or decoder disagreement is a protocol bug.
 The public [`crdt`](../crdt) package is the canonical Go implementation.
 
@@ -82,10 +82,10 @@ op-specific payload:
 For an **insert**, active non-generated columns are present as a full row image
 and `cl` is the writer's next live generation, which is odd.
 
-For an **update**, the record carries the columns SQLite reports as changed and
-`cl` is the writer's current live generation. The receiver maps stable table
-and column IDs through its catalog, ignores tombstoned columns, and arbitrates
-surviving values according to the admitted conflict layers.
+For an **update**, the record carries the columns the source engine reports as
+changed and `cl` is the writer's current live generation. The receiver maps
+stable table and column IDs through its catalog, ignores tombstoned columns,
+and arbitrates surviving values according to the admitted conflict layers.
 
 For a **delete**, `column_count` is zero. The tombstone is keyed by
 `(table_id, pk_blob)`, and `cl` is the next even generation.
@@ -124,7 +124,7 @@ Syzy must:
 
 1. assign one origin and strictly increasing sequence to each produced
    changeset;
-2. preserve the SQLite transaction boundary in one changeset;
+2. preserve the source transaction boundary in one changeset;
 3. make the exact encoded bytes durable before releasing the source
    history required to reconstruct the commit;
 4. validate cluster identity and schema dependencies before apply;
@@ -134,4 +134,5 @@ Syzy must:
 
 The convergence invariants behind these obligations are authoritative in
 [CRDT.md](CRDT.md). Admission and apply details are specified in the
-[SQLite architecture](../sqlite/docs/ARCHITECTURE.md).
+[SQLite architecture](../sqlite/docs/ARCHITECTURE.md) and
+[Postgres engine](postgres.md).

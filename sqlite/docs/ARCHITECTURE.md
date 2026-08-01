@@ -1,4 +1,4 @@
-# SQLite Architecture
+# SQLite engine architecture
 
 This document specifies Syzy's SQLite hook capture, transactional apply,
 sidecar state, commit-gated uniqueness, extension/daemon lifecycle, and LTX

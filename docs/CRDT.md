@@ -163,7 +163,9 @@ F_counter(o, vis, _)  = Σ contributions in vis restricted to cell(o),
 ```
 
 `F_counter` governs declared **counter columns** (see
-[SQLite DDL](../sqlite/docs/DDL.md#counter-columns)). It is the one layer that
+[SQLite DDL](../sqlite/docs/DDL.md#counter-columns) and the
+[Postgres engine](postgres.md#8-merge-semantics-clock-groups-and-counters)). It
+is the one layer that
 ignores `ar` entirely: within a row generation, every operation on a
 counter cell is a signed **contribution** — an UPDATE ships the delta
 `NEW − OLD`, and a concurrent same-generation INSERT image contributes
@@ -188,8 +190,10 @@ frontier (invariant 9) provides exactly-once in steady state; the
 crash window between native DML commit and frontier persistence — which
 registers cover by idempotent re-apply — must be closed for counter-bearing
 changesets by a **durable applied marker** written inside the same native
-transaction as the DML. The SQLite realization is
-[`apply.go`](../internal/broker/apply.go). On redelivery of a marked changeset, counter
+transaction as the DML. The engine realizations are
+[`apply.go`](../internal/broker/apply.go) and
+[`pg/internal/postgres/apply.go`](../pg/internal/postgres/apply.go). On
+redelivery of a marked changeset, counter
 contributions are stripped and the remaining idempotent effects re-apply.
 
 Interplay with `F_cell` on the same row: counter cells never carry
@@ -221,7 +225,7 @@ Uniqueness is not a merge function applied after the fact; it is a
 **linearizable precondition on admission**: the writer reserves `v` against
 the cluster's reservation leaseholder before its commit may proceed. The
 reservation gate is the *only* enforcement point — no replica, the DDL
-originator included, holds a native SQLite unique index for a coordinated
+originator included, holds a native unique index for a coordinated
 key, so apply never arbitrates and never rejects. A competing operation is
 rejected before commit or cannot reach an admitting leaseholder, so there is
 no loser to null and no convergence step. This is the system's one CP operation; it is
@@ -251,9 +255,10 @@ operator-driven and its mechanization is design-stage (see
 transiently observe the departing duplicate until the releasing change
 arrives. (The owning row may reclaim its own value immediately.)
 
-See [SCHEMA.md](SCHEMA.md#unique-keys) for the key model. Apply and reservation
-flows are specified in the
-[SQLite DDL specification](../sqlite/docs/DDL.md#unique-keys).
+See [SCHEMA.md](SCHEMA.md#unique-keys) for the key model. Engine-specific apply
+and reservation flows are specified in the
+[SQLite DDL specification](../sqlite/docs/DDL.md#unique-keys) and
+[Postgres engine](postgres.md#7-unique-keys).
 
 ### Layer composition
 
@@ -288,9 +293,9 @@ et al.: `Δ = Materialize(...)` such that `X ⊔ Δ = NewState`. Rows that
 materialize no effect are omitted, corresponding to irredundant deltas
 (Almeida §4.1).
 
-SQLite materializes captured hook evidence in
-`internal/syncer/materialize.go` and produces the canonical changeset in
-[PROTOCOL.md](PROTOCOL.md).
+SQLite materializes captured hook evidence in `internal/syncer/materialize.go`;
+Postgres folds logical-decoding records in `pg/internal/postgres/capture.go`.
+Both produce the canonical changeset in [PROTOCOL.md](PROTOCOL.md).
 
 ## Cross-Document Map
 

@@ -1,6 +1,6 @@
 # Concepts
 
-Syzy turns each committed SQLite transaction into a deterministic changeset,
+Syzy turns each committed database transaction into a deterministic changeset,
 makes that changeset durable, sends the same bytes to other nodes, and applies
 it idempotently. Concurrent changes may arrive in different orders; the merge
 rules select the same logical result everywhere.
@@ -11,7 +11,7 @@ are in [CRDT.md](CRDT.md).
 
 ## Key terms
 
-- **Replica or node** — one SQLite application database plus local Syzy state
+- **Replica or node** — one application database plus local Syzy state
   needed to produce, apply, and recover replicated changes.
 - **Origin** — the durable identity of one writer. Each origin numbers its
   changesets consecutively so receivers can detect duplicates and gaps.
@@ -27,17 +27,17 @@ are in [CRDT.md](CRDT.md).
 ## The replication path
 
 ```text
-SQLite commit
-  -> hook capture
+database commit
+  -> engine capture
   -> canonical changeset
   -> durable self-origin history
   -> live broadcast and optional object-store sealing
-  -> transactional SQLite apply on peers
+  -> transactional native apply on peers
   -> durable frontier advance
 ```
 
-SQLite statement, preupdate, commit, rollback, and WAL hooks preserve the
-originating transaction boundary. The exact encoded changeset becomes durable
+SQLite hooks or Postgres logical decoding preserve the originating transaction
+boundary. The exact encoded changeset becomes durable
 before source history can be released. The public [`crdt`](../crdt) package
 owns canonical values and encoding; transports, journals, and object epochs
 carry those bytes unchanged.
@@ -59,7 +59,7 @@ Row-level last-writer-wins is the base. A causal row generation distinguishes
 an update from a deletion followed by re-insertion. Within one generation the
 higher `(HLC, origin)` stamp wins.
 
-SQLite may opt individual tables or columns into more specific layers:
+Tables or columns may opt into more specific layers:
 
 - cell-level last-writer-wins;
 - additive counters;
@@ -74,7 +74,7 @@ semantics are specified in [CRDT.md](CRDT.md).
 Most commits are local and asynchronous. Coordination is reserved for an
 invariant with no convergent loser state. A `NOT NULL UNIQUE` key is the
 canonical example: clearing the losing value would violate the schema, so the
-current leaseholder reserves the value before the SQLite commit completes.
+current leaseholder reserves the value before the originating commit completes.
 
 Coordination intentionally reduces availability for that operation. Loss of
 the coordinator cannot make an unsafe write look committed.
@@ -86,10 +86,9 @@ miss a broadcast, restart, or remain offline. It compares frontiers, pulls
 missing origin/sequence ranges from peers, and can fall back to object-store
 epochs when configured.
 
-Coupled LTX histories restore the application and metadata databases, eagerly
-or through lazy page loading. Clone is the bootstrap and divergence-repair
-path; replay above the restored frontier brings the node to the current logical
-tip.
+The SQLite engine uses coupled LTX histories and clone for physical recovery.
+The Postgres engine uses native base backups or bucket restore; both replay
+above the restored frontier to reach the current logical tip.
 
 ## Schema
 
@@ -98,7 +97,8 @@ through a compare-and-swap schema log. Catalog operations assign stable table,
 column, and key identities, and every changeset records the schema sequence it
 requires. Receivers catch the catalog up before applying dependent data.
 
-SQLite translates catalog operations into native DDL and rejects features it
-cannot replicate safely. A terminal inability to follow the schema chain is
+Each engine translates catalog operations into native DDL and rejects features
+it cannot replicate safely. A terminal inability to follow the schema chain is
 persisted as schema-unhealthy and requires a fresh clone. See
-[SCHEMA.md](SCHEMA.md) and [SQLite DDL](../sqlite/docs/DDL.md).
+[SCHEMA.md](SCHEMA.md), [SQLite DDL](../sqlite/docs/DDL.md), and the
+[Postgres engine](postgres.md).

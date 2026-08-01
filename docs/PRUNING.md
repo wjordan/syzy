@@ -1,4 +1,8 @@
-# Pruning
+# Pruning and offline-peer contract
+
+This document specifies the SQLite retention realization and the shared
+offline-peer contract. Postgres journal retention is described in the
+[Postgres engine architecture](postgres.md).
 
 Bounded retention for Syzy's logical history and CRDT state. Per-origin
 journal files are pruned by segment-level `unlink()`; metadata

@@ -19,15 +19,18 @@ The main system references are [ARCHITECTURE.md](docs/ARCHITECTURE.md),
 [SCHEMA.md](docs/SCHEMA.md), and [TRANSPORT.md](docs/TRANSPORT.md).
 SQLite-specific behavior belongs to the
 [SQLite architecture](sqlite/docs/ARCHITECTURE.md).
+Postgres-specific behavior belongs to the [Postgres engine](docs/postgres.md).
 
 ## Building
 
-You need Go 1.25 or newer, Make, and a C compiler. Syzy vendors the SQLite
-amalgamation and its extension is a `c-shared` cgo build, so `CGO_ENABLED=1` is
-mandatory and `go install` cannot produce the extension — use Make:
+You need Go 1.25 or newer and Make. SQLite builds also need a C compiler: Syzy
+vendors the SQLite amalgamation and its extension is a `c-shared` cgo build, so
+`CGO_ENABLED=1` is mandatory and `go install` cannot produce the extension — use
+Make:
 
 ```bash
 make build ext      # bin/syzy and ext/syzy.so
+make build-pg       # bin/syzy-pg
 export PATH="$PWD/bin:$PATH"
 ```
 
@@ -41,16 +44,18 @@ compare on every attach:
 make build ext VERSION=v0.1.0
 ```
 
-## Module
+## Modules
 
-The repository is one Go module. The SQLite runtime and lazy-restore support
-are packages under the root module.
+The repository is a Go workspace containing the root module and the nested
+`pg` module. The SQLite runtime and lazy-restore support are packages under the
+root module; the Postgres sidecar lives in `pg`.
 
 Run the complete checks with:
 
 ```bash
 make vet
 make test
+make test-pg
 ```
 
 To test the module without ambient workspace resolution:
@@ -63,6 +68,8 @@ GOWORK=off go test ./...
 
 - Keep the SQLite package focused on database and application lifecycle; the
   root module carries supporting protocol, transport, and runtime packages.
+- Keep Postgres-specific capture, apply, and DDL realization in the nested
+  `pg` module.
 - Make `objectstore.Bucket` contract and backend changes in the standalone
   [`objectstore`](https://github.com/wjordan/objectstore) module; this repository
   owns the object layouts and runtime integration built on that contract.

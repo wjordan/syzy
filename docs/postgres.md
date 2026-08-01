@@ -1,4 +1,4 @@
-# Postgres engine
+# Postgres engine architecture
 
 The Postgres engine (`pg/`, a separate Go module) replicates a Postgres
 database under the same CRDT model the SQLite engine uses — multi-master,

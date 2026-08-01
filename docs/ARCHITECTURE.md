@@ -1,12 +1,13 @@
-# Syzy Architecture
+# System architecture
 
-Syzy captures committed SQLite transactions as durable CRDT changesets,
+Syzy captures committed database transactions as durable CRDT changesets,
 distributes them through peers and optional object storage, and applies them
 transactionally at every replica.
 
 This document defines the end-to-end lifecycle and its ordering requirements.
-SQLite hook details, metadata storage, DDL admission, and physical recovery are
-specified in the [SQLite architecture](../sqlite/docs/ARCHITECTURE.md).
+Engine-specific capture, apply, DDL, and recovery are specified in the
+[SQLite engine architecture](../sqlite/docs/ARCHITECTURE.md) and
+[Postgres engine](postgres.md).
 
 The [CRDT model](CRDT.md), [changeset protocol](PROTOCOL.md),
 [schema contract](SCHEMA.md), and [transport protocol](TRANSPORT.md) are
@@ -16,14 +17,14 @@ or consistency claims.
 ## System overview
 
 ```text
-SQLite application
-  commit hooks | DDL admission | transactional apply
+application database
+  engine capture | DDL admission | transactional apply
         |
 canonical changesets and stable schema identities
         |
 origin history | live transport | anti-entropy | object storage
         |
-peer SQLite replicas
+peer database replicas
 ```
 
 Each node combines local transaction capture, per-origin history, deterministic
@@ -34,33 +35,35 @@ model.
 
 ## Transaction lifecycle
 
-One local SQLite transaction follows this ordering:
+One local transaction passes through these phases. The engine guide defines
+where its native commit sits: SQLite observes through hooks, while Postgres
+decodes the committed WAL transaction.
 
-1. **Hook observation.** SQLite statement and preupdate hooks collect the
-   transaction's replicated row effects without losing its atomic boundary.
+1. **Capture.** The source engine collects the transaction's replicated row
+   effects without losing its atomic boundary.
 2. **Materialization.** Stable catalog identities replace native table and
-   column names; SQLite values become canonical value classes.
+   column names; native values become canonical value classes.
 3. **Identity allocation.** The local origin allocates the next sequence and
    HLC stamp, computes row generations, and builds one changeset.
-4. **Commit and durable self history.** SQLite commits, then the exact encoded
-   bytes become durable before Syzy releases the source history position or
-   reports the entry available for pruning.
+4. **Durable self history.** The exact encoded bytes become durable before Syzy
+   releases the source history position or reports the entry available for
+   pruning.
 5. **Publication.** Live transport broadcasts the retained payload; an
    optional sealer also batches it into immutable object-store epochs.
 6. **Inbound admission.** A receiver validates cluster identity, schema
    dependency, per-origin sequence state, and record semantics.
-7. **Arbitration and apply.** The broker resolves records against persisted
-   CRDT state and applies accepted SQLite DML in one transaction.
+7. **Arbitration and apply.** The runtime resolves records against persisted
+   CRDT state and applies accepted native DML in one transaction.
 8. **Durable frontier advance.** Apply metadata is persisted before the origin
    frontier records the sequence as accepted.
 
 Syzy pipelines these phases, but the ordering obligations are invariant. See
 [PROTOCOL.md](PROTOCOL.md) for wire and durability requirements.
 
-Inbound apply owns its SQLite transaction state: every success or failure must
-leave the apply connection in autocommit before another payload starts.
-Resource failures such as `SQLITE_FULL` are retained and retried after the
-connection is repaired; they never advance the frontier or drop the payload.
+Inbound apply owns its native transaction state: every success or failure must
+leave the apply connection ready before another payload starts. Resource
+failures are retained and retried after repair; they never advance the frontier
+or drop the payload.
 
 ## Replica state
 
@@ -74,9 +77,9 @@ Every replica tracks:
 - quarantined changesets durably accepted but not yet materialized; and
 - self-origin and remote-origin history needed for replay and catch-up.
 
-SQLite persists this state in its companion metadata database. Public meaning
+Each engine persists this state beside its application database. Public meaning
 and ordering are contractual; internal Go structs are code-authoritative unless
-the SQLite architecture explicitly makes an on-disk field part of recovery.
+an engine specification makes an on-disk field part of recovery.
 
 ## Convergence
 
@@ -102,9 +105,9 @@ operation, and native SQL context. Compare-and-swap append gives the chain one
 total order.
 
 Each DML changeset records the schema sequence it requires. A receiver catches
-its stable catalog up before decoding IDs into SQLite objects. DDL admission,
-SQLite rendering, terminal schema-health policy, and recovery are described in
-[SCHEMA.md](SCHEMA.md) and [SQLite DDL](../sqlite/docs/DDL.md).
+its stable catalog up before decoding IDs into native objects. DDL admission,
+rendering, terminal schema-health policy, and recovery are described in
+[SCHEMA.md](SCHEMA.md) and the engine guides.
 
 ## Distribution and anti-entropy
 
@@ -124,13 +127,9 @@ Its authoritative framing is in [TRANSPORT.md](TRANSPORT.md).
 ## Durability and recovery
 
 The exact changeset history and persisted CRDT/frontier state provide logical
-durability. SQLite physical recovery publishes coupled LTX histories for the
-application and metadata databases. A clone restores both streams to a valid
-point, then replays retained changesets above the restored frontier. Optional
-lazy restore changes when pages are fetched, not the recovery authority.
-
-SQLite clone and LTX restore are the bootstrap authority, preserving the
-schema, extension state, and database bytes that row export cannot represent.
+durability. Physical recovery is engine-specific: SQLite couples the
+application and metadata LTX histories, while Postgres uses its native backup
+and slot model. Both replay retained changesets above the restored frontier.
 
 ## Implementation map
 

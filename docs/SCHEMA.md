@@ -1,12 +1,13 @@
 # Schema Replication
 
 This document defines Syzy's schema chain, stable catalog identity, and the
-schema dependency carried by changesets. DDL capture, admission, rendering,
-and recovery are detailed in [SQLite DDL](../sqlite/docs/DDL.md).
+schema dependency carried by changesets. Engine-specific DDL capture,
+admission, rendering, and recovery are detailed in
+[SQLite DDL](../sqlite/docs/DDL.md) and the [Postgres engine](postgres.md).
 
 Catalog-operation meaning and schema-chain ordering are
 **spec-authoritative**. Internal metadata tables and Go shapes are
-code-authoritative unless the SQLite specification explicitly makes an on-disk
+code-authoritative unless an engine specification explicitly makes an on-disk
 format part of recovery.
 
 ## Why DDL has its own chain
@@ -27,7 +28,7 @@ A schema event contains:
 ```text
 schema_seq   dense sequence allocated by the schema authority
 parent_seq   head observed before compare-and-swap append
-catalog_op   typed SQLite catalog mutation
+catalog_op   typed native catalog mutation
 raw_sql      native statement context for diagnostics or replay
 ```
 
@@ -42,7 +43,7 @@ the schema-chain contract; a particular provider's storage layout is not.
 
 ## Stable catalog identity
 
-Replicated objects are addressed independently of SQLite names:
+Replicated objects are addressed independently of native names:
 
 - `table_id` — 16-byte stable table identity;
 - `column_id` — 16-byte stable column identity scoped by its table;
@@ -50,7 +51,7 @@ Replicated objects are addressed independently of SQLite names:
 - schema sequence — the point at which an identity becomes active or
   tombstoned.
 
-Renaming an object changes its SQLite name while preserving its stable ID. A
+Renaming an object changes its native name while preserving its stable ID. A
 changeset created before the rename still resolves to the same logical object
 after catch-up. Dropping an object tombstones its identity; IDs are never
 recycled while retained history may still address them.
@@ -76,14 +77,14 @@ The replicated catalog operation vocabulary covers:
 - add, rename, and drop column;
 - create and drop primary/unique key metadata;
 - native create/drop index, view, virtual table, and trigger operations;
-- bundles used when one admitted SQLite statement has several catalog effects;
+- bundles used when one admitted native statement has several catalog effects;
   and
 - clock-group selection for replicated conflict behavior.
 
-Structural operations carry stable identities and the SQLite attributes needed
-to decode later DML. Auxiliary objects retain admitted SQLite SQL where their
+Structural operations carry stable identities and the native attributes needed
+to decode later DML. Auxiliary objects retain admitted native SQL where their
 semantics do not affect record decoding. The operation deliberately models only
-the catalog state needed for SQLite replication; it is not a universal SQL AST.
+the catalog state needed for replication; it is not a universal SQL AST.
 
 ## Changeset dependency
 
@@ -92,14 +93,14 @@ applying its records, a receiver must bring the local catalog to at least that
 sequence. A schema-behind changeset waits; it must not be decoded against an
 older catalog.
 
-DDL itself does not appear as a DML record. The SQLite broker fetches schema
-events, applies native structure before metadata, records the event, reloads the
-runtime catalog, and advances its local schema sequence.
+DDL itself does not appear as a DML record. The runtime fetches schema events,
+applies native structure before metadata, records the event, reloads the
+catalog, and advances its local schema sequence.
 
-On open, reconciliation treats the terminal state of the applied schema chain
-as authoritative for coordinated unique keys. If a key's final decodable
-operation leaves it active while the local catalog has lost or tombstoned it,
-Syzy restores the key definition before coordination services start. A later
+On open, the SQLite engine's reconciliation treats the terminal state of the
+applied schema chain as authoritative for coordinated unique keys. If a key's
+final decodable operation leaves it active while the local catalog has lost or
+tombstoned it, Syzy restores the key definition before coordination services start. A later
 drop of the key, one of its columns, or its table wins and must not be
 resurrected. If historical admission defects left duplicate active identities
 for one key definition, reconciliation restores only the same deterministic
@@ -116,7 +117,7 @@ Syzy must:
 3. append against the schema head with compare-and-swap semantics;
 4. ensure a rejected append cannot silently commit divergent native DDL;
 5. apply each event idempotently in dense schema-sequence order;
-6. map stable IDs to SQLite objects for DML capture and apply;
+6. map stable IDs to native objects for DML capture and apply;
 7. classify temporary lock, cancellation, I/O, and resource failures as
    retryable without advancing schema state; and
 8. durably mark the node schema-unhealthy when it misses the retention horizon,
@@ -124,13 +125,13 @@ Syzy must:
    structural event.
 
 The terminal marker is fail-closed and requires a fresh clone. There is no
-skip-event or force-advance operation. [SQLite DDL](../sqlite/docs/DDL.md)
-specifies hook ordering and the durable marker encoding.
+skip-event or force-advance operation. Engine guides specify admission ordering
+and durable marker details.
 
 ## Unique keys
 
 Unique keys are catalog identities; an eventual key is additionally backed by
-a SQLite index, while a coordinated key is catalog metadata alone on every
+a native index, while a coordinated key is catalog metadata alone on every
 node. Syzy admits two logical modes:
 
 - **Eventual ownership.** A key with a representable loser state allows
@@ -141,10 +142,10 @@ node. Syzy admits two logical modes:
   commit becomes visible.
 
 The coordinator leaseholder serves canonical per-value reservations and the
-SQLite commit hook vetoes conflicts or unavailable coordination. Handoff waits
-through the configured release quarantine before a new holder admits claims.
+engine's admission gate vetoes conflicts or unavailable coordination. Handoff
+waits through the configured release quarantine before a new holder admits claims.
 This availability tradeoff is intentional: an operation with no valid loser
 state must fail closed when coordination is unavailable.
 
-SQLite collation, partial-index, blob, and DDL details are specified in the
-[DDL guide](../sqlite/docs/DDL.md) rather than duplicated here.
+Engine-specific collation, index, blob, and DDL details are specified in the
+[SQLite DDL guide](../sqlite/docs/DDL.md) and [Postgres engine](postgres.md).

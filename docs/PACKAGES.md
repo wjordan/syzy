@@ -3,25 +3,29 @@
 Syzy is pre-1.0. These classifications describe package ownership and intended
 extension surfaces, not stability promises.
 
-## Application API
+## Product entry points
 
 | Module/package | Role |
 |---|---|
 | `github.com/wjordan/syzy/sqlite` | Open, operate, clone, restore, subscribe to, and inspect replicated SQLite databases. |
 | `github.com/wjordan/syzy/lazyrestore` | Optional sparse bootstrap and page-fault recovery for object-backed databases. |
+| `github.com/wjordan/syzy/pg/cmd/syzy-pg` | Run the Postgres sidecar; applications continue to use ordinary Postgres clients and drivers. |
 
-Applications use the SQLite package. Public extension contracts are the
-packages listed below; other packages primarily support Syzy itself.
+SQLite applications use the `sqlite` package. Postgres deployments run the
+`syzy-pg` sidecar. Public extension contracts are listed below; other packages
+primarily support Syzy itself.
 
 ## Internal ownership
 
 - The `sqlite` package owns database lifecycle, hook capture, transactional
   apply, DDL realization, extension/daemon packaging, and physical recovery.
+- The nested `pg` module owns logical-decoding capture, native apply, Postgres
+  DDL realization, and sidecar packaging.
 - Root packages own canonical changesets and CRDT state, stable catalog
   identities, transport, schema-log integration, object-storage integration,
   coordination, journals, and anti-entropy services.
 
-The SQLite runtime composes these packages directly. This ownership seam is an
+Both runtimes compose root packages directly. This ownership seam is an
 implementation rule, not an additional application or provider API.
 
 ## Extension contracts
@@ -58,7 +62,6 @@ Implementation helpers should remain internal to their owning module.
 
 ## Module boundary
 
-The repository is one module. SQLite and lazy restore are packages versioned
-with the replication runtime because they bind the same wire formats, on-disk
-layout, and recovery invariants. Separately distributed companion programs
-depend on the public contracts above instead of importing `internal` packages.
+The repository is a Go workspace containing the root module and the nested
+`pg` module. SQLite and lazy restore live in the root module; the Postgres
+sidecar is separate so its driver dependencies stay out of SQLite builds.
