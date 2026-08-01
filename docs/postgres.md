@@ -350,7 +350,7 @@ that had tightened the column could never apply them, and would halt forever.
 | `CREATE TABLE` | Permanent, in `public`, with a `PRIMARY KEY` |
 | `DROP TABLE`, `ALTER TABLE … RENAME` | |
 | `ADD COLUMN` / `DROP COLUMN` / `RENAME COLUMN` | |
-| `ALTER COLUMN … TYPE` | **Widening only**: `smallint`→`integer`→`bigint`, `real`→`double precision`, `varchar(n)`→`varchar(m>n)`/`text`, `numeric(p,s)`→`numeric(p'≥p,s)` |
+| `ALTER COLUMN … TYPE` | **Widening only**, and without `USING`: `smallint`→`integer`→`bigint`, `real`→`double precision`, `varchar(n)`→`varchar(m>n)`/`text`, `numeric(p,s)`→`numeric(p'≥p,s)` |
 | `ALTER COLUMN … SET/DROP DEFAULT` | Defaults are evaluated only at the origin (apply supplies every column), so they carry no convergence risk |
 | `ALTER COLUMN … DROP NOT NULL` | A relaxation |
 | `CREATE UNIQUE INDEX` / `UNIQUE` constraint | Total keys only; becomes a §7 unique key |
@@ -368,9 +368,13 @@ writes are captured as ordinary DML.
 
 `CREATE EXTENSION` · `CREATE FUNCTION` / `PROCEDURE` · `CREATE TRIGGER` ·
 `CREATE TYPE` · `CREATE SCHEMA` · standalone `CREATE SEQUENCE` · `CREATE RULE`
-· `GRANT` / `REVOKE` · `COMMENT` · `ALTER TABLE … ADD CHECK` / foreign keys /
-storage parameters · anything on a `TEMP` or `UNLOGGED` relation · **anything
-outside the `public` schema**.
+· `GRANT` / `REVOKE` · `COMMENT` · `FOREIGN KEY` constraints · `ALTER TABLE …
+SET` storage parameters · anything on a `TEMP` or `UNLOGGED` relation ·
+**anything outside the `public` schema**.
+
+Declare foreign keys on every node that should enforce them locally. They are
+never enforced on applied rows (§12), so they cannot quarantine a peer's write
+or diverge the cluster — which is why they are admitted where `CHECK` is not.
 
 ### Rejected before commit
 
@@ -384,19 +388,56 @@ node stays healthy.
 | A column of a user-defined type (enum, domain, composite, extension type) | Would replicate as text into a type the receiver may not have; an enum that gains a value on one node only would fail apply there forever. `public.syzy_counter` is exempt — the sidecar creates it on every node (§8) |
 | `CREATE TABLE AS`, `SELECT INTO`, `CREATE MATERIALIZED VIEW` | Materializes a node-local query result |
 | `ALTER COLUMN … SET NOT NULL` | A `NULL` written on a peer before it applied the change is already in flight. Declare the column `NOT NULL` when it is created |
+| `CHECK` and `EXCLUDE` — at `CREATE TABLE` or `ADD CONSTRAINT` | Neither replicates, and both are enforced on applied rows, so the node that declares one quarantines its peers' writes. See below |
 | `ALTER COLUMN … TYPE` that narrows | Values in flight under the old type could not be applied |
 | Adding/dropping a `GENERATED` expression, changing `IDENTITY` | Recomputed per node |
 | Changing `PRIMARY KEY` membership, dropping a PK column | Changes row identity |
 | `SET DEFAULT nextval(…)`, `ADD COLUMN` that is serial/identity | Names a node-local sequence / mints divergent values for existing rows |
+| `ALTER COLUMN … TYPE` on a serial/`IDENTITY` column | Its type travels as the `CREATE`-shaped `bigserial` / `… GENERATED … AS IDENTITY`, neither spellable in `ALTER COLUMN … TYPE` |
+| `ALTER COLUMN … TYPE … USING` | `USING` rewrites this node's rows only; the op carries just the target type, so peers keep their own values. Widen without `USING`, then `UPDATE` as ordinary DML |
+| `ENABLE ALWAYS` / `ENABLE REPLICA` on a trigger | It would also fire on applied peer writes, adding local-only mutations no peer sees |
+| `SET UNLOGGED` / `SET SCHEMA` on a replicated table | Would take it out of replication scope with no error while the catalog kept serving it |
 | `UNIQUE` that is partial (`WHERE`), on an expression, or `NULLS NOT DISTINCT` | Not a plain column tuple, or a predicate whose truth varies per replica |
 | `UNIQUE` mixing `NOT NULL` and nullable members | No convergent loser state |
 | A counter column that is nullable, in the PK, `GENERATED`, or in a unique key | Contributions could not merge (§8) |
 | `REPLICA IDENTITY` away from `FULL` on a table with counters | Counters require the cell group (§8) |
 | `ALTER COLUMN … TYPE` into or out of `public.syzy_counter` | Existing values are absolute on one side, contributions on the other |
 
+#### Why `CHECK` and `EXCLUDE` are refused, and `FOREIGN KEY` is not
+
+A `CREATE TABLE` op carries columns and keys and nothing else, and an `ALTER`
+that adds a constraint produces no op at all. So a node that declares one is
+enforcing a rule its peers do not have, against rows they have already
+committed under their own shape. What that costs depends on whether apply
+enforces it:
+
+- **`CHECK` and `EXCLUDE` are enforced on applied rows.** A peer's row fails
+  with an integrity error on every redelivery. That does not halt the node —
+  it quarantines (§4) — which is exactly the problem: the write is dropped on
+  this node alone while every other node keeps it, and the cluster silently
+  diverges. Hence the refusal.
+- **`FOREIGN KEY` is not enforced on applied rows.** It runs on system
+  triggers, and apply runs under `session_replication_role = replica`, which
+  disables them, so peer rows land unchecked. Nothing quarantines and nothing
+  diverges; what the node loses is the constraint being *true* of its own
+  table. That is how all logical replication behaves, Postgres's own included,
+  so it stays admitted and documented (§12) — a foreign key still constrains
+  the local writes the application makes here, which is why people declare
+  them.
+
+Declaring a `CHECK` on every node does not rescue it. The write that breaks it
+was made on a peer *before* that peer had the constraint, or against a row this
+node does not have yet; identical DDL everywhere does not make a cross-node
+invariant enforceable from one node's snapshot. Enforce those rules in the
+application, where they can be checked against the state the writer has.
+
+The gate only runs under `-ddl`. With an explicit `-tables` set the schema is
+yours to manage, and a constraint you keep identical on every node is your
+call — the hazards above are unchanged, and quarantined writes are the cost.
+
 Two layers enforce this. A `ddl_command_start` trigger records the
-pre-command column shape; `ddl_command_end` diffs the finished catalog against
-it and raises. The same rules run again in the sidecar after commit, as the
+pre-command column shape and constraint set; `ddl_command_end` diffs the
+finished catalog against it and raises. The same rules run again in the sidecar after commit, as the
 floor for a node that has no snapshot to judge against — one whose DDL support
 was installed after the table already existed. That second layer halts
 schema-unhealthy, which is the outcome the first layer exists to prevent.
@@ -405,8 +446,14 @@ schema-unhealthy, which is the outcome the first layer exists to prevent.
 
 ## 12. Limitations
 
-- **Foreign keys are not enforced on inbound apply.** Standard for all
-  logical replication, Postgres's own included.
+- **Foreign keys are not enforced on inbound apply.** `replica` role disables
+  their triggers, so a peer's row lands whether or not it satisfies them —
+  standard for all logical replication, Postgres's own included. They are
+  still enforced against writes made locally.
+- **`CHECK` and `EXCLUDE` constraints are not available on replicated
+  tables.** Neither replicates, and both *are* enforced on applied rows, so
+  under `-ddl` they are refused before commit rather than left to quarantine
+  peer writes and diverge the cluster (§11).
 - **Row-group tables lose the losing whole-row image** of genuinely
   concurrent same-row writes. Deterministic winner; loss window is
   replication lag; every instance is recorded (§9). Cell groups narrow this

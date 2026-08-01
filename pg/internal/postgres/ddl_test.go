@@ -2243,6 +2243,12 @@ func TestAdmissionRejectsUnreplicableTable(t *testing.T) {
 		{`CREATE TABLE public.enums (id bigint PRIMARY KEY, m public.mood)`, "user-defined type"},
 		{`CREATE MATERIALIZED VIEW public.mv AS SELECT 1 AS x`, "not replicable"},
 		{`CREATE TABLE public.ctas AS SELECT 1 AS x`, "not replicable"},
+		// A CREATE op carries columns and keys, so these ride along with neither:
+		// peers would build the table without them and this node alone would then
+		// refuse their rows. (A FOREIGN KEY is admitted — apply does not enforce
+		// it, so it quarantines nothing; see TestAdmissionAdmitsRelaxingAlter.)
+		{`CREATE TABLE public.chk (id bigint PRIMARY KEY, n int CHECK (n > 0))`, "do not replicate"},
+		{`CREATE TABLE public.excl (id bigint PRIMARY KEY, s text, EXCLUDE USING btree (s WITH =))`, "do not replicate"},
 	} {
 		err := appExecErr(t, db, tc.sql)
 		if err == nil {

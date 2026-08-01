@@ -57,46 +57,72 @@ END $$;
 -- session replaces them. (The target relation is not known at command_start —
 -- pg_event_trigger_ddl_commands() is end-only and the SQL text is never parsed
 -- — hence the whole replicated schema.)
-CREATE UNLOGGED TABLE IF NOT EXISTS syzy_ddl_prior (
+--
+-- Keyed by ATTNUM, not attname, so it diffs the same way buildAlterTableOps
+-- does: attnum survives a rename and is never reused by a re-add, so
+-- "DROP COLUMN v, ADD COLUMN v" reads as a drop plus an add on both sides
+-- instead of a same-name attribute change only this layer would see.
+-- Dropped and recreated rather than migrated in place: the rows are
+-- single-command scratch state with no meaning across an install.
+DROP TABLE IF EXISTS syzy_ddl_prior;
+CREATE UNLOGGED TABLE syzy_ddl_prior (
     pid          int     NOT NULL,
     relid        oid     NOT NULL,
+    attnum       int     NOT NULL,
     attname      name    NOT NULL,
     typename     text    NOT NULL,
     is_notnull   boolean NOT NULL,
     is_generated boolean NOT NULL,
     identity     "char"  NOT NULL,
     pkpos        int     NOT NULL,
+    def          text    NOT NULL,
     -- The table's pre-command pg_class.relreplident, repeated on each of its
     -- rows: REPLICA IDENTITY FULL is the cell-clock-group opt-in, so the
     -- admission gate has to know which side of the flip the command started on.
-    replident    "char"  NOT NULL DEFAULT 'd',
-    PRIMARY KEY (pid, relid, attname)
+    replident    "char"  NOT NULL,
+    -- The table's pre-command CHECK / EXCLUDE constraint oids, likewise repeated
+    -- per row (syzy_ddl_restricting_cons is the reader, and says why those two).
+    -- Held by oid rather than name so RENAME CONSTRAINT does not read as adding
+    -- one, and snapshotted rather than assumed empty so a constraint predating
+    -- this install is not either.
+    prior_con    oid[]   NOT NULL,
+    PRIMARY KEY (pid, relid, attnum)
 );
--- Upgrade path for a node whose spool predates the column.
-ALTER TABLE syzy_ddl_prior ADD COLUMN IF NOT EXISTS replident "char" NOT NULL DEFAULT 'd';
 
 CREATE OR REPLACE FUNCTION syzy_ddl_snapshot() RETURNS event_trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
 BEGIN
     IF current_setting('syzy.internal', true) = 'on' THEN RETURN; END IF;
+    -- syzy_ddl_admit_alter is the only reader, so only ALTER TABLE needs a
+    -- prior shape. Every other DDL command skips a full-schema scan it would
+    -- never consult.
+    IF TG_TAG <> 'ALTER TABLE' THEN RETURN; END IF;
     DELETE FROM syzy_ddl_prior WHERE pid = pg_backend_pid();
     -- Rows a backend left behind by disconnecting mid-DDL: reclaimed here
     -- rather than by a background sweep.
     DELETE FROM syzy_ddl_prior p
     WHERE NOT EXISTS (SELECT 1 FROM pg_stat_activity s WHERE s.pid = p.pid);
     INSERT INTO syzy_ddl_prior
-      (pid, relid, attname, typename, is_notnull, is_generated, identity, pkpos, replident)
-    SELECT pg_backend_pid(), a.attrelid, a.attname,
+      (pid, relid, attnum, attname, typename, is_notnull, is_generated, identity, pkpos, def, replident, prior_con)
+    SELECT pg_backend_pid(), a.attrelid, a.attnum, a.attname,
            format_type(a.atttypid, a.atttypmod), a.attnotnull,
-           a.attgenerated <> '', a.attidentity, COALESCE(k.pkpos, 0), c.relreplident
+           a.attgenerated <> '', a.attidentity, COALESCE(k.pkpos, 0),
+           COALESCE(pg_get_expr(d.adbin, d.adrelid), ''), c.relreplident,
+           COALESCE(cn.cons, '{}')
     FROM pg_attribute a
     JOIN pg_class c ON c.oid = a.attrelid AND c.relkind = 'r' AND c.relpersistence = 'p'
     JOIN pg_namespace ns ON ns.oid = c.relnamespace AND ns.nspname = 'public'
+    LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
     LEFT JOIN LATERAL (
         SELECT x.ord AS pkpos
         FROM pg_index i, unnest(i.indkey) WITH ORDINALITY AS x(attnum, ord)
         WHERE i.indrelid = a.attrelid AND i.indisprimary AND x.attnum = a.attnum
     ) k ON true
+    LEFT JOIN LATERAL (
+        SELECT array_agg(con.oid) AS cons
+        FROM pg_constraint con
+        WHERE con.conrelid = a.attrelid AND con.contype IN ('c', 'x')
+    ) cn ON true
     WHERE a.attnum > 0 AND NOT a.attisdropped AND c.relname NOT LIKE 'syzy\_%';
 END $$;
 
@@ -144,6 +170,38 @@ BEGIN
                     AND tm[2] = fm[2] AND tm[1] >= fm[1], false);
 END $$;
 
+-- syzy_ddl_restricting_cons names rel's CHECK / EXCLUDE constraints that are not
+-- in `known`, or NULL if there are none.
+--
+-- These are the constraint kinds that RESTRICT which rows a table accepts, are
+-- ENFORCED on applied rows, and do not replicate: a CREATE TABLE op carries
+-- columns and keys, nothing else (buildCreateTableOp), and an ALTER that adds
+-- one produces no op at all (buildAlterTableOps). So a node that has one refuses
+-- rows its peers committed legally under their own shape, with SQLSTATE class 23
+-- on every redelivery. That does not halt the node — it quarantines (§4) — which
+-- is the problem: the write is dropped here and kept everywhere else, so the
+-- cluster silently diverges.
+--
+-- FOREIGN KEY is deliberately NOT in this set. It is enforced by system
+-- triggers, which apply runs with disabled (session_replication_role =
+-- replica), so peer rows land unchecked instead of quarantining. Convergence is
+-- unaffected; what the node loses is the constraint being true of its own table.
+-- That is how ALL logical replication behaves, Postgres's own included, so it is
+-- documented as a limitation (§12) rather than refused — a foreign key still
+-- constrains the local writes the application makes here, which is why people
+-- declare them.
+--
+-- PRIMARY KEY and UNIQUE are excluded because they do replicate, as keys (§5).
+CREATE OR REPLACE FUNCTION syzy_ddl_restricting_cons(rel oid, known oid[]) RETURNS text
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+    SELECT string_agg(format('%I (%s)', con.conname,
+               CASE con.contype WHEN 'c' THEN 'CHECK' ELSE 'EXCLUDE' END),
+             ', ' ORDER BY con.conname)
+      FROM pg_constraint con
+     WHERE con.conrelid = rel AND con.contype IN ('c', 'x')
+       AND NOT con.oid = ANY(known)
+$$;
+
 -- syzy_ddl_admit_table rejects a new table whose shape can never replicate. Its
 -- twin in the sidecar is buildCreateTableOp/rejectUnreplicable, which stays as
 -- the post-commit floor.
@@ -182,6 +240,11 @@ BEGIN
         RAISE EXCEPTION 'syzy: CREATE TABLE %: column(s) % use a user-defined type; only built-in types replicate', tname, bad
             USING ERRCODE = 'feature_not_supported';
     END IF;
+    bad := syzy_ddl_restricting_cons(rel, '{}');
+    IF bad IS NOT NULL THEN
+        RAISE EXCEPTION 'syzy: CREATE TABLE %: constraint(s) % do not replicate — peers would build this table without them, so the rows they write would quarantine here forever; enforce the rule in the application', tname, bad
+            USING ERRCODE = 'feature_not_supported';
+    END IF;
 END $$;
 
 -- syzy_ddl_admit_alter rejects — pre-commit, so the user's transaction rolls
@@ -198,9 +261,44 @@ DECLARE
     tname text := rel::regclass::text;
     live  record;
     prior record;
+    pcon  oid[];
+    bad   text;
 BEGIN
+    -- A trigger left in ENABLE ALWAYS / ENABLE REPLICA fires on the writes the
+    -- sidecar applies under session_replication_role = replica, so a peer's row
+    -- lands here plus whatever the trigger writes on top of it — a local-only
+    -- mutation no peer ever sees. Replicated tables carry ORIGIN triggers only.
+    SELECT string_agg(quote_ident(t.tgname), ', ') INTO bad
+      FROM pg_trigger t
+     WHERE t.tgrelid = rel AND NOT t.tgisinternal AND t.tgenabled IN ('A', 'R');
+    IF bad IS NOT NULL THEN
+        RAISE EXCEPTION 'syzy: ALTER TABLE %: trigger(s) % are ENABLE ALWAYS/REPLICA; they would also fire on applied peer writes and diverge this node', tname, bad
+            USING ERRCODE = 'feature_not_supported';
+    END IF;
+    -- No snapshot rows means there is no pre-command shape to judge against —
+    -- the relation was created by THIS command, which syzy_ddl_admit_table has
+    -- already judged. Return rather than fall into the loop below, where every
+    -- column would look like an ADD COLUMN and a serial primary key would be
+    -- refused as a newly added auto-increment. (Out-of-scope relations never
+    -- reach here: the caller skips them before admission.) The post-commit floor
+    -- is the backstop for a node that genuinely has no snapshot.
+    SELECT p.prior_con INTO pcon FROM syzy_ddl_prior p
+     WHERE p.pid = pg_backend_pid() AND p.relid = rel LIMIT 1;
+    IF NOT FOUND THEN
+        RETURN;
+    END IF;
+    -- Adding a restricting constraint to a live replicated table is the same
+    -- class of change as SET NOT NULL below, and is refused for the same reason:
+    -- rows already in flight from peers were legal under the shape they were
+    -- written against. Judged against the pre-command snapshot so only a
+    -- constraint this command ADDS is refused.
+    bad := syzy_ddl_restricting_cons(rel, pcon);
+    IF bad IS NOT NULL THEN
+        RAISE EXCEPTION 'syzy: ALTER TABLE %: adding constraint(s) % restricts a replicated table — the constraint does not replicate, so rows peers write under their own shape would quarantine here forever; enforce the rule in the application', tname, bad
+            USING ERRCODE = 'feature_not_supported';
+    END IF;
     FOR live IN
-        SELECT a.attname, format_type(a.atttypid, a.atttypmod) AS typename,
+        SELECT a.attnum, a.attname, format_type(a.atttypid, a.atttypmod) AS typename,
                a.attnotnull AS is_notnull, a.attgenerated <> '' AS is_generated,
                a.attidentity AS identity, COALESCE(k.pkpos, 0) AS pkpos,
                COALESCE(pg_get_expr(d.adbin, d.adrelid), '') AS def
@@ -214,12 +312,28 @@ BEGIN
         WHERE a.attrelid = rel AND a.attnum > 0 AND NOT a.attisdropped
     LOOP
         SELECT * INTO prior FROM syzy_ddl_prior p
-        WHERE p.pid = pg_backend_pid() AND p.relid = rel AND p.attname = live.attname;
+        WHERE p.pid = pg_backend_pid() AND p.relid = rel AND p.attnum = live.attnum;
         IF NOT FOUND THEN
             -- ADD COLUMN. Its values are minted per node for existing rows, so an
             -- auto-increment column cannot be added to a table that already has any.
             IF live.identity <> '' OR live.def LIKE 'nextval(%' THEN
                 RAISE EXCEPTION 'syzy: ALTER TABLE %: ADD COLUMN "%" is auto-increment (serial/identity); it mints divergent per-node values for existing rows', tname, live.attname
+                    USING ERRCODE = 'feature_not_supported';
+            END IF;
+            -- Same hazard without a sequence: Postgres backfills the existing
+            -- rows by evaluating the default HERE, so a non-immutable one
+            -- (now(), gen_random_uuid(), random()) gives every node its own
+            -- values. Volatility is read from the stored expression tree, whose
+            -- :funcid / :opfuncid entries name every function it calls.
+            IF live.def <> '' AND EXISTS (
+                SELECT 1 FROM pg_attrdef d
+                WHERE d.adrelid = rel AND d.adnum = live.attnum
+                  AND EXISTS (
+                    SELECT 1 FROM regexp_matches(d.adbin::text, ':(?:funcid|opfuncid) ([0-9]+)', 'g') m
+                    JOIN pg_proc pr ON pr.oid = m[1]::oid
+                    WHERE pr.provolatile <> 'i')
+            ) THEN
+                RAISE EXCEPTION 'syzy: ALTER TABLE %: ADD COLUMN "%" DEFAULT % is not immutable; Postgres backfills existing rows by evaluating it on this node, so every node would store different values — add the column without a default, then SET DEFAULT and backfill with an UPDATE', tname, live.attname, live.def
                     USING ERRCODE = 'feature_not_supported';
             END IF;
             CONTINUE;
@@ -240,23 +354,47 @@ BEGIN
             RAISE EXCEPTION 'syzy: ALTER TABLE %: SET NOT NULL on column "%" cannot replicate — a NULL written on a peer before it applied the change is already in flight and would fail apply there permanently; declare the column NOT NULL when it is created', tname, live.attname
                 USING ERRCODE = 'feature_not_supported';
         END IF;
-        IF live.typename <> prior.typename AND NOT syzy_type_widens(prior.typename, live.typename) THEN
-            RAISE EXCEPTION 'syzy: ALTER TABLE %: changing column "%" from % to % is not a widening conversion — values already in flight under the old type could not be applied', tname, live.attname, prior.typename, live.typename
-                USING ERRCODE = 'feature_not_supported';
+        IF live.typename <> prior.typename THEN
+            -- An auto-increment column's type does not travel as a type: the op
+            -- ships the CREATE-shaped "bigserial" / "… GENERATED … AS IDENTITY",
+            -- neither of which is spellable in ALTER COLUMN … TYPE, so a
+            -- follower could only fail the statement forever.
+            IF live.identity <> '' OR prior.identity <> ''
+               OR live.def LIKE 'nextval(%' OR prior.def LIKE 'nextval(%' THEN
+                RAISE EXCEPTION 'syzy: ALTER TABLE %: changing the type of auto-increment column "%" (serial/identity) is not supported; its type carries the sequence shape a follower cannot re-declare', tname, live.attname
+                    USING ERRCODE = 'feature_not_supported';
+            END IF;
+            IF NOT syzy_type_widens(prior.typename, live.typename) THEN
+                RAISE EXCEPTION 'syzy: ALTER TABLE %: changing column "%" from % to % is not a widening conversion — values already in flight under the old type could not be applied', tname, live.attname, prior.typename, live.typename
+                    USING ERRCODE = 'feature_not_supported';
+            END IF;
+            -- USING rewrites THIS node's stored values, and the op carries only
+            -- the target type — a follower runs a plain ALTER COLUMN … TYPE and
+            -- keeps its own rows, so the two silently diverge. The catalog
+            -- records nothing about a USING clause, so this is the one place the
+            -- command text is consulted: as an admission heuristic that errs
+            -- toward rejection, never to build an op.
+            IF current_query() ~* '\yusing\y' THEN
+                RAISE EXCEPTION 'syzy: ALTER TABLE %: ALTER COLUMN "%" TYPE ... USING rewrites this node''s rows only and cannot replicate; widen the column without USING, then UPDATE the values as ordinary DML', tname, live.attname
+                    USING ERRCODE = 'feature_not_supported';
+            END IF;
         END IF;
-        IF live.def LIKE 'nextval(%' THEN
+        -- Only a NEWLY set nextval default is a rejection: a column that has
+        -- carried one since CREATE TABLE is an admitted serial, and rejecting it
+        -- here would make every later ALTER on its table fail.
+        IF live.def <> prior.def AND live.def LIKE 'nextval(%' THEN
             RAISE EXCEPTION 'syzy: ALTER TABLE %: DEFAULT nextval(...) on column "%" names a node-local sequence and cannot replicate', tname, live.attname
                 USING ERRCODE = 'feature_not_supported';
         END IF;
     END LOOP;
-    IF EXISTS (
-        SELECT 1 FROM syzy_ddl_prior p
-        WHERE p.pid = pg_backend_pid() AND p.relid = rel AND p.pkpos > 0
-          AND NOT EXISTS (
-            SELECT 1 FROM pg_attribute a
-            WHERE a.attrelid = rel AND a.attname = p.attname AND NOT a.attisdropped)
-    ) THEN
-        RAISE EXCEPTION 'syzy: ALTER TABLE %: dropping a PRIMARY KEY column changes row identity and is not supported', tname
+    SELECT string_agg(quote_ident(p.attname), ', ') INTO bad
+      FROM syzy_ddl_prior p
+     WHERE p.pid = pg_backend_pid() AND p.relid = rel AND p.pkpos > 0
+       AND NOT EXISTS (
+         SELECT 1 FROM pg_attribute a
+         WHERE a.attrelid = rel AND a.attnum = p.attnum AND NOT a.attisdropped);
+    IF bad IS NOT NULL THEN
+        RAISE EXCEPTION 'syzy: ALTER TABLE %: dropping PRIMARY KEY column(s) % changes row identity and is not supported', tname, bad
             USING ERRCODE = 'feature_not_supported';
     END IF;
 END $$;
@@ -371,31 +509,44 @@ DECLARE
 BEGIN
     IF current_setting('syzy.internal', true) = 'on' THEN RETURN; END IF;
     FOR r IN SELECT * FROM pg_event_trigger_ddl_commands() LOOP
-        -- Only PERMANENT relations are in scope at all. A TEMP table is
-        -- session-local and an UNLOGGED table is not WAL-logged, so logical
-        -- decoding never sees either's DML. Checked first, so a harmless
-        -- CREATE TEMP TABLE … AS is not caught by the rejection below.
+        -- A relation that WAS a replicated table when the command started (it
+        -- has a snapshot row) may not leave replication scope: SET UNLOGGED and
+        -- SET SCHEMA would otherwise pass the filters below as "out of scope",
+        -- writing no intent row and no error while the sidecar's catalog keeps
+        -- serving the table — silent divergence rather than a clean failure.
+        IF EXISTS (SELECT 1 FROM syzy_ddl_prior p
+                   WHERE p.pid = pg_backend_pid() AND p.relid = r.objid)
+           AND (COALESCE(r.schema_name, '') <> 'public'
+                OR EXISTS (SELECT 1 FROM pg_class c
+                           WHERE c.oid = r.objid AND c.relpersistence <> 'p')) THEN
+            RAISE EXCEPTION 'syzy: ALTER TABLE %: moving a replicated table out of scope (SET UNLOGGED / SET SCHEMA) would silently stop replicating it', r.object_identity
+                USING ERRCODE = 'feature_not_supported';
+        END IF;
+        -- Replication scope, evaluated BEFORE any rejection: an object outside
+        -- public, or a TEMP / UNLOGGED relation, is local to this node — its DML
+        -- never reaches logical decoding — so it is skipped, never refused.
+        -- EVERYTHING else out of scope (extensions, functions, procedures,
+        -- triggers, types, schemas, standalone sequences, GRANT, COMMENT) is
+        -- local the same way: no intent row, so capture never sees it and the
+        -- node can never halt on it. (A trigger's or function's EFFECTS still
+        -- replicate: they run on the originator and their row changes are
+        -- captured as ordinary DML.)
         SELECT relpersistence INTO persist FROM pg_class WHERE oid = r.objid;
-        IF persist IS NOT NULL AND persist <> 'p' THEN
+        IF COALESCE(r.schema_name, '') <> 'public'
+           OR (persist IS NOT NULL AND persist <> 'p') THEN
             CONTINUE;
         END IF;
         -- Admission (§6 G): a permanent CREATE TABLE AS / SELECT INTO / MATERIALIZED
-        -- VIEW materializes a node-local query result that cannot replicate. Reject
-        -- it PRE-COMMIT so the user txn rolls back cleanly, instead of committing and
-        -- forcing the sidecar to halt schema-unhealthy post-commit.
+        -- VIEW in the replicated schema materializes a node-local query result that
+        -- cannot replicate. Reject it PRE-COMMIT so the user txn rolls back cleanly,
+        -- instead of committing and forcing the sidecar to halt schema-unhealthy
+        -- post-commit.
         IF r.command_tag IN ('CREATE TABLE AS', 'SELECT INTO', 'CREATE MATERIALIZED VIEW') THEN
             RAISE EXCEPTION 'syzy: % is not replicable (node-local query result); use CREATE TABLE then INSERT ... SELECT', r.command_tag
                 USING ERRCODE = 'feature_not_supported';
         END IF;
-        -- Replication scope. Only these commands, on a table/view/index in the
-        -- replicated schema, become intent rows. EVERYTHING else — extensions,
-        -- functions, procedures, triggers, types, schemas, standalone sequences,
-        -- GRANT, COMMENT, and any object outside public — is local to this node:
-        -- no intent row, so capture never sees it and the node can never halt on
-        -- it. (A trigger's or function's EFFECTS still replicate: they run on the
-        -- originator and their row changes are captured as ordinary DML.)
-        IF r.command_tag NOT IN ('CREATE TABLE', 'ALTER TABLE', 'CREATE INDEX', 'CREATE VIEW')
-           OR COALESCE(r.schema_name, '') <> 'public' THEN
+        -- Only these commands, on a table/view/index, become intent rows.
+        IF r.command_tag NOT IN ('CREATE TABLE', 'ALTER TABLE', 'CREATE INDEX', 'CREATE VIEW') THEN
             CONTINUE;
         END IF;
         -- Admission (§6 G): shapes that cannot replicate at all, and column

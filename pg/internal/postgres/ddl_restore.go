@@ -48,6 +48,133 @@ func decodeTableOIDs(b []byte) map[crdt.TableID]uint32 {
 	return m
 }
 
+// pgColAttrsKey holds the PG-local per-column physical attributes (type,
+// NOT NULL, default, GENERATED/IDENTITY, PK membership) of every catalog table —
+// the second PG addendum to the engine-neutral catalog, which stores none of
+// them. Its purpose is crash-window fidelity: buildAlterTableOps derives an
+// ALTER by diffing the live catalog against the cached tableInfo, so if restore
+// primed those attributes from the live relation, a DDL that committed in
+// Postgres but crashed before persistSchemaEvent would read as "no change" and
+// silently never replicate. Recording them here keeps the cache at the last
+// SHIPPED shape, which is what the diff has to compare against.
+const pgColAttrsKey = "pg_col_attrs"
+
+// colAttrs is one column's physical attributes as last shipped.
+type colAttrs struct {
+	typeName  string
+	def       string
+	identity  byte
+	notNull   bool
+	generated bool
+	isPK      bool
+}
+
+func appendStr(b []byte, s string) []byte {
+	return append(binary.AppendUvarint(b, uint64(len(s))), s...)
+}
+
+func takeStr(b []byte) (string, []byte, bool) {
+	n, k := binary.Uvarint(b)
+	if k <= 0 || uint64(len(b[k:])) < n {
+		return "", nil, false
+	}
+	return string(b[k : k+int(n)]), b[k+int(n):], true
+}
+
+// encodeColAttrs serializes the in-memory catalog's per-column attributes,
+// keyed by the stable TableID/ColumnID (never attnum, which a re-add reuses
+// differently on each node). Written in persistSchemaEvent, so it tracks the
+// cache exactly.
+func encodeColAttrs(cat *catalog) []byte {
+	buf := binary.AppendUvarint(nil, uint64(len(cat.byID)))
+	for tid, ti := range cat.byID {
+		buf = append(buf, tid[:]...)
+		buf = binary.AppendUvarint(buf, uint64(len(ti.cols)))
+		for _, c := range ti.cols {
+			buf = append(buf, c.cid[:]...)
+			buf = appendStr(buf, c.typeName)
+			buf = appendStr(buf, c.def)
+			var flags byte
+			if c.notNull {
+				flags |= 1
+			}
+			if c.generated {
+				flags |= 2
+			}
+			if c.isPK {
+				flags |= 4
+			}
+			buf = append(buf, c.identity, flags)
+		}
+	}
+	return buf
+}
+
+// decodeColAttrs reverses encodeColAttrs. A truncated or absent blob (a node
+// whose metadata predates it) yields whatever was parsed so far; those tables
+// fall back to the live relation, which is the behaviour before this record
+// existed.
+func decodeColAttrs(b []byte) map[crdt.TableID]map[crdt.ColumnID]colAttrs {
+	out := map[crdt.TableID]map[crdt.ColumnID]colAttrs{}
+	nt, k := binary.Uvarint(b)
+	if k <= 0 {
+		return out
+	}
+	b = b[k:]
+	for i := uint64(0); i < nt; i++ {
+		if len(b) < 16 {
+			return out
+		}
+		var tid crdt.TableID
+		copy(tid[:], b[:16])
+		b = b[16:]
+		nc, k := binary.Uvarint(b)
+		if k <= 0 {
+			return out
+		}
+		b = b[k:]
+		cols := make(map[crdt.ColumnID]colAttrs, nc)
+		for j := uint64(0); j < nc; j++ {
+			if len(b) < 16 {
+				return out
+			}
+			var cid crdt.ColumnID
+			copy(cid[:], b[:16])
+			b = b[16:]
+			var a colAttrs
+			var ok bool
+			if a.typeName, b, ok = takeStr(b); !ok {
+				return out
+			}
+			if a.def, b, ok = takeStr(b); !ok {
+				return out
+			}
+			if len(b) < 2 {
+				return out
+			}
+			a.identity, a.notNull = b[0], b[1]&1 != 0
+			a.generated, a.isPK = b[1]&2 != 0, b[1]&4 != 0
+			b = b[2:]
+			cols[cid] = a
+		}
+		out[tid] = cols
+	}
+	return out
+}
+
+// applyColAttrs sets one table's columns to their last-shipped attributes.
+// Columns with no record keep whatever the caller bound (the live relation).
+func applyColAttrs(ti *tableInfo, attrs map[crdt.ColumnID]colAttrs) {
+	for _, c := range ti.cols {
+		a, ok := attrs[c.cid]
+		if !ok {
+			continue
+		}
+		c.typeName, c.def, c.identity = a.typeName, a.def, a.identity
+		c.notNull, c.generated, c.isPK = a.notNull, a.generated, a.isPK
+	}
+}
+
 // restoreSchemaCatalog rebuilds the in-memory OID⇄stable-ID map for
 // DDL-created tables from the durable metadata catalog and restores schema_seq
 // (§6 F), so a restart resumes from the persisted schema head rather than
@@ -122,11 +249,32 @@ func (e *Engine) restoreSchemaCatalog(ctx context.Context) error {
 		if te.State != metadata.StateActive {
 			continue
 		}
-		if e.cat.byID[te.ID] != nil {
-			continue // already bound (a bootstrap table that also rode the log)
+		if ti := e.cat.byID[te.ID]; ti != nil {
+			// Already bound from the live relation (a bootstrap table that also
+			// rode the schema log). Its merge unit is a recorded fact too, so a
+			// crash-window REPLICA IDENTITY flip must not reach arbitration before
+			// the cluster knows about it.
+			if te.DefaultClockGroup == metadata.ClockGroupCell {
+				ti.clockGroup = metadata.ClockGroupCell
+			} else {
+				ti.clockGroup = metadata.ClockGroupRow
+			}
+			continue
 		}
 		if err := e.bindRestoredTable(ctx, te, oidByTID[te.ID], colsByTable[te.ID], pkByTable[te.ID], uqByTable[te.ID]); err != nil {
 			return err
+		}
+	}
+	// Last-shipped column attributes over the live ones every path above bound,
+	// so buildAlterTableOps diffs against what peers know rather than against a
+	// physical schema a crash may have left ahead of the schema log.
+	attrsBlob, _, err := e.cfg.Meta.GetMeta(pgColAttrsKey)
+	if err != nil {
+		return fmt.Errorf("load column attrs: %w", err)
+	}
+	for tid, attrs := range decodeColAttrs(attrsBlob) {
+		if ti := e.cat.byID[tid]; ti != nil {
+			applyColAttrs(ti, attrs)
 		}
 	}
 	return nil
@@ -154,10 +302,10 @@ type restoredUniqueKey struct {
 // re-derived by DIFFING the live catalog against this cached tableInfo
 // (buildAlterTableOps/buildDropOp). Binding to live would erase that diff and
 // the pending RENAME/DROP would silently never replicate — a divergence worse
-// than the loud Open failure this rebinding replaced. (A crash-window attribute
-// change that IS reflected in the merged live attrs — e.g. ALTER COLUMN TYPE —
-// is not detected here; that form is already rejected at capture, and increment
-// G's admission gate stops it pre-commit.)
+// than the loud Open failure this rebinding replaced. Column ATTRIBUTES are
+// merged from the live relation only as a floor: restoreSchemaCatalog overwrites
+// them with the last-shipped values (pgColAttrsKey) wherever it has them, so a
+// crash-window ALTER COLUMN is a real diff here rather than an invisible one.
 func (e *Engine) bindRestoredTable(ctx context.Context, te metadata.TableEntry, oid uint32, cols []metadata.ColumnEntry, pk []metadata.KeyEntry, uniqueKeys []restoredUniqueKey) error {
 	if oid == 0 {
 		// No persisted oid (a table predating the oid map): best-effort resolve by

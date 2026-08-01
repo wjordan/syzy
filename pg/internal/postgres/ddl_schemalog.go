@@ -124,6 +124,12 @@ func (e *Engine) persistSchemaEvent(op crdt.CatalogOp, seq, parent uint64, encod
 		if err := tx.SetMeta(pgTableOIDsKey, encodeTableOIDs(e.cat)); err != nil {
 			return err
 		}
+		// Likewise the per-column physical attributes: restore binds them from
+		// here so a DDL that committed but never reached the schema log still
+		// reads as a change against the cache (pgColAttrsKey).
+		if err := tx.SetMeta(pgColAttrsKey, encodeColAttrs(e.cat)); err != nil {
+			return err
+		}
 		if err := tx.AppendSchemaEvent(metadata.SchemaEventEntry{
 			SchemaSeq:   seq,
 			ParentSeq:   parent,

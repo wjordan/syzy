@@ -295,7 +295,19 @@ func applyAlterColumn(ctx context.Context, conn *pgx.Conn, cat *catalog, op crdt
 	typ := pgColumnType(c.Type)
 	var stmts []string
 	if ci.typeName != typ {
+		// Defense in depth against the two shapes the origin classifier refuses
+		// to emit: a serial pseudo-type and an embedded IDENTITY clause are
+		// CREATE-only spellings, so rendering either into ALTER COLUMN … TYPE
+		// would fail on every follower forever. Halt with the reason instead.
+		if isAutoIncrementType(typ) {
+			return fmt.Errorf("apply alter column %s.%s: op carries auto-increment type %q, which cannot be spelled in ALTER COLUMN … TYPE", ti.name, ci.name, typ)
+		}
 		stmts = append(stmts, fmt.Sprintf("ALTER COLUMN %s TYPE %s", col, typ))
+	}
+	if c.NotNull && !ci.notNull {
+		// A restriction cannot replicate; the origin rejects it, and an op that
+		// carries one anyway must not be recorded as applied.
+		return fmt.Errorf("apply alter column %s.%s: op sets NOT NULL, which cannot replicate", ti.name, ci.name)
 	}
 	if ci.def != c.Default {
 		if c.Default == "" {
@@ -475,6 +487,17 @@ func execDDLApply(ctx context.Context, conn *pgx.Conn, sql string) error {
 // 8-byte float there) as double precision. An exact-match table — free-form
 // SQLite type names outside the profile fail the CREATE loudly
 // (schema-unhealthy) rather than guess.
+// isAutoIncrementType reports whether a rendered column type carries
+// auto-increment shape — a serial pseudo-type or the IDENTITY clause
+// catalogColumn appends. Both are CREATE-only spellings.
+func isAutoIncrementType(typ string) bool {
+	switch typ {
+	case "smallserial", "serial", "bigserial":
+		return true
+	}
+	return strings.Contains(typ, " AS IDENTITY")
+}
+
 func pgColumnType(declared string) string {
 	switch strings.ToUpper(declared) {
 	case "":
