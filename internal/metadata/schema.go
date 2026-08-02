@@ -170,7 +170,6 @@ const pragmaSetupSQL = `
 PRAGMA busy_timeout = 5000;
 PRAGMA synchronous = NORMAL;
 PRAGMA wal_autocheckpoint = 10000;
-PRAGMA journal_size_limit = 0;
 PRAGMA foreign_keys = OFF;
 `
 

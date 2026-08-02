@@ -264,8 +264,14 @@ var ErrCheckpointBusy = errors.New("ltxstream: checkpoint busy; WAL not recycled
 //     still holds exactly the drained generation (same salts, no
 //     committed frame beyond the drained offset), then commit a minimal
 //     write. SQLite restarts a fully-backfilled WAL inside such a commit
-//     (walRestartLog: fresh salts, frames from offset 32, file truncated
-//     via journal_size_limit); no out-of-band checkpoint can pin the WAL
+//     (walRestartLog: fresh salts, frames from offset 32). The restart
+//     rewinds the write position without shrinking the file — the
+//     embedder must leave journal_size_limit unset, because commit-tail
+//     truncation runs while readers are live and turns any stale
+//     wal-index view into zero-filled hole reads; only a
+//     wal_checkpoint(TRUNCATE), which holds every read slot exclusively,
+//     may shrink the file. Frames beyond the restart carry dead salts
+//     and are never re-read. No out-of-band checkpoint can pin the WAL
 //     from validation through restart the way this lock does. Stale
 //     validation rolls back, then retries (a commit landed behind the
 //     drain) or defers (the generation was replaced).

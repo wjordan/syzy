@@ -294,13 +294,17 @@ func (o *opener) openConns() error {
 	if err := o.appWrite.Exec(`PRAGMA journal_mode = WAL; ` + connPragmas(o.cfg.DisableMmap)); err != nil {
 		return fmt.Errorf("syzy: configure writer: %w", err)
 	}
-	// Bound the WAL file: when this connection's commit restarts a
-	// fully-backfilled WAL (SQLite's walRestartLog), truncate it in the
-	// same commit. The publisher's coordinated recycle relies on this —
-	// its recycle write runs on this connection.
-	if err := o.appWrite.Exec(`PRAGMA journal_size_limit = 0`); err != nil {
-		return fmt.Errorf("syzy: configure writer journal size limit: %w", err)
-	}
+	// journal_size_limit stays unset (-1): a commit that restarts a
+	// fully-backfilled WAL (SQLite's walRestartLog) rewinds the write
+	// position without truncating the file. Commit-tail truncation
+	// (truncateOnCommit) shrinks the WAL while readers run; a reader or
+	// checkpointer acting on a stale wal-index view of a truncated file
+	// reads sparse holes as zero pages, and a checkpoint then backfills
+	// those zeros into the database — page 1 first, because the recycle
+	// sentinel makes page 1 frame 1 of every generation. Only
+	// wal_checkpoint(TRUNCATE) may shrink the WAL: it truncates with
+	// every read slot held exclusively (open above, the standby loop,
+	// and close), so no reader can straddle the shrink.
 	// Shrink any WAL inherited from a prior run before opening for full
 	// operation. Prior to the auto-checkpoint fix, crashes could leave a
 	// multi-hundred-MB WAL on disk; without this, recovery starts under
