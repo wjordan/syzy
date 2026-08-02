@@ -168,18 +168,23 @@ publisher tails a database, it owns WAL recycling: the coordinated pass
 drains the tailer, verifies a PASSIVE checkpoint's frame counts, then runs
 the recycle write as one write transaction that revalidates the drained
 generation under SQLite's write lock before committing. SQLite restarts
-the fully-backfilled WAL inside that commit (truncated via
-`journal_size_limit=0`), and the commit's recorded frame count plus the
-header salts prove the outcome, because nothing can move between the
-validation and the commit (`ltxstream.CheckpointUnderLock` is the
-contract). Any uncoordinated restart is caught by that validation or the
+the fully-backfilled WAL inside that commit — rewinding the write position
+without shrinking the file (`journal_size_limit` stays unset: commit-tail
+truncation runs while readers are live, and a stale wal-index view of a
+truncated file reads sparse holes as zero pages that a checkpoint would
+backfill over page 1; only `wal_checkpoint(TRUNCATE)`, which holds every
+read slot exclusively, may shrink a WAL) — and the commit's recorded frame
+count plus the header salts prove the outcome, because nothing can move
+between the validation and the commit (`ltxstream.CheckpointUnderLock` is
+the contract). Any uncoordinated restart is caught by that validation or the
 tailer's resume salt check and forces a loud rebaseline — safe, but not
 free — so auto-checkpointing on published databases is disabled (host
 writer) or demoted to a high emergency backstop (other openers).
 
-Metadata pragmas: `journal_mode=WAL`, `synchronous=NORMAL`,
-`journal_size_limit=0`, and `wal_autocheckpoint` set to a high backstop
-threshold (the host process owns metadata WAL recycling; see above). The
+Metadata pragmas: `journal_mode=WAL`, `synchronous=NORMAL`, and
+`wal_autocheckpoint` set to a high backstop threshold (the host process
+owns metadata WAL recycling; see above). `journal_size_limit` stays unset
+for the same no-commit-tail-truncation reason as `app.db`. The
 metadata holds the periodic snapshot of in-memory CRDT state and is not on
 the commit hot path; NORMAL is enough.
 

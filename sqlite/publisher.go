@@ -94,6 +94,12 @@ func (n *Node) appCheckpoint(_ context.Context, mode string, underFence func(hoo
 		if err := n.writerDB.QueryRow(fmt.Sprintf(`PRAGMA wal_checkpoint(%s)`, mode)).Scan(&busy, &nLog, &nCkpt); err != nil {
 			return ltxstream.CheckpointResult{}, err
 		}
+		// The backfill this checkpoint just ran is the only writer of
+		// page 1 in WAL mode; a zeroed on-disk header here means WAL
+		// state is corrupt. Fail the fence rather than recycle over it.
+		if err := verifyDBHeader(n.appPath); err != nil {
+			return ltxstream.CheckpointResult{}, err
+		}
 		return ltxstream.CheckpointResult{Busy: busy != 0, NLog: nLog, NCkpt: nCkpt}, nil
 	}
 	if underFence == nil {
@@ -110,9 +116,30 @@ func (n *Node) appCheckpoint(_ context.Context, mode string, underFence func(hoo
 
 // metaCheckpoint composes Store.Checkpoint: the metadata connection's
 // wal_checkpoint runs under Store.mu, before the under-fence hook acquires the
-// metadata tailer.
+// metadata tailer. The same page-1 header gate as appCheckpoint rides on the
+// checkpoint hook.
 func (n *Node) metaCheckpoint(_ context.Context, mode string, underFence func(hooks ltxstream.CheckpointHooks) error) error {
-	return n.meta.Checkpoint(mode, underFence)
+	metaPath := layout.MetaDB(n.appPath)
+	if underFence == nil {
+		if err := n.meta.Checkpoint(mode, nil); err != nil {
+			return err
+		}
+		return verifyDBHeader(metaPath)
+	}
+	return n.meta.Checkpoint(mode, func(hooks ltxstream.CheckpointHooks) error {
+		inner := hooks.Checkpoint
+		hooks.Checkpoint = func() (ltxstream.CheckpointResult, error) {
+			res, err := inner()
+			if err != nil {
+				return res, err
+			}
+			if err := verifyDBHeader(metaPath); err != nil {
+				return ltxstream.CheckpointResult{}, err
+			}
+			return res, nil
+		}
+		return underFence(hooks)
+	})
 }
 
 // encodeBaselines pins the node and encodes metadata.db (always) plus
@@ -127,6 +154,18 @@ func (n *Node) encodeBaselines(ctx context.Context, txid uint64, includeApp bool
 	if err != nil {
 		snap.Close()
 		return nil, nil, nil, fmt.Errorf("read staged backups: %w", err)
+	}
+	// Never encode a baseline whose page 1 is not a SQLite header: a
+	// corrupted staged copy must fail here, not propagate to the bucket.
+	if err := verifyDBHeader(metaPath); err != nil {
+		snap.Close()
+		return nil, nil, nil, fmt.Errorf("staged meta baseline: %w", err)
+	}
+	if includeApp {
+		if err := verifyDBHeader(appPath); err != nil {
+			snap.Close()
+			return nil, nil, nil, fmt.Errorf("staged app baseline: %w", err)
+		}
 	}
 	var metaBuf bytes.Buffer
 	if _, err := ltxstream.EncodeBaseline(ctx, &metaBuf, metaPath, txid); err != nil {
