@@ -50,11 +50,11 @@ func newRebaselinePub(t *testing.T, be objectstore.Bucket, cfg Config) *Publishe
 	cfg.NodeID = "node-a"
 	cfg.WALPath = "/x/app.db-wal"
 	cfg.MetaWALPath = "/x/meta.db-wal"
-	cfg.Baseline = func(_ context.Context, txid uint64) ([]byte, []byte, func(), error) {
-		return rebTinyLTX(t, txid), rebTinyLTX(t, txid), func() {}, nil
+	cfg.Baseline = func(_ context.Context, txid uint64) (EncodedBaseline, EncodedBaseline, func(), error) {
+		return EncodedBaseline{LTX: rebTinyLTX(t, txid)}, EncodedBaseline{LTX: rebTinyLTX(t, txid)}, func() {}, nil
 	}
-	cfg.MetaBaseline = func(_ context.Context, txid uint64) ([]byte, func(), error) {
-		return rebTinyLTX(t, txid), func() {}, nil
+	cfg.MetaBaseline = func(_ context.Context, txid uint64) (EncodedBaseline, func(), error) {
+		return EncodedBaseline{LTX: rebTinyLTX(t, txid)}, func() {}, nil
 	}
 	p, err := New(cfg)
 	if err != nil {
@@ -108,7 +108,7 @@ func TestMaybeRebaseline_ChainBytes(t *testing.T) {
 	if err := p.seedTXIDCounters(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.takeCoupledBaselines(ctx); err != nil {
+	if _, _, err := p.takeCoupledBaselines(ctx); err != nil {
 		t.Fatalf("init baseline: %v", err)
 	}
 	head, _, _ := objstore.LoadHEAD(ctx, be)
@@ -153,7 +153,7 @@ func TestMaybeRebaseline_NoTriggerWhenSmall(t *testing.T) {
 	if err := p.seedTXIDCounters(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.takeCoupledBaselines(ctx); err != nil {
+	if _, _, err := p.takeCoupledBaselines(ctx); err != nil {
 		t.Fatalf("init baseline: %v", err)
 	}
 	head, _, _ := objstore.LoadHEAD(ctx, be)
@@ -230,7 +230,7 @@ func TestMaybeRebaseline_BaselineSkew(t *testing.T) {
 	if err := p.seedTXIDCounters(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.takeCoupledBaselines(ctx); err != nil {
+	if _, _, err := p.takeCoupledBaselines(ctx); err != nil {
 		t.Fatalf("init baseline: %v", err)
 	}
 	head, _, _ := objstore.LoadHEAD(ctx, be)

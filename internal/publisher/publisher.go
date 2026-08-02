@@ -96,6 +96,16 @@ const (
 	MetaKeyParentAppTXID = "parent_app_txid"
 )
 
+// EncodedBaseline is one stream's snapshot LTX plus the checksum state
+// seeded from the same encode pass. The publisher installs the state
+// into the stream's tailer so subsequent L0s carry pre/post-apply
+// checksums; nil (an encoder that doesn't produce one) degrades those
+// L0s to HeaderFlagNoChecksum.
+type EncodedBaseline struct {
+	LTX       []byte
+	Checksums *ltxstream.ChecksumState
+}
+
 // BaselineFunc encodes both app.db and metadata.db at a single
 // writer-barrier-pinned moment as snapshot LTXes stamped with
 // MaxTXID=txid. The publisher allocates txid above both stream
@@ -106,14 +116,14 @@ const (
 //
 // Used on initial claim, lease takeover, structural rebaseline, and
 // online/operator publication (Node.PublishSnapshot).
-type BaselineFunc func(ctx context.Context, txid uint64) (appLTX, metaLTX []byte, cleanup func(), err error)
+type BaselineFunc func(ctx context.Context, txid uint64) (app, meta EncodedBaseline, cleanup func(), err error)
 
 // MetaBaselineFunc encodes metadata.db alone as a snapshot LTX
 // stamped with MaxTXID=txid, under the same allocate-before-pin
 // contract. Used on an out-of-band metadata WAL recycle
 // (onMetaRecycle), where only the metadata stream needs a fresh
 // anchor.
-type MetaBaselineFunc func(ctx context.Context, txid uint64) (metaLTX []byte, cleanup func(), err error)
+type MetaBaselineFunc func(ctx context.Context, txid uint64) (meta EncodedBaseline, cleanup func(), err error)
 
 // CheckpointFunc runs PRAGMA wal_checkpoint(<mode>) under the embedder's
 // process-local serialization for that connection (writeMu for app.db,
@@ -326,8 +336,10 @@ type stream struct {
 	// record sinks one L0 publish outcome into the stats tracker.
 	record func(minTXID, maxTXID uint64, size int64, dur time.Duration, err error)
 	// rebaseline re-anchors after an out-of-band WAL recycle: coupled
-	// (both streams) for app.db, metadata-only for metadata.db.
-	rebaseline func(ctx context.Context) error
+	// (both streams) for app.db, metadata-only for metadata.db. It
+	// returns the checksum state seeded from THIS stream's fresh
+	// baseline; the tailer adopts it together with its position reset.
+	rebaseline func(ctx context.Context) (*ltxstream.ChecksumState, error)
 	// fence runs wal_checkpoint under the connection's writer fence;
 	// nil when checkpointing isn't wired (no coordinated recycle).
 	fence CheckpointFunc
@@ -336,6 +348,26 @@ type stream struct {
 	tailer *ltxstream.Tailer
 	stop   context.CancelFunc
 	done   chan struct{}
+	// pendingCk is the checksum state seeded by the latest baseline
+	// encode, installed into the tailer when it (re)starts. Guarded by
+	// Publisher.mu.
+	pendingCk *ltxstream.ChecksumState
+}
+
+// stashChecksums records the checksum state seeded by a baseline
+// encode for the stream's NEXT tailer start. It never touches a live
+// tailer: a pin-time state installed mid-stream would silently drop
+// every commit the tailer consumed between the pin and the install,
+// corrupting all later attestations. Live tailers pick up fresh
+// states only through the OnRecycle return, atomically with their
+// position reset.
+func (p *Publisher) stashChecksums(s *stream, ck *ltxstream.ChecksumState) {
+	if ck == nil {
+		return
+	}
+	p.mu.Lock()
+	s.pendingCk = ck
+	p.mu.Unlock()
 }
 
 // SyncAppStream drains the app.db LTX tailer, blocking until any
@@ -577,12 +609,18 @@ func (p *Publisher) PublishCoupledBaseline(ctx context.Context, prepare Baseline
 		p.baselineMu.Lock()
 		defer p.baselineMu.Unlock()
 		txid := p.allocBaselineTXID()
-		appLTX, metaLTX, cleanup, err := prepare(mutationCtx, txid)
+		// The seeded checksum states are deliberately dropped: both
+		// tailers keep running across an external baseline, and their
+		// live states remain correct (see stashChecksums). The staged
+		// backup copy is byte-divergent from the live file, so a
+		// restore anchored on this baseline verifies opportunistically
+		// until its chain converges (see physicalrestore's verifier).
+		app, meta, cleanup, err := prepare(mutationCtx, txid)
 		if err != nil {
 			return err
 		}
 		defer cleanup()
-		return p.publishCoupledBaselines(mutationCtx, txid, appLTX, metaLTX)
+		return p.publishCoupledBaselines(mutationCtx, txid, app.LTX, meta.LTX)
 	}()
 	// Cancellation injected by the generation (lease lost, unhealthy) must
 	// surface as its cause, not as the bare context error an interrupted
@@ -649,7 +687,10 @@ func New(cfg Config) (*Publisher, error) {
 		prefix:     objstore.DBPrefix,
 		nextTXID:   p.allocBucketTXID,
 		record:     p.stats.recordL0,
-		rebaseline: p.takeCoupledBaselines,
+		rebaseline: func(ctx context.Context) (*ltxstream.ChecksumState, error) {
+			appCk, _, err := p.takeCoupledBaselines(ctx)
+			return appCk, err
+		},
 		fence:      cfg.AppCheckpoint,
 	}
 	p.meta = stream{
@@ -1056,7 +1097,7 @@ func (p *Publisher) claimOrTakeover(ctx context.Context) error {
 		// takeover, or same-node resume — can prove its local WAL is
 		// contiguous with the bucket chain, and an unproven resume can
 		// silently drop checkpointed-but-unshipped txns from db/.
-		if err := p.takeCoupledBaselines(ctx); err != nil {
+		if _, _, err := p.takeCoupledBaselines(ctx); err != nil {
 			return fmt.Errorf("coupled baseline on claim: %w", err)
 		}
 		p.cfg.Logger.Info("publisher: lease claimed",
@@ -1070,35 +1111,41 @@ func (p *Publisher) claimOrTakeover(ctx context.Context) error {
 // takeCoupledBaselines allocates one TXID, encodes both app.db and
 // metadata.db as snapshot LTXes (under one barrier-pin), uploads them
 // to db/0009/ and metadata/0009/, then CASes HEAD with both pointers.
-// Used on initial claim and lease takeover.
-func (p *Publisher) takeCoupledBaselines(ctx context.Context) error {
+// Used on initial claim and lease takeover, and by the app stream's
+// out-of-band recycle (which adopts the returned app state together
+// with its position reset; the meta state is stashed for the next
+// tailer start only, since the meta tailer keeps its position and its
+// live state stays correct).
+func (p *Publisher) takeCoupledBaselines(ctx context.Context) (appCk, metaCk *ltxstream.ChecksumState, err error) {
 	t0 := time.Now()
 	p.baselineMu.Lock()
 	defer p.baselineMu.Unlock()
 	mutationCtx, done, err := p.leaseMutationContext(ctx)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	defer done()
 	txid := p.allocBaselineTXID()
-	appLTX, metaLTX, cleanup, err := p.cfg.Baseline(mutationCtx, txid)
+	app, meta, cleanup, err := p.cfg.Baseline(mutationCtx, txid)
 	if err != nil {
 		dur := time.Since(t0)
 		p.stats.recordAppBaseline(txid, 0, dur, err)
 		p.stats.recordMetaBaseline(txid, 0, dur, err)
-		return fmt.Errorf("encode coupled baseline: %w", err)
+		return nil, nil, fmt.Errorf("encode coupled baseline: %w", err)
 	}
 	defer cleanup()
-	if err := p.publishCoupledBaselines(mutationCtx, txid, appLTX, metaLTX); err != nil {
+	p.stashChecksums(&p.app, app.Checksums)
+	p.stashChecksums(&p.meta, meta.Checksums)
+	if err := p.publishCoupledBaselines(mutationCtx, txid, app.LTX, meta.LTX); err != nil {
 		dur := time.Since(t0)
-		p.stats.recordAppBaseline(txid, int64(len(appLTX)), dur, err)
-		p.stats.recordMetaBaseline(txid, int64(len(metaLTX)), dur, err)
-		return fmt.Errorf("publish coupled baselines: %w", err)
+		p.stats.recordAppBaseline(txid, int64(len(app.LTX)), dur, err)
+		p.stats.recordMetaBaseline(txid, int64(len(meta.LTX)), dur, err)
+		return nil, nil, fmt.Errorf("publish coupled baselines: %w", err)
 	}
 	dur := time.Since(t0)
-	p.stats.recordAppBaseline(txid, int64(len(appLTX)), dur, nil)
-	p.stats.recordMetaBaseline(txid, int64(len(metaLTX)), dur, nil)
-	return nil
+	p.stats.recordAppBaseline(txid, int64(len(app.LTX)), dur, nil)
+	p.stats.recordMetaBaseline(txid, int64(len(meta.LTX)), dur, nil)
+	return app.Checksums, meta.Checksums, nil
 }
 
 // maybeRebaseline takes a fresh coupled (app+meta) baseline when the db
@@ -1170,43 +1217,48 @@ func (p *Publisher) maybeRebaseline(ctx context.Context) error {
 		"chain_objects", chainObjects,
 		"chain_bytes", chainBytes,
 		"baseline_skew", skew)
-	return p.takeCoupledBaselines(ctx)
+	// Live tailer states stay untouched (see stashChecksums); the
+	// structural baseline's seeded states apply from the next claim.
+	_, _, err = p.takeCoupledBaselines(ctx)
+	return err
 }
 
 // takeMetaBaselineOnly encodes metadata.db as a snapshot LTX and
 // CASes HEAD updating only MetaBaseline. Used on an out-of-band
 // metadata WAL recycle, where the meta stream alone lost frames and
-// needs a fresh anchor.
-func (p *Publisher) takeMetaBaselineOnly(ctx context.Context) error {
+// needs a fresh anchor; the returned state is adopted by the meta
+// tailer together with its position reset.
+func (p *Publisher) takeMetaBaselineOnly(ctx context.Context) (*ltxstream.ChecksumState, error) {
 	t0 := time.Now()
 	p.baselineMu.Lock()
 	defer p.baselineMu.Unlock()
 	mutationCtx, done, err := p.leaseMutationContext(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer done()
 	expected, ok := p.publisherIdentity()
 	if !ok {
-		return errLeaseLost
+		return nil, errLeaseLost
 	}
 	txid := p.allocBaselineTXID()
-	metaLTX, cleanup, err := p.cfg.MetaBaseline(mutationCtx, txid)
+	meta, cleanup, err := p.cfg.MetaBaseline(mutationCtx, txid)
 	if err != nil {
 		p.stats.recordMetaBaseline(txid, 0, time.Since(t0), err)
-		return fmt.Errorf("encode meta baseline: %w", err)
+		return nil, fmt.Errorf("encode meta baseline: %w", err)
 	}
 	defer cleanup()
+	p.stashChecksums(&p.meta, meta.Checksums)
 	err = objstore.PublishMetadataBaselineOwned(
-		mutationCtx, p.mutationBackend(), p.cfg.ClusterID, expected, txid, metaLTX,
+		mutationCtx, p.mutationBackend(), p.cfg.ClusterID, expected, txid, meta.LTX,
 	)
 	if err != nil {
 		err = p.fenceMutationError(err)
-		p.stats.recordMetaBaseline(txid, int64(len(metaLTX)), time.Since(t0), err)
-		return fmt.Errorf("publish metadata baseline: %w", err)
+		p.stats.recordMetaBaseline(txid, int64(len(meta.LTX)), time.Since(t0), err)
+		return nil, fmt.Errorf("publish metadata baseline: %w", err)
 	}
-	p.stats.recordMetaBaseline(txid, int64(len(metaLTX)), time.Since(t0), nil)
-	return nil
+	p.stats.recordMetaBaseline(txid, int64(len(meta.LTX)), time.Since(t0), nil)
+	return meta.Checksums, nil
 }
 
 // allocBaselineTXID picks a TXID strictly greater than every L0/L1/baseline
@@ -1512,7 +1564,9 @@ func (p *Publisher) startStream(parent context.Context, s *stream) {
 		OnLTX: func(ctx context.Context, hdr ltx.Header, body []byte) error {
 			return p.publishL0(ctx, s, hdr, body)
 		},
-		OnRecycle: func(ctx context.Context) (ltxstream.Position, error) { return p.onRecycle(ctx, s) },
+		OnRecycle: func(ctx context.Context) (ltxstream.Position, *ltxstream.ChecksumState, error) {
+			return p.onRecycle(ctx, s)
+		},
 	}
 	t := ltxstream.New(cfg, ltxstream.Position{})
 	ctx, cancel := context.WithCancel(parent)
@@ -1520,7 +1574,11 @@ func (p *Publisher) startStream(parent context.Context, s *stream) {
 	s.tailer = t
 	s.stop = cancel
 	s.done = make(chan struct{})
+	ck := s.pendingCk
 	p.mu.Unlock()
+	if ck != nil {
+		t.SetChecksumState(ck)
+	}
 	go func() {
 		defer close(s.done)
 		_ = t.Run(ctx)
@@ -1568,17 +1626,19 @@ func (p *Publisher) publishL0(ctx context.Context, s *stream, hdr ltx.Header, bo
 // here, frames may have been lost between commit and Sync, so a fresh
 // baseline re-anchors the chain: coupled for app.db (both streams),
 // metadata-only for metadata.db.
-func (p *Publisher) onRecycle(ctx context.Context, s *stream) (ltxstream.Position, error) {
+func (p *Publisher) onRecycle(ctx context.Context, s *stream) (ltxstream.Position, *ltxstream.ChecksumState, error) {
 	p.recycleMu.Lock()
 	defer p.recycleMu.Unlock()
 	p.recycling.Store(true)
 	defer p.recycling.Store(false)
 	p.cfg.Logger.Warn("publisher: " + s.label + " WAL recycled out of band; rebaselining")
-	if err := s.rebaseline(ctx); err != nil {
-		return ltxstream.Position{}, err
+	ck, err := s.rebaseline(ctx)
+	if err != nil {
+		return ltxstream.Position{}, nil, err
 	}
-	// Position{} primes a fresh-WAL-header read on the next Sync.
-	return ltxstream.Position{}, nil
+	// Position{} primes a fresh-WAL-header read on the next Sync; the
+	// tailer adopts the baseline-seeded checksum state with it.
+	return ltxstream.Position{}, ck, nil
 }
 
 // allocBucketTXID returns the next monotonic TXID for the app stream.

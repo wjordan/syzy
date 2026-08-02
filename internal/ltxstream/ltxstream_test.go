@@ -336,13 +336,13 @@ func TestTailer_RecycleInvokesCallback(t *testing.T) {
 		NextTXID:     func() uint64 { return counter.Add(1) },
 		OnLTX:        func(_ context.Context, _ ltx.Header, _ []byte) error { ltxCount.Add(1); return nil },
 		SyncInterval: 25 * time.Millisecond,
-		OnRecycle: func(_ context.Context) (ltxstream.Position, error) {
+		OnRecycle: func(_ context.Context) (ltxstream.Position, *ltxstream.ChecksumState, error) {
 			recycleCalls.Add(1)
 			select {
 			case recycled <- struct{}{}:
 			default:
 			}
-			return ltxstream.Position{}, nil
+			return ltxstream.Position{}, nil, nil
 		},
 	}
 
@@ -434,9 +434,9 @@ func TestTailer_RecycleSkippedAfterCancel(t *testing.T) {
 	// PrevFrameMismatchError and call OnRecycle. With the context already
 	// canceled, it must skip OnRecycle and exit.
 	var recycleCalls atomic.Int64
-	cfg.OnRecycle = func(_ context.Context) (ltxstream.Position, error) {
+	cfg.OnRecycle = func(_ context.Context) (ltxstream.Position, *ltxstream.ChecksumState, error) {
 		recycleCalls.Add(1)
-		return ltxstream.Position{}, nil
+		return ltxstream.Position{}, nil, nil
 	}
 	tailer := ltxstream.New(cfg, stale)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -482,9 +482,9 @@ func TestTailer_CoordinatedCheckpointRace(t *testing.T) {
 		NextTXID:     func() uint64 { return counter.Add(1) },
 		OnLTX:        func(_ context.Context, _ ltx.Header, _ []byte) error { return nil },
 		SyncInterval: time.Millisecond, // accelerate the prod 1s tick
-		OnRecycle: func(_ context.Context) (ltxstream.Position, error) {
+		OnRecycle: func(_ context.Context) (ltxstream.Position, *ltxstream.ChecksumState, error) {
 			recycles.Add(1)
-			return ltxstream.Position{}, nil
+			return ltxstream.Position{}, nil, nil
 		},
 	}
 	tailer := ltxstream.New(cfg, ltxstream.Position{})

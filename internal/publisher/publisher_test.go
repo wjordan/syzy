@@ -18,9 +18,9 @@ import (
 func stubBaseline(t *testing.T) (publisher.BaselineFunc, *int) {
 	t.Helper()
 	calls := 0
-	return func(ctx context.Context, txid uint64) ([]byte, []byte, func(), error) {
+	return func(ctx context.Context, txid uint64) (publisher.EncodedBaseline, publisher.EncodedBaseline, func(), error) {
 		calls++
-		return []byte("fake-app-baseline-ltx"), []byte("fake-meta-baseline-ltx"), func() {}, nil
+		return publisher.EncodedBaseline{LTX: []byte("fake-app-baseline-ltx")}, publisher.EncodedBaseline{LTX: []byte("fake-meta-baseline-ltx")}, func() {}, nil
 	}, &calls
 }
 
@@ -28,9 +28,9 @@ func stubBaseline(t *testing.T) (publisher.BaselineFunc, *int) {
 func stubMetaBaseline(t *testing.T) (publisher.MetaBaselineFunc, *int) {
 	t.Helper()
 	calls := 0
-	return func(ctx context.Context, txid uint64) ([]byte, func(), error) {
+	return func(ctx context.Context, txid uint64) (publisher.EncodedBaseline, func(), error) {
 		calls++
-		return []byte("fake-meta-baseline-ltx"), func() {}, nil
+		return publisher.EncodedBaseline{LTX: []byte("fake-meta-baseline-ltx")}, func() {}, nil
 	}, &calls
 }
 

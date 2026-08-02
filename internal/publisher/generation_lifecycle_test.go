@@ -46,11 +46,11 @@ func TestGenerationOperationGateCancelsJoinsAndRejects(t *testing.T) {
 	release := make(chan struct{})
 	result := make(chan error, 1)
 	go func() {
-		result <- p.PublishCoupledBaseline(context.Background(), func(ctx context.Context, _ uint64) ([]byte, []byte, func(), error) {
+		result <- p.PublishCoupledBaseline(context.Background(), func(ctx context.Context, _ uint64) (EncodedBaseline, EncodedBaseline, func(), error) {
 			close(entered)
 			<-release
 			<-ctx.Done()
-			return nil, nil, nil, context.Cause(ctx)
+			return EncodedBaseline{}, EncodedBaseline{}, nil, context.Cause(ctx)
 		})
 	}()
 	<-entered
@@ -159,20 +159,20 @@ func TestCoupledBaselinesSerializeCaptureAndPromotion(t *testing.T) {
 	var olderTXID, newerTXID atomic.Uint64
 	olderDone := make(chan error, 1)
 	go func() {
-		olderDone <- p.PublishCoupledBaseline(context.Background(), func(_ context.Context, txid uint64) ([]byte, []byte, func(), error) {
+		olderDone <- p.PublishCoupledBaseline(context.Background(), func(_ context.Context, txid uint64) (EncodedBaseline, EncodedBaseline, func(), error) {
 			close(olderEntered)
 			<-releaseOlder
 			olderTXID.Store(txid)
-			return []byte("older-app"), []byte("older-meta"), func() {}, nil
+			return EncodedBaseline{LTX: []byte("older-app")}, EncodedBaseline{LTX: []byte("older-meta")}, func() {}, nil
 		})
 	}()
 	<-olderEntered
 	newerDone := make(chan error, 1)
 	go func() {
-		newerDone <- p.PublishCoupledBaseline(context.Background(), func(_ context.Context, txid uint64) ([]byte, []byte, func(), error) {
+		newerDone <- p.PublishCoupledBaseline(context.Background(), func(_ context.Context, txid uint64) (EncodedBaseline, EncodedBaseline, func(), error) {
 			close(newerEntered)
 			newerTXID.Store(txid)
-			return []byte("newer-app"), []byte("newer-meta"), func() {}, nil
+			return EncodedBaseline{LTX: []byte("newer-app")}, EncodedBaseline{LTX: []byte("newer-meta")}, func() {}, nil
 		})
 	}()
 	select {
@@ -230,11 +230,11 @@ func TestNewValidatesLeaseRenewalWindow(t *testing.T) {
 		NodeID:      "node-a",
 		WALPath:     filepath.Join(t.TempDir(), "app-wal"),
 		MetaWALPath: filepath.Join(t.TempDir(), "meta-wal"),
-		Baseline: func(context.Context, uint64) ([]byte, []byte, func(), error) {
-			return nil, nil, func() {}, nil
+		Baseline: func(context.Context, uint64) (EncodedBaseline, EncodedBaseline, func(), error) {
+			return EncodedBaseline{}, EncodedBaseline{}, func() {}, nil
 		},
-		MetaBaseline: func(context.Context, uint64) ([]byte, func(), error) {
-			return nil, func() {}, nil
+		MetaBaseline: func(context.Context, uint64) (EncodedBaseline, func(), error) {
+			return EncodedBaseline{}, func() {}, nil
 		},
 	}
 	for _, tc := range []struct {
@@ -284,11 +284,11 @@ func TestPublishCoupledBaselineAllocatesTXIDBeforePin(t *testing.T) {
 	p.metaTXIDCounter.Store(20)
 
 	var baselineTXID, concurrentL0 uint64
-	err = p.PublishCoupledBaseline(context.Background(), func(_ context.Context, txid uint64) ([]byte, []byte, func(), error) {
+	err = p.PublishCoupledBaseline(context.Background(), func(_ context.Context, txid uint64) (EncodedBaseline, EncodedBaseline, func(), error) {
 		baselineTXID = txid
 		// A tailer drain racing the pin allocates only above the baseline.
 		concurrentL0 = p.allocBucketTXID()
-		return []byte("app"), []byte("meta"), func() {}, nil
+		return EncodedBaseline{LTX: []byte("app")}, EncodedBaseline{LTX: []byte("meta")}, func() {}, nil
 	})
 	if err != nil {
 		t.Fatalf("publish: %v", err)
@@ -340,11 +340,11 @@ func startRunTestPublisher(t *testing.T, mutate func(*Config)) (*Publisher, obje
 		CheckpointInterval: time.Hour,
 		CompactInterval:    time.Hour,
 		RetentionGrace:     time.Hour,
-		Baseline: func(context.Context, uint64) ([]byte, []byte, func(), error) {
-			return []byte("app-baseline"), []byte("meta-baseline"), func() {}, nil
+		Baseline: func(context.Context, uint64) (EncodedBaseline, EncodedBaseline, func(), error) {
+			return EncodedBaseline{LTX: []byte("app-baseline")}, EncodedBaseline{LTX: []byte("meta-baseline")}, func() {}, nil
 		},
-		MetaBaseline: func(context.Context, uint64) ([]byte, func(), error) {
-			return []byte("meta-baseline"), func() {}, nil
+		MetaBaseline: func(context.Context, uint64) (EncodedBaseline, func(), error) {
+			return EncodedBaseline{LTX: []byte("meta-baseline")}, func() {}, nil
 		},
 	}
 	if mutate != nil {

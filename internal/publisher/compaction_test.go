@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/superfly/ltx"
 	"github.com/wjordan/objectstore"
+	"github.com/wjordan/syzy/internal/ltxstream"
 	"github.com/wjordan/syzy/internal/objstore"
 	"github.com/wjordan/syzy/internal/publisher"
 )
@@ -692,3 +694,118 @@ func TestRetention_DryRun(t *testing.T) {
 
 // avoid unused-import warning when test file is the only consumer of filepath
 var _ = filepath.Join
+
+// makeAttestedChain builds n contiguous checksummed L0s (txids
+// first..first+n-1) chained from a seeded state, each rewriting page 1.
+func makeAttestedChain(t *testing.T, first uint64, n int) [][]byte {
+	t.Helper()
+	const pageSize = 4096
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "src.db")
+	page := bytes.Repeat([]byte{0xB0}, pageSize)
+	page[16], page[17] = 0x10, 0x00 // page size 4096
+	if err := os.WriteFile(dbPath, page, 0o644); err != nil {
+		t.Fatalf("write fake db: %v", err)
+	}
+	var baseBuf bytes.Buffer
+	_, state, err := ltxstream.EncodeBaseline(context.Background(), &baseBuf, dbPath, first-1)
+	if err != nil {
+		t.Fatalf("EncodeBaseline: %v", err)
+	}
+	bodies := make([][]byte, 0, n)
+	for i := 0; i < n; i++ {
+		txid := first + uint64(i)
+		pageMap := map[uint32][]byte{1: bytes.Repeat([]byte{byte(0xC0 + i)}, pageSize)}
+		pageMap[1][16], pageMap[1][17] = 0x10, 0x00
+		st := state.Stage(pageMap, 1)
+		hdr := ltx.Header{
+			Version: ltx.Version, PageSize: pageSize, Commit: 1,
+			MinTXID: ltx.TXID(txid), MaxTXID: ltx.TXID(txid),
+			Timestamp: time.Now().UnixMilli(), PreApplyChecksum: st.Pre,
+		}
+		var buf bytes.Buffer
+		if err := ltxstream.EncodeIncremental(context.Background(), &buf, pageMap, hdr, st.Post); err != nil {
+			t.Fatalf("encode attested L0 %d: %v", txid, err)
+		}
+		st.Commit()
+		bodies = append(bodies, buf.Bytes())
+	}
+	return bodies
+}
+
+// TestCompactor_PropagatesAttestations: an all-attested run must merge
+// into an L1 that keeps checksum tracking — first input's pre-apply,
+// last input's post-apply.
+func TestCompactor_PropagatesAttestations(t *testing.T) {
+	t.Parallel()
+	be, _ := objectstore.OpenFS(t.TempDir())
+	ctx := context.Background()
+	bodies := makeAttestedChain(t, 2, 3)
+	for i, body := range bodies {
+		txid := uint64(2 + i)
+		if _, err := objstore.PublishLTX(ctx, be, objstore.DBPrefix, objstore.L0Level, txid, txid, body); err != nil {
+			t.Fatalf("publish %d: %v", txid, err)
+		}
+	}
+	c := &publisher.Compactor{Backend: be, StreamPrefix: objstore.DBPrefix, MinFiles: 3}
+	if produced, err := c.CompactOnce(ctx); err != nil || produced != 1 {
+		t.Fatalf("CompactOnce: produced=%d err=%v", produced, err)
+	}
+	merged := readBucketObject(t, ctx, be, "db/0001/0000000000000002-0000000000000004.ltx")
+	dec := ltx.NewDecoder(bytes.NewReader(merged))
+	if err := dec.Verify(); err != nil {
+		t.Fatalf("verify merged L1: %v", err)
+	}
+	if dec.Header().NoChecksum() {
+		t.Fatalf("merged L1 dropped checksum tracking")
+	}
+	firstDec := ltx.NewDecoder(bytes.NewReader(bodies[0]))
+	if err := firstDec.Verify(); err != nil {
+		t.Fatalf("verify first input: %v", err)
+	}
+	lastDec := ltx.NewDecoder(bytes.NewReader(bodies[2]))
+	if err := lastDec.Verify(); err != nil {
+		t.Fatalf("verify last input: %v", err)
+	}
+	if got, want := dec.Header().PreApplyChecksum, firstDec.Header().PreApplyChecksum; got != want {
+		t.Fatalf("merged pre-apply %s != first input's %s", got, want)
+	}
+	if got, want := dec.Trailer().PostApplyChecksum, lastDec.Trailer().PostApplyChecksum; got != want {
+		t.Fatalf("merged post-apply %s != last input's %s", got, want)
+	}
+}
+
+// TestCompactor_SplitsRunAtAttestationBoundary: a run mixing legacy
+// (NoChecksum) and attested inputs cannot merge into one valid L1; the
+// compactor must truncate to the leading uniform segment rather than
+// fail or emit an invalid object.
+func TestCompactor_SplitsRunAtAttestationBoundary(t *testing.T) {
+	t.Parallel()
+	be, _ := objectstore.OpenFS(t.TempDir())
+	ctx := context.Background()
+	for i := uint64(1); i <= 2; i++ {
+		if _, err := objstore.PublishLTX(ctx, be, objstore.DBPrefix, objstore.L0Level, i, i, makeTinyLTX(t, i, byte(i))); err != nil {
+			t.Fatalf("publish legacy %d: %v", i, err)
+		}
+	}
+	bodies := makeAttestedChain(t, 3, 2)
+	for i, body := range bodies {
+		txid := uint64(3 + i)
+		if _, err := objstore.PublishLTX(ctx, be, objstore.DBPrefix, objstore.L0Level, txid, txid, body); err != nil {
+			t.Fatalf("publish attested %d: %v", txid, err)
+		}
+	}
+	c := &publisher.Compactor{Backend: be, StreamPrefix: objstore.DBPrefix, MinFiles: 4}
+	if produced, err := c.CompactOnce(ctx); err != nil || produced != 1 {
+		t.Fatalf("CompactOnce: produced=%d err=%v", produced, err)
+	}
+	// Only the legacy prefix [1..2] merges; the attested tail stays L0.
+	merged := readBucketObject(t, ctx, be, "db/0001/0000000000000001-0000000000000002.ltx")
+	dec := ltx.NewDecoder(bytes.NewReader(merged))
+	if err := dec.Verify(); err != nil {
+		t.Fatalf("verify merged L1: %v", err)
+	}
+	if !dec.Header().NoChecksum() {
+		t.Fatalf("legacy-prefix L1 unexpectedly claims checksum tracking")
+	}
+}

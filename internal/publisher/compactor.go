@@ -1,6 +1,7 @@
 package publisher
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -201,6 +202,14 @@ func (c *Compactor) CompactOnceDetailed(ctx context.Context) (CompactionResult, 
 // compactRun downloads the given L0 files and streams their merged LTX into
 // one immutable L1 object. A concurrent writer that creates the same key is
 // accepted only when its bytes exactly match this output.
+//
+// Checksum attestations propagate through the merge: when every input
+// carries them, the L1 inherits the first input's pre-apply and the
+// last input's post-apply checksums. Inputs cannot mix — ltx's
+// compactor would emit an invalid header — so a run straddling an
+// attestation boundary (legacy objects meeting checksummed ones) is
+// truncated to its leading uniform segment; the rest compacts on a
+// later pass.
 func (c *Compactor) compactRun(ctx context.Context, run []objstore.LTXFile) error {
 	readers, closers, err := c.openRunReaders(ctx, run)
 	if err != nil {
@@ -211,6 +220,27 @@ func (c *Compactor) compactRun(ctx context.Context, run []objstore.LTXFile) erro
 			_ = rc.Close()
 		}
 	}()
+
+	attested, err := peekAttestations(readers)
+	if err != nil {
+		return err
+	}
+	uniform := 1
+	for uniform < len(run) && attested[uniform] == attested[0] {
+		uniform++
+	}
+	if uniform < len(run) {
+		logger := c.Logger
+		if logger == nil {
+			logger = syzylog.Default()
+		}
+		logger.Warn("compactor: attestation boundary splits run",
+			"stream", c.StreamPrefix,
+			"min", run[0].MinTXID, "max", run[len(run)-1].MaxTXID,
+			"uniform_files", uniform)
+		run = run[:uniform]
+		readers = readers[:uniform]
+	}
 
 	pr, pw := io.Pipe()
 	h := sha256.New()
@@ -223,7 +253,9 @@ func (c *Compactor) compactRun(ctx context.Context, run []objstore.LTXFile) erro
 			compactErr <- fmt.Errorf("ltx.NewCompactor: %w", err)
 			return
 		}
-		merger.HeaderFlags = ltx.HeaderFlagNoChecksum
+		if !attested[0] {
+			merger.HeaderFlags = ltx.HeaderFlagNoChecksum
+		}
 		err = merger.Compact(ctx)
 		_ = pw.CloseWithError(err)
 		if err != nil {
@@ -285,7 +317,9 @@ func (c *Compactor) openRunReaders(ctx context.Context, run []objstore.LTXFile) 
 			}
 			continue
 		}
-		readers[res.index] = res.rc
+		// Buffered so peekAttestations can read the header without
+		// consuming it from the compactor's stream.
+		readers[res.index] = bufio.NewReaderSize(res.rc, ltx.HeaderSize)
 		closers = append(closers, res.rc)
 	}
 	if firstErr != nil {
@@ -295,6 +329,28 @@ func (c *Compactor) openRunReaders(ctx context.Context, run []objstore.LTXFile) 
 		return nil, nil, firstErr
 	}
 	return readers, closers, nil
+}
+
+// peekAttestations reports, per input, whether the LTX carries
+// checksum attestations, without consuming any reader bytes.
+func peekAttestations(readers []io.Reader) ([]bool, error) {
+	attested := make([]bool, len(readers))
+	for i, r := range readers {
+		br, ok := r.(*bufio.Reader)
+		if !ok {
+			return nil, fmt.Errorf("compactor: input %d is not peekable", i)
+		}
+		b, err := br.Peek(ltx.HeaderSize)
+		if err != nil {
+			return nil, fmt.Errorf("compactor: peek input %d header: %w", i, err)
+		}
+		var hdr ltx.Header
+		if err := hdr.UnmarshalBinary(b); err != nil {
+			return nil, fmt.Errorf("compactor: decode input %d header: %w", i, err)
+		}
+		attested[i] = !hdr.NoChecksum()
+	}
+	return attested, nil
 }
 
 func compactorBaselineTXID(ctx context.Context, b objectstore.Bucket, streamPrefix string) (uint64, error) {

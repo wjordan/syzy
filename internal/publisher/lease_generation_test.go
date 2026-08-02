@@ -21,11 +21,11 @@ func newLeaseGenerationPublisher(t *testing.T, be objectstore.Bucket, cfg Config
 	cfg.NodeID = "node-a"
 	cfg.WALPath = filepath.Join(t.TempDir(), "app.db-wal")
 	cfg.MetaWALPath = filepath.Join(t.TempDir(), "metadata.db-wal")
-	cfg.Baseline = func(context.Context, uint64) ([]byte, []byte, func(), error) {
-		return []byte("old-app"), []byte("old-meta"), func() {}, nil
+	cfg.Baseline = func(context.Context, uint64) (EncodedBaseline, EncodedBaseline, func(), error) {
+		return EncodedBaseline{LTX: []byte("old-app")}, EncodedBaseline{LTX: []byte("old-meta")}, func() {}, nil
 	}
-	cfg.MetaBaseline = func(context.Context, uint64) ([]byte, func(), error) {
-		return []byte("old-meta"), func() {}, nil
+	cfg.MetaBaseline = func(context.Context, uint64) (EncodedBaseline, func(), error) {
+		return EncodedBaseline{LTX: []byte("old-meta")}, func() {}, nil
 	}
 	p, err := New(cfg)
 	if err != nil {
@@ -53,8 +53,8 @@ func successorHEAD() *objstore.HEAD {
 }
 
 func publishTestCoupledBaseline(ctx context.Context, p *Publisher, app, meta []byte) error {
-	return p.PublishCoupledBaseline(ctx, func(context.Context, uint64) ([]byte, []byte, func(), error) {
-		return app, meta, func() {}, nil
+	return p.PublishCoupledBaseline(ctx, func(context.Context, uint64) (EncodedBaseline, EncodedBaseline, func(), error) {
+		return EncodedBaseline{LTX: app}, EncodedBaseline{LTX: meta}, func() {}, nil
 	})
 }
 
@@ -67,7 +67,7 @@ func TestBaselineMutationsRejectOldGeneration(t *testing.T) {
 		run  func(context.Context, *Publisher) error
 	}{
 		{name: "coupled", run: func(ctx context.Context, p *Publisher) error {
-			return p.takeCoupledBaselines(ctx)
+			_, _, err := p.takeCoupledBaselines(ctx); return err
 		}},
 		{name: "external coupled", run: func(ctx context.Context, p *Publisher) error {
 			leadCtx, leadCancel := context.WithCancelCause(context.Background())
@@ -81,7 +81,7 @@ func TestBaselineMutationsRejectOldGeneration(t *testing.T) {
 			return publishTestCoupledBaseline(ctx, p, []byte("external-app"), []byte("external-meta"))
 		}},
 		{name: "metadata only", run: func(ctx context.Context, p *Publisher) error {
-			return p.takeMetaBaselineOnly(ctx)
+			_, err := p.takeMetaBaselineOnly(ctx); return err
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
