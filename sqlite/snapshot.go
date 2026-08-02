@@ -13,6 +13,7 @@ import (
 	"github.com/wjordan/syzy/internal/clone"
 	"github.com/wjordan/syzy/internal/ltxstream"
 	"github.com/wjordan/syzy/internal/nodestate"
+	"github.com/wjordan/syzy/internal/publisher"
 )
 
 type pinnedSnapshot struct {
@@ -231,12 +232,15 @@ func (n *Node) PublishSnapshot(ctx context.Context) error {
 	var filesDur time.Duration
 	var snapTimings pinTimings
 	var baselineTXID uint64
-	pubErr := n.publisher.PublishCoupledBaseline(ctx, func(opCtx context.Context, txid uint64) ([]byte, []byte, func(), error) {
+	fail := func(err error) (publisher.EncodedBaseline, publisher.EncodedBaseline, func(), error) {
+		return publisher.EncodedBaseline{}, publisher.EncodedBaseline{}, nil, err
+	}
+	pubErr := n.publisher.PublishCoupledBaseline(ctx, func(opCtx context.Context, txid uint64) (publisher.EncodedBaseline, publisher.EncodedBaseline, func(), error) {
 		baselineTXID = txid
 		// Pre-drain off writeMu. The generation operation context cancels this
 		// work during lease teardown before database connections are closed.
 		if err := n.waitAllDrained(opCtx); err != nil {
-			return nil, nil, nil, fmt.Errorf("syzy: pre-barrier drain: %w", err)
+			return fail(fmt.Errorf("syzy: pre-barrier drain: %w", err))
 		}
 		tPredrained = time.Now()
 
@@ -256,7 +260,7 @@ func (n *Node) PublishSnapshot(ctx context.Context) error {
 			return n.snapshotPinnedLocked(opCtx)
 		}()
 		if err != nil {
-			return nil, nil, nil, err
+			return fail(err)
 		}
 		snapTimings = snap.timings
 
@@ -265,19 +269,21 @@ func (n *Node) PublishSnapshot(ctx context.Context) error {
 		filesDur = time.Since(tFiles)
 		if err != nil {
 			snap.Close()
-			return nil, nil, nil, fmt.Errorf("syzy: read staged backups: %w", err)
+			return fail(fmt.Errorf("syzy: read staged backups: %w", err))
 		}
 		tUpload = time.Now()
+		var app, meta publisher.EncodedBaseline
 		var appBuf, metaBuf bytes.Buffer
-		if _, err := ltxstream.EncodeBaseline(opCtx, &appBuf, appPath, txid); err != nil {
+		if _, app.Checksums, err = ltxstream.EncodeBaseline(opCtx, &appBuf, appPath, txid); err != nil {
 			snap.Close()
-			return nil, nil, nil, fmt.Errorf("syzy: encode app baseline LTX: %w", err)
+			return fail(fmt.Errorf("syzy: encode app baseline LTX: %w", err))
 		}
-		if _, err := ltxstream.EncodeBaseline(opCtx, &metaBuf, metaPath, txid); err != nil {
+		if _, meta.Checksums, err = ltxstream.EncodeBaseline(opCtx, &metaBuf, metaPath, txid); err != nil {
 			snap.Close()
-			return nil, nil, nil, fmt.Errorf("syzy: encode meta baseline LTX: %w", err)
+			return fail(fmt.Errorf("syzy: encode meta baseline LTX: %w", err))
 		}
-		return appBuf.Bytes(), metaBuf.Bytes(), snap.Close, nil
+		app.LTX, meta.LTX = appBuf.Bytes(), metaBuf.Bytes()
+		return app, meta, snap.Close, nil
 	})
 	if tUpload.IsZero() {
 		return pubErr

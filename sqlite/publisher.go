@@ -60,22 +60,22 @@ func (n *Node) startPublisher() error {
 // capture, encodes both app.db and metadata.db as snapshot LTXes
 // stamped with MaxTXID=txid (allocated by the publisher before this
 // call). Used on initial claim, lease takeover, and rebaseline.
-func (n *Node) publisherBaseline(ctx context.Context, txid uint64) ([]byte, []byte, func(), error) {
-	snap, appLTX, metaLTX, err := n.encodeBaselines(ctx, txid, true)
+func (n *Node) publisherBaseline(ctx context.Context, txid uint64) (publisher.EncodedBaseline, publisher.EncodedBaseline, func(), error) {
+	snap, app, meta, err := n.encodeBaselines(ctx, txid, true)
 	if err != nil {
-		return nil, nil, func() {}, err
+		return publisher.EncodedBaseline{}, publisher.EncodedBaseline{}, func() {}, err
 	}
-	return appLTX, metaLTX, snap.Close, nil
+	return app, meta, snap.Close, nil
 }
 
 // publisherMetaBaseline is the Node-side MetaBaselineFunc: encodes
 // metadata.db alone at txid. Used on an out-of-band meta WAL recycle.
-func (n *Node) publisherMetaBaseline(ctx context.Context, txid uint64) ([]byte, func(), error) {
-	snap, _, metaLTX, err := n.encodeBaselines(ctx, txid, false)
+func (n *Node) publisherMetaBaseline(ctx context.Context, txid uint64) (publisher.EncodedBaseline, func(), error) {
+	snap, _, meta, err := n.encodeBaselines(ctx, txid, false)
 	if err != nil {
-		return nil, func() {}, err
+		return publisher.EncodedBaseline{}, func() {}, err
 	}
-	return metaLTX, snap.Close, nil
+	return meta, snap.Close, nil
 }
 
 // appCheckpoint runs PRAGMA wal_checkpoint(<mode>) on appWrite under writeMu.
@@ -143,45 +143,46 @@ func (n *Node) metaCheckpoint(_ context.Context, mode string, underFence func(ho
 }
 
 // encodeBaselines pins the node and encodes metadata.db (always) plus
-// app.db (when includeApp). Caller owns snap.Close on success; on
-// error snap is already closed.
-func (n *Node) encodeBaselines(ctx context.Context, txid uint64, includeApp bool) (*pinnedSnapshot, []byte, []byte, error) {
+// app.db (when includeApp), each with its seeded checksum state.
+// Caller owns snap.Close on success; on error snap is already closed.
+func (n *Node) encodeBaselines(ctx context.Context, txid uint64, includeApp bool) (*pinnedSnapshot, publisher.EncodedBaseline, publisher.EncodedBaseline, error) {
+	var app, meta publisher.EncodedBaseline
 	snap, err := n.snapshotPinned(ctx)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, app, meta, err
 	}
 	metaPath, appPath, err := snap.bundle.Files()
 	if err != nil {
 		snap.Close()
-		return nil, nil, nil, fmt.Errorf("read staged backups: %w", err)
+		return nil, app, meta, fmt.Errorf("read staged backups: %w", err)
 	}
 	// Never encode a baseline whose page 1 is not a SQLite header: a
 	// corrupted staged copy must fail here, not propagate to the bucket.
 	if err := verifyDBHeader(metaPath); err != nil {
 		snap.Close()
-		return nil, nil, nil, fmt.Errorf("staged meta baseline: %w", err)
+		return nil, app, meta, fmt.Errorf("staged meta baseline: %w", err)
 	}
 	if includeApp {
 		if err := verifyDBHeader(appPath); err != nil {
 			snap.Close()
-			return nil, nil, nil, fmt.Errorf("staged app baseline: %w", err)
+			return nil, app, meta, fmt.Errorf("staged app baseline: %w", err)
 		}
 	}
 	var metaBuf bytes.Buffer
-	if _, err := ltxstream.EncodeBaseline(ctx, &metaBuf, metaPath, txid); err != nil {
+	if _, meta.Checksums, err = ltxstream.EncodeBaseline(ctx, &metaBuf, metaPath, txid); err != nil {
 		snap.Close()
-		return nil, nil, nil, fmt.Errorf("encode meta baseline: %w", err)
+		return nil, app, meta, fmt.Errorf("encode meta baseline: %w", err)
 	}
-	var appLTX []byte
+	meta.LTX = metaBuf.Bytes()
 	if includeApp {
 		var appBuf bytes.Buffer
-		if _, err := ltxstream.EncodeBaseline(ctx, &appBuf, appPath, txid); err != nil {
+		if _, app.Checksums, err = ltxstream.EncodeBaseline(ctx, &appBuf, appPath, txid); err != nil {
 			snap.Close()
-			return nil, nil, nil, fmt.Errorf("encode app baseline: %w", err)
+			return nil, app, meta, fmt.Errorf("encode app baseline: %w", err)
 		}
-		appLTX = appBuf.Bytes()
+		app.LTX = appBuf.Bytes()
 	}
-	return snap, appLTX, metaBuf.Bytes(), nil
+	return snap, app, meta, nil
 }
 
 // PublisherStats returns a snapshot of the publisher's local state.

@@ -120,10 +120,10 @@ func snapshotCmd(args []string) error {
 		}
 
 		var appBuf, metaBuf bytes.Buffer
-		if _, err := ltxstream.EncodeBaseline(opCtx, &appBuf, stagedApp, txid); err != nil {
+		if _, _, err := ltxstream.EncodeBaseline(opCtx, &appBuf, stagedApp, txid); err != nil {
 			return fmt.Errorf("encode app baseline LTX: %w", err)
 		}
-		if _, err := ltxstream.EncodeBaseline(opCtx, &metaBuf, stagedMeta, txid); err != nil {
+		if _, _, err := ltxstream.EncodeBaseline(opCtx, &metaBuf, stagedMeta, txid); err != nil {
 			return fmt.Errorf("encode meta baseline LTX: %w", err)
 		}
 		if err := reservation.PublishCoupledBaselines(opCtx, txid, appBuf.Bytes(), metaBuf.Bytes()); err != nil {

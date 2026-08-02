@@ -1,8 +1,11 @@
 // Package ltxstream tails a SQLite WAL and emits LTX files describing
-// committed transactions' dirty pages. LTX is encoded with
-// HeaderFlagNoChecksum (matching Litestream); per-LTX integrity comes
-// from the trailer's FileChecksum, and per-frame integrity from the
-// SQLite WAL checksum chain that WALReader validates as it reads.
+// committed transactions' dirty pages. Per-LTX integrity comes from
+// the trailer's FileChecksum, and per-frame integrity from the SQLite
+// WAL checksum chain that WALReader validates as it reads. When a
+// ChecksumState is installed (seeded by EncodeBaseline), emitted LTX
+// additionally carries pre/post-apply database checksums so a restorer
+// can verify the materialized database against the chain; without one
+// the header carries HeaderFlagNoChecksum.
 //
 // Concept of operations:
 //   - Tailer is a passive consumer of the WAL file; it does not write
@@ -69,9 +72,13 @@ type OnLTXFunc func(ctx context.Context, header ltx.Header, body []byte) error
 // fresh baseline LTX for this stream so the chain has a new anchor,
 // and return the Position the tailer should resume from (typically a
 // zero-Offset Position that primes a fresh-WAL-header read on next
-// Sync). Returning an error logs and re-tries on the next tick with
+// Sync) plus the checksum state seeded from that baseline (nil keeps
+// the current state). Position and state are adopted together under
+// the tailer lock: a baseline-seeded state is only sound if no frame
+// is consumed between the states it covers and the position it pairs
+// with. Returning an error logs and re-tries on the next tick with
 // the existing (broken) position.
-type OnRecycleFunc func(ctx context.Context) (Position, error)
+type OnRecycleFunc func(ctx context.Context) (Position, *ChecksumState, error)
 
 // Config tunes a Tailer.
 type Config struct {
@@ -101,6 +108,11 @@ type Tailer struct {
 	// a coordinated checkpoint's SetPosition.
 	mu  sync.Mutex
 	pos Position
+	// ck, when set, supplies pre/post-apply checksums for emitted LTX.
+	// Seeded from the latest baseline encode; nil until installed (or
+	// after a page-size mismatch drops it), in which case LTX is
+	// emitted with HeaderFlagNoChecksum.
+	ck *ChecksumState
 
 	// successfulSyncs is a lock-independent liveness signal for callers that
 	// supervise the tailer. Every public Sync pass that returns nil advances it,
@@ -145,6 +157,20 @@ func (t *Tailer) SetPosition(pos Position) {
 	t.mu.Unlock()
 }
 
+// SetChecksumState installs the checksum state emitted LTX chains
+// from. Only sound BEFORE the tailer's first Sync: a baseline-seeded
+// state covers everything up to its pin, so it must not replace a
+// live state after the tailer has consumed frames — commits emitted
+// between the pin and the install would vanish from the tracked
+// state and every later attestation would be wrong. Mid-life state
+// swaps ride the OnRecycle return instead, atomically with the
+// position reset.
+func (t *Tailer) SetChecksumState(s *ChecksumState) {
+	t.mu.Lock()
+	t.ck = s
+	t.mu.Unlock()
+}
+
 // SuccessfulSyncs returns the number of public Sync passes that completed
 // successfully. The counter advances for idle passes as well as passes that
 // emit LTX, so it reports executor liveness rather than write activity.
@@ -165,11 +191,14 @@ func (t *Tailer) Run(ctx context.Context) error {
 		if err != nil && ctx.Err() == nil {
 			var pre *PrevFrameMismatchError
 			if errors.As(err, &pre) && t.cfg.OnRecycle != nil {
-				if pos, rerr := t.cfg.OnRecycle(ctx); rerr != nil {
+				if pos, ck, rerr := t.cfg.OnRecycle(ctx); rerr != nil {
 					t.cfg.Logger.Warn("ltxstream recycle: rebaseline failed", "err", rerr)
 				} else {
 					t.mu.Lock()
 					t.pos = pos
+					if ck != nil {
+						t.ck = ck
+					}
 					t.mu.Unlock()
 					t.cfg.Logger.Info("ltxstream recycle: rebaselined", "txid", pos.TXID)
 				}
@@ -562,7 +591,10 @@ func (t *Tailer) syncFrom(ctx context.Context, pos Position, expect *walGen) err
 		// All committed frames were for pages truncated by the same
 		// or a later commit in the batch. Treat as a no-op LTX:
 		// advance pos so we don't re-read these frames, but emit
-		// nothing.
+		// nothing. The checksum state must still absorb the shrink.
+		if t.ck != nil {
+			t.ck.Stage(nil, lastCommit).Commit()
+		}
 		pos.FrameN += committedFrames
 		pos.Offset = lastNextOffset
 		pos.Chksum1, pos.Chksum2 = lastChksum1, lastChksum2
@@ -579,21 +611,39 @@ func (t *Tailer) syncFrom(ctx context.Context, pos Position, expect *walGen) err
 		lastTXID = t.cfg.NextTXID()
 	}
 
+	if t.ck != nil && t.ck.PageSize() != pageSize {
+		// A page-size change means the state was seeded from a
+		// different database geometry; its checksums would be wrong.
+		// Drop it — emissions degrade to NoChecksum until the next
+		// baseline installs a fresh state.
+		t.cfg.Logger.Warn("ltxstream: checksum state page size mismatch; dropping state",
+			"state_page_size", t.ck.PageSize(), "wal_page_size", pageSize)
+		t.ck = nil
+	}
 	var body bytes.Buffer
+	var att StagedChecksums
 	hdr := ltx.Header{
 		Version:   ltx.Version,
-		Flags:     ltx.HeaderFlagNoChecksum,
 		PageSize:  pageSize,
 		Commit:    lastCommit,
 		MinTXID:   ltx.TXID(firstTXID),
 		MaxTXID:   ltx.TXID(lastTXID),
 		Timestamp: time.Now().UnixMilli(),
 	}
-	if err := EncodeIncremental(ctx, &body, pageMap, pageSize, lastCommit, firstTXID, lastTXID); err != nil {
+	if t.ck != nil {
+		att = t.ck.Stage(pageMap, lastCommit)
+		hdr.PreApplyChecksum = att.Pre
+	} else {
+		hdr.Flags = ltx.HeaderFlagNoChecksum
+	}
+	if err := EncodeIncremental(ctx, &body, pageMap, hdr, att.Post); err != nil {
 		return fmt.Errorf("encode ltx [%d..%d]: %w", firstTXID, lastTXID, err)
 	}
 	if err := t.cfg.OnLTX(ctx, hdr, body.Bytes()); err != nil {
 		return fmt.Errorf("onLTX [%d..%d]: %w", firstTXID, lastTXID, err)
+	}
+	if t.ck != nil {
+		att.Commit()
 	}
 
 	// Advance position only after OnLTX accepted; if it failed, the

@@ -62,12 +62,14 @@
 //
 // # Litestream compatibility
 //
-// db/<level>/<min>-<max>.ltx matches Litestream's S3 path convention,
-// and our LTX is encoded with HeaderFlagNoChecksum (matching what
-// Litestream writes — necessary for Litestream's restore-side compactor
-// to validate the merged output). `litestream restore` pointed at a
-// syzy bucket produces a valid app.db; metadata.db is syzy-specific and
-// not recovered by Litestream tooling — the eject hatch is one-way.
+// db/<level>/<min>-<max>.ltx matches Litestream's S3 path convention.
+// LTX is encoded with the format's native pre/post-apply checksums
+// whenever the publisher holds a baseline-seeded checksum state
+// (objects written before that shipped carry HeaderFlagNoChecksum and
+// are still restored, unverified beyond their FileChecksum).
+// `litestream restore` pointed at a syzy bucket produces a valid
+// app.db; metadata.db is syzy-specific and not recovered by Litestream
+// tooling — the eject hatch is one-way.
 //
 // Object key helpers below are pure functions; nothing in this file
 // touches the network.

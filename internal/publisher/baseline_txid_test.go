@@ -82,12 +82,12 @@ func TestMetaBaselineTXIDOvertakesMetaCounter(t *testing.T) {
 		WALPath:     walPath,
 		MetaWALPath: walPath,
 		// Resume takes a coupled baseline; observe its TXID there.
-		Baseline: func(_ context.Context, txid uint64) ([]byte, []byte, func(), error) {
+		Baseline: func(_ context.Context, txid uint64) (publisher.EncodedBaseline, publisher.EncodedBaseline, func(), error) {
 			observedBaselineTXID.Store(txid)
-			return []byte("app-baseline"), []byte("meta-baseline"), func() {}, nil
+			return publisher.EncodedBaseline{LTX: []byte("app-baseline")}, publisher.EncodedBaseline{LTX: []byte("meta-baseline")}, func() {}, nil
 		},
-		MetaBaseline: func(_ context.Context, txid uint64) ([]byte, func(), error) {
-			return []byte("meta-baseline"), func() {}, nil
+		MetaBaseline: func(_ context.Context, txid uint64) (publisher.EncodedBaseline, func(), error) {
+			return publisher.EncodedBaseline{LTX: []byte("meta-baseline")}, func() {}, nil
 		},
 		HeartbeatInterval: 10 * time.Millisecond,
 		LeaseExpiry:       100 * time.Millisecond,
