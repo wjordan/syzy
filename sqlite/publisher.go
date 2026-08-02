@@ -56,8 +56,8 @@ func (n *Node) startPublisher() error {
 	return nil
 }
 
-// publisherBaseline is the Node-side BaselineFunc: takes a writer-
-// barrier-pin, encodes both app.db and metadata.db as snapshot LTXes
+// publisherBaseline is the Node-side BaselineFunc: takes a writer-barrier
+// capture, encodes both app.db and metadata.db as snapshot LTXes
 // stamped with MaxTXID=txid (allocated by the publisher before this
 // call). Used on initial claim, lease takeover, and rebaseline.
 func (n *Node) publisherBaseline(ctx context.Context, txid uint64) ([]byte, []byte, func(), error) {
@@ -126,7 +126,7 @@ func (n *Node) encodeBaselines(ctx context.Context, txid uint64, includeApp bool
 	metaPath, appPath, err := snap.bundle.Files()
 	if err != nil {
 		snap.Close()
-		return nil, nil, nil, fmt.Errorf("drain pinned backups: %w", err)
+		return nil, nil, nil, fmt.Errorf("read staged backups: %w", err)
 	}
 	var metaBuf bytes.Buffer
 	if _, err := ltxstream.EncodeBaseline(ctx, &metaBuf, metaPath, txid); err != nil {

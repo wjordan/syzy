@@ -186,15 +186,12 @@ func backupTo(dstPath, srcPath string) error {
 	return nil
 }
 
-// pinnedBackup holds an open sqlite3_backup whose source-side read
-// transaction has been pinned via at least one backup_step. Subsequent
-// backup_step calls stream pages from the pinned snapshot in WAL mode;
-// concurrent writers append to the WAL but do not invalidate the snapshot.
+// pinnedBackup holds an sqlite3_backup and its staged destination. SQLite's
+// backup API does not retain a source snapshot between backup_step calls: a
+// source write can restart the backup and appear in later steps. The caller
+// must therefore finish both backups before releasing its writer barrier.
 //
-// startPinnedBackup must be called inside a writer barrier so the
-// "first step opens read tx" moment lands on a known commit boundary.
-// finishPinnedBackup drains remaining pages and is safe to call after
-// the barrier has been released.
+// startPinnedBackup and finish must both run inside the writer barrier.
 type pinnedBackup struct {
 	name    string
 	src     *sqlitebridge.Conn
@@ -230,9 +227,9 @@ func startPinnedBackup(name, srcPath string) (*pinnedBackup, error) {
 	if err != nil {
 		return nil, fmt.Errorf("clone: backup_init %s: %w", name, err)
 	}
-	// First step opens the read transaction on the source. EOF on a
-	// tiny database is fine — the snapshot is still established and
-	// finishPinnedBackup will be a no-op.
+	// Copy one page before returning the initialized handle. PinSnapshots
+	// immediately drains the rest while its caller still holds the writer
+	// barrier. EOF on a tiny database is fine; finish will be a no-op.
 	if err := pb.bk.Step(1); err != nil && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("clone: backup_step(1) %s: %w", name, err)
 	}
@@ -296,26 +293,25 @@ func (pb *pinnedBackup) close() {
 	}
 }
 
-// PinnedBundle holds the two pinned backup snapshots that make up one
+// PinnedBundle holds the two staged backup snapshots that make up one
 // consistent bundle: metadata.db (CRDT metadata) and app.db (user data).
-// Both are pinned to the same logical commit boundary, established by
-// the writer barrier the caller holds across PinSnapshots.
+// Both are copied to completion at the same logical commit boundary while
+// the caller holds its writer barrier across PinSnapshots.
 //
-// Construct with PinSnapshots inside the barrier; release the barrier
-// before calling Stream so concurrent writers can resume while the
-// rest of the pages are copied. Close releases resources without
-// producing wire output (use on error paths).
+// Construct with PinSnapshots inside the barrier. Stream only frames the
+// already-staged files, so the barrier may be released before it runs. Close
+// releases resources without producing wire output (use on error paths).
 type PinnedBundle struct {
 	cluster *pinnedBackup
 	app     *pinnedBackup
 }
 
-// PinSnapshots opens backup handles over metadata.db and app.db at
-// srcAppDB and runs one backup_step on each, pinning a WAL read
-// transaction on both source databases. Caller must hold a WAL writer
-// barrier across this call (see syzy.Node.ServeBundle for the
-// orchestrator) so the two pins reflect the same logical commit
-// boundary.
+// PinSnapshots copies metadata.db and app.db at srcAppDB to staged files.
+// Caller must hold a WAL writer barrier across this call (see
+// syzy.Node.ServeBundle for the orchestrator) so both completed copies reflect
+// the same logical commit boundary. Copying only an initial page here and
+// draining later is unsafe: sqlite3_backup follows source writes between
+// backup_step calls instead of retaining the first step's snapshot.
 //
 // On error, no resources are leaked.
 func PinSnapshots(srcAppDB string) (*PinnedBundle, error) {
@@ -336,13 +332,21 @@ func PinSnapshots(srcAppDB string) (*PinnedBundle, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Drain both backups before returning to the caller, which releases the
+	// writer barrier immediately after this function. finish is idempotent;
+	// Files later returns these staged paths without touching the sources.
+	if _, err = pb.cluster.finish(); err != nil {
+		return nil, err
+	}
+	if _, err = pb.app.finish(); err != nil {
+		return nil, err
+	}
 	ok = true
 	return pb, nil
 }
 
-// Files drains the two pinned backups to completion and returns the
-// staged temp file paths for the metadata.db and app.db copies. The
-// caller must invoke Close on the PinnedBundle after consuming the
+// Files returns the staged temp file paths for the metadata.db and app.db
+// copies. The caller must invoke Close on the PinnedBundle after consuming the
 // files (typically via defer); Close removes the temp files.
 //
 // Callable exactly once; consumes the pinned backup state. After
@@ -362,8 +366,8 @@ func (pb *PinnedBundle) Files() (metaPath, appPath string, err error) {
 	return metaPath, appPath, nil
 }
 
-// Stream drains the two pinned backups to completion, then writes the
-// bundle wire format to w. Frees all held SQLite resources before
+// Stream writes the two staged backups in the bundle wire format to w.
+// Frees all held SQLite resources before
 // returning (success or error). Callable exactly once.
 func (pb *PinnedBundle) Stream(w io.Writer) error {
 	if pb == nil || pb.cluster == nil || pb.app == nil {

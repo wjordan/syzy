@@ -31,7 +31,7 @@ type pinTimings struct {
 	BarrierAcq    time.Duration // sqlite open + BEGIN IMMEDIATE
 	TailDrain     time.Duration // inside barrier
 	SnapshotFlush time.Duration // SnapshotOnce → metadata.db
-	PinInit       time.Duration // backup_init + step(1) on both DBs
+	PinInit       time.Duration // full backup copies; name retained for log compatibility
 	BarrierRel    time.Duration // closeWriterBarrier
 }
 
@@ -53,11 +53,11 @@ func (s *pinnedSnapshot) Close() {
 	}
 }
 
-// snapshotPinned takes n.writeMu and runs the barrier-pin protocol.
+// snapshotPinned takes n.writeMu and runs the barrier-copy protocol.
 // It is the public-API surface for callers (PublishSnapshot) that do
-// not need writeMu held for the byte-drain phase. ServeBundle holds
-// writeMu through Stream itself, so it uses snapshotPinnedLocked
-// directly.
+// not need writeMu held while staged bytes are encoded and uploaded.
+// ServeBundle holds writeMu through Stream itself, so it uses
+// snapshotPinnedLocked directly.
 func (n *Node) snapshotPinned(ctx context.Context) (*pinnedSnapshot, error) {
 	n.writeMu.Lock()
 	defer n.writeMu.Unlock()
@@ -77,15 +77,13 @@ func (n *Node) snapshotPinned(ctx context.Context) (*pinnedSnapshot, error) {
 //     pre-drain and barrier acquisition. Converges quickly because
 //     the barrier has frozen all journal heads.
 //  4. Flush the cache to metadata.db (Snapshotter.SnapshotOnce).
-//  5. Pin sqlite3_backup reads on metadata.db and app.db (one
-//     backup_step each, opening read transactions on both).
+//  5. Copy metadata.db and app.db to staged files with sqlite3_backup,
+//     finishing both copies while the writer barrier is still held.
 //  6. Release the barrier. Concurrent app.db writers (gated only by
-//     the WAL slot, not by writeMu) resume; the pinned read txns
-//     survive new commits.
+//     the WAL slot, not by writeMu) resume; the staged files are immutable.
 //
-// On success, the returned pinnedSnapshot holds backup handles whose
-// remaining bytes can be drained later (via bundle.Stream or
-// bundle.Files). Caller must Close.
+// On success, the returned pinnedSnapshot holds completed staged copies that
+// can be encoded later via bundle.Stream or bundle.Files. Caller must Close.
 func (n *Node) snapshotPinnedLocked(ctx context.Context) (*pinnedSnapshot, error) {
 	var t pinTimings
 	mark := time.Now()
@@ -123,7 +121,7 @@ func (n *Node) snapshotPinnedLocked(ctx context.Context) (*pinnedSnapshot, error
 
 	pb, err := clone.PinSnapshots(n.appPath)
 	if err != nil {
-		return nil, fmt.Errorf("syzy: pin snapshots: %w", err)
+		return nil, fmt.Errorf("syzy: stage snapshots: %w", err)
 	}
 	t.PinInit = time.Since(mark)
 	mark = time.Now()
@@ -146,10 +144,9 @@ func (n *Node) snapshotPinnedLocked(ctx context.Context) (*pinnedSnapshot, error
 		slog.Duration("barrier_rel", t.BarrierRel),
 	)
 
-	// Capture metadata. After barrier release, additional commits may
-	// land on app.db, but the pinned read txns inside pb were opened
-	// inside the barrier and survive concurrent commits. The cache's
-	// FrontierMap and the metadata's schema_seq advanced contiguously
+	// Capture metadata. After barrier release, additional commits may land on
+	// app.db, but pb contains complete copies made inside the barrier. The
+	// cache's FrontierMap and the metadata's schema_seq advanced contiguously
 	// up to the same boundary.
 	frontier := n.cache.FrontierMap()
 	schemaSeq, _, err := n.meta.GetSchemaSeq()
@@ -171,11 +168,10 @@ func (n *Node) snapshotPinnedLocked(ctx context.Context) (*pinnedSnapshot, error
 // bootstrap from this one with `syzy clone tcp://here:port new.db`.
 // See ARCHITECTURE.md "Bootstrap & Repair" for the protocol.
 //
-// Holds n.writeMu for the entire call: the barrier-pin orchestration
-// AND the byte streaming. Holding writeMu through Stream prevents
-// Node.Exec writes from racing with the pinned reads' WAL backing
-// (PinSnapshots' read txns survive new commits, but the app's writer
-// pipeline still sees a paused appearance).
+// Holds n.writeMu for the entire call: the barrier-copy orchestration and byte
+// streaming. The staged copies no longer depend on the source WAL after the
+// barrier is released; retaining the lock through Stream preserves the clone
+// path's existing serialization with Node lifecycle operations.
 //
 // Returns ErrClosed if Close has begun: the transport's bundle
 // handler may fire after Close on a quiescing node, and dereferencing
@@ -216,13 +212,12 @@ func (n *Node) ServeBundle(w io.Writer) error {
 //
 // Errors with ErrNoObjectBackend if Config.ObjectBackend was nil.
 //
-// Holds n.writeMu only across the writer-barrier-pin window
-// (snapshotPinnedLocked). Once the pin is established, writeMu is
-// released and the bundle drain + object upload + HEAD CAS run free of
-// the lock — they only touch the pinned bundle's independent
-// SQLite conns and immutable Node state (objectBackend, clusterID).
+// Holds n.writeMu only across the writer-barrier-copy window
+// (snapshotPinnedLocked). Once the copies are staged, writeMu is released and
+// encoding + object upload + HEAD CAS run free of the lock — they only touch
+// the staged bundle and immutable Node state (objectBackend, clusterID).
 // Concurrent Node.Exec / db.BeginTx callers therefore block only
-// for the brief barrier-pin phase, not for the duration of the S3
+// for the barrier-copy phase, not for the duration of the S3
 // round-trip.
 func (n *Node) PublishSnapshot(ctx context.Context) error {
 	if n.objectBackend == nil {
@@ -270,7 +265,7 @@ func (n *Node) PublishSnapshot(ctx context.Context) error {
 		filesDur = time.Since(tFiles)
 		if err != nil {
 			snap.Close()
-			return nil, nil, nil, fmt.Errorf("syzy: drain pinned backups: %w", err)
+			return nil, nil, nil, fmt.Errorf("syzy: read staged backups: %w", err)
 		}
 		tUpload = time.Now()
 		var appBuf, metaBuf bytes.Buffer

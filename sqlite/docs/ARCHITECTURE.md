@@ -1283,9 +1283,8 @@ state in the receiver's `app.db`:
   *deduplicates* peer rebroadcasts of those rows. Permanent silent data
   loss.
 
-Both directions are unsafe. The fix is a brief writer-barrier window on
-the source that pins read snapshots on both files at the same logical
-commit boundary.
+Both directions are unsafe. The fix is a writer-barrier window on the source
+that copies both files to completion at the same logical commit boundary.
 
 #### Live clone (tcp://): the writer-barrier protocol
 
@@ -1312,35 +1311,30 @@ a consistent snapshot without a long writer pause:
 4. **Flush the cache to `metadata.db`.** `Snapshotter.SnapshotOnce()` —
    incremental, scales with dirty rows since the last periodic snapshot,
    not with cache size.
-5. **Pin both backup snapshots.** Open `sqlite3_backup_init` on
+5. **Copy both backup snapshots.** Open `sqlite3_backup_init` on
    `metadata.db` and on `app.db` (each through its own fresh source
-   connection) and run *one* `backup_step` on each. In WAL mode that
-   first step opens a read transaction pinned to the current
-   `wal-index` head; subsequent steps stream pages from that snapshot
-   without re-acquiring a read tx.
+   connection), and run both backups to completion while the barrier remains
+   held. A partial `sqlite3_backup` is not a durable snapshot boundary:
+   source writes between `backup_step` calls can restart the backup and appear
+   in later steps.
 6. **Release the barrier.** `COMMIT` on the writer connection.
-   Concurrent writers proceed. The pinned read transactions hold their
-   snapshots until `backup_finish`; new commits append to the WAL but
-   don't invalidate the snapshots (PASSIVE checkpoints don't overwrite
-   pages held by readers).
-7. **Stream the rest.** Run `backup_step` to completion on both
-   handles. The bundle wire format is emitted as
+   Concurrent writers proceed. The completed staged files are independent of
+   subsequent source writes and checkpoints.
+7. **Stream the staged files.** The bundle wire format is emitted as
    `magic | version | (metadata.db) | (app.db)` regardless of how the
    pages were copied.
 
-The held window is bounded by `tail-drain + SnapshotOnce + 2×
-backup_step(1 page)` — typically sub-millisecond, since the bulk
-drain is amortized in step 1 outside the barrier. The pathological
-case (large in-flight commit backlog or unusually large `dirtyRows`)
-is still tens of ms at most; well under any sane `busy_timeout`.
-There is no source-side intent record persisted — the barrier is
-implicit in the SQLite WAL writer slot, not in the intent slots.
+The held window is bounded by `tail-drain + SnapshotOnce + two complete local
+SQLite backups`. The copy cost scales with the database sizes, so baseline
+creation can pause writers longer than the old partial-copy scheme. This is a
+deliberate correctness tradeoff: publishing a mixed physical image can make a
+cold restore unrecoverable. The bulk journal drain is still amortized in step
+1 outside the barrier, and object encoding/upload happens after release. There
+is no source-side intent record persisted — the barrier is implicit in the
+SQLite WAL writer slot, not in the intent slots.
 
-While the bundle streams, the source's WAL grows with new commits
-because the pinned read transactions block checkpoint truncation.
-Steady-state catches up after `backup_finish`. Operators cloning a
-large database against a busy source should expect transient WAL
-growth on the source for the duration of the stream.
+Streaming does not hold source read transactions and therefore does not pin
+the source WAL. The staged files are removed when the bundle is closed.
 
 #### Clone installation (receiver)
 
