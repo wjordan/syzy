@@ -9,6 +9,8 @@
 //   - package renamed
 //   - logger replaced with log/slog (no internal/hexdump dep)
 //   - dropped Hexdump-on-failure debug helper (not load-bearing)
+//   - dropped the header checkpoint-sequence field (per-connection
+//     counter; useless for cross-connection restart accounting)
 package ltxstream
 
 import (
@@ -40,7 +42,6 @@ type WALReader struct {
 
 	bo       binary.ByteOrder
 	pageSize uint32
-	seq      uint32
 
 	salt1, salt2     uint32
 	chksum1, chksum2 uint32
@@ -76,7 +77,17 @@ func NewWALReaderWithOffset(ctx context.Context, rd io.ReaderAt, offset int64, s
 	if err := r.readHeader(); err != nil {
 		return nil, fmt.Errorf("read header: %w", err)
 	}
-	r.salt1, r.salt2 = salt1, salt2
+	// The live header salt is rewritten whenever SQLite restarts the WAL in
+	// place (walRestartHdr): frames resume from offset 32 under fresh salts
+	// while stale prior-generation frames — including the one at offset —
+	// remain on disk and still match the saved salts. Comparing only the
+	// frame at offset would miss that restart and silently drop every
+	// new-generation commit below the saved position.
+	if r.salt1 != salt1 || r.salt2 != salt2 {
+		return nil, &PrevFrameMismatchError{Err: fmt.Errorf(
+			"wal header salt %08x-%08x differs from saved %08x-%08x: wal restarted below saved offset",
+			r.salt1, r.salt2, salt1, salt2)}
+	}
 
 	frameSize := int64(r.pageSize + WALFrameHeaderSize)
 	if (offset-WALHeaderSize)%frameSize != 0 {
@@ -94,6 +105,11 @@ func NewWALReaderWithOffset(ctx context.Context, rd io.ReaderAt, offset int64, s
 	return r, nil
 }
 
+// PageSize, Salt1, Salt2 expose the parsed WAL header fields. Salt1 counts
+// generation transitions: walRestartHdr sets it to exactly old+1 through the
+// shared wal-index header. (The header's checkpoint-sequence field does not:
+// SQLite writes it from a per-connection counter that goes stale across
+// restarts made by other connections.)
 func (r *WALReader) PageSize() uint32 { return r.pageSize }
 func (r *WALReader) Salt1() uint32    { return r.salt1 }
 func (r *WALReader) Salt2() uint32    { return r.salt2 }
@@ -152,7 +168,6 @@ func (r *WALReader) readHeader() error {
 	}
 
 	r.pageSize = binary.BigEndian.Uint32(hdr[8:])
-	r.seq = binary.BigEndian.Uint32(hdr[12:])
 	r.salt1 = binary.BigEndian.Uint32(hdr[16:])
 	r.salt2 = binary.BigEndian.Uint32(hdr[20:])
 	r.chksum1, r.chksum2 = chksum1, chksum2

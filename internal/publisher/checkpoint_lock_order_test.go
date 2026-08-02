@@ -33,18 +33,19 @@ func TestCheckpointStreamWriterFencePrecedesTailer(t *testing.T) {
 	p.app = stream{
 		label:  "app",
 		tailer: tailer,
-		fence: func(_ context.Context, _ string, underFence func(checkpoint func() error) error) error {
+		fence: func(_ context.Context, _ string, underFence func(hooks ltxstream.CheckpointHooks) error) error {
 			signalOnce.Do(func() { close(fenceAttempted) })
 			writerFence.Lock()
 			defer writerFence.Unlock()
-			checkpoint := func() error {
+			hooks := fakeCheckpointHooks(func() error {
 				checkpointCalled = true
 				return nil
-			}
+			})
 			if underFence != nil {
-				return underFence(checkpoint)
+				return underFence(hooks)
 			}
-			return checkpoint()
+			_, err := hooks.Checkpoint()
+			return err
 		},
 	}
 
@@ -97,8 +98,8 @@ func TestCheckpointStreamDoesNotCreateHeartbeatProof(t *testing.T) {
 	p.app = stream{
 		label:  "app",
 		tailer: tailer,
-		fence: func(_ context.Context, _ string, underFence func(func() error) error) error {
-			return underFence(func() error { return nil })
+		fence: func(_ context.Context, _ string, underFence func(ltxstream.CheckpointHooks) error) error {
+			return underFence(fakeCheckpointHooks(func() error { return nil }))
 		},
 	}
 	if err := p.checkpointStream(context.Background(), &p.app); err != nil {
@@ -106,5 +107,15 @@ func TestCheckpointStreamDoesNotCreateHeartbeatProof(t *testing.T) {
 	}
 	if got := tailer.SuccessfulSyncs(); got != 0 {
 		t.Fatalf("coordinated checkpoint created %d heartbeat proofs", got)
+	}
+}
+
+// fakeCheckpointHooks adapts a bare checkpoint func into CheckpointHooks for
+// fakes that have no real database: empty-WAL checkpoint result, no-op
+// recycle.
+func fakeCheckpointHooks(checkpoint func() error) ltxstream.CheckpointHooks {
+	return ltxstream.CheckpointHooks{
+		Checkpoint: func() (ltxstream.CheckpointResult, error) { return ltxstream.CheckpointResult{}, checkpoint() },
+		Recycle:    func(func() error) (int64, error) { return 0, nil },
 	}
 }

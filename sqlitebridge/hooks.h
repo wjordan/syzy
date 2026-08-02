@@ -31,8 +31,15 @@ typedef struct syzy_conn_state {
 	// receiver's ensureBlobLen rederives the trailing zero extension).
 	// Counter (not bool) to nest safely.
 	int suppress_dml_capture;
+	// wal_checkpoint_threshold overrides the WAL frame count at which
+	// the wal_hook trampolines run their backstop PASSIVE checkpoint.
+	// 0 selects the built-in default; negative disables the backstop
+	// (the embedder owns WAL bounding).
+	int wal_checkpoint_threshold;
 	uintptr_t hook_handle;
 } syzy_conn_state;
+
+void syzy_set_wal_checkpoint_threshold(syzy_conn_state *s, int n);
 
 syzy_conn_state *syzy_state_new(void);
 void syzy_state_free(syzy_conn_state *s);

@@ -80,28 +80,38 @@ func (n *Node) publisherMetaBaseline(ctx context.Context, txid uint64) ([]byte, 
 
 // appCheckpoint runs PRAGMA wal_checkpoint(<mode>) on appWrite under writeMu.
 // underFence runs after writeMu is acquired and receives the checkpoint
-// operation, allowing the publisher to acquire the app tailer only after the
-// writer fence and keep its last drain, checkpoint, and position reset atomic.
-func (n *Node) appCheckpoint(_ context.Context, mode string, underFence func(checkpoint func() error) error) error {
+// hooks (Recycle is sqlitebridge.RecycleCommit on appWrite), allowing the
+// publisher to acquire the app tailer only after this serialization and
+// keep its last drain, checkpoint, and position reset atomic.
+func (n *Node) appCheckpoint(_ context.Context, mode string, underFence func(hooks ltxstream.CheckpointHooks) error) error {
 	n.writeMu.Lock()
 	defer n.writeMu.Unlock()
 	if n.writerDB == nil {
 		return ErrClosed
 	}
-	checkpoint := func() error {
-		_, err := n.writerDB.Exec(fmt.Sprintf(`PRAGMA wal_checkpoint(%s)`, mode))
+	checkpoint := func() (ltxstream.CheckpointResult, error) {
+		var busy, nLog, nCkpt int64
+		if err := n.writerDB.QueryRow(fmt.Sprintf(`PRAGMA wal_checkpoint(%s)`, mode)).Scan(&busy, &nLog, &nCkpt); err != nil {
+			return ltxstream.CheckpointResult{}, err
+		}
+		return ltxstream.CheckpointResult{Busy: busy != 0, NLog: nLog, NCkpt: nCkpt}, nil
+	}
+	if underFence == nil {
+		_, err := checkpoint()
 		return err
 	}
-	if underFence != nil {
-		return underFence(checkpoint)
-	}
-	return checkpoint()
+	return underFence(ltxstream.CheckpointHooks{
+		Checkpoint: checkpoint,
+		// The bracket runs directly on appWrite (the single conn behind
+		// writerDB); writeMu serializes all writers around it.
+		Recycle: n.appWrite.RecycleCommit,
+	})
 }
 
 // metaCheckpoint composes Store.Checkpoint: the metadata connection's
 // wal_checkpoint runs under Store.mu, before the under-fence hook acquires the
 // metadata tailer.
-func (n *Node) metaCheckpoint(_ context.Context, mode string, underFence func(checkpoint func() error) error) error {
+func (n *Node) metaCheckpoint(_ context.Context, mode string, underFence func(hooks ltxstream.CheckpointHooks) error) error {
 	return n.meta.Checkpoint(mode, underFence)
 }
 
@@ -156,16 +166,29 @@ func (n *Node) HoldsPublisherLease() bool {
 // the node has just become the publisher; not a real error.
 var errStandbyStandDown = errors.New("syzy: standby checkpoint stood down (now leading)")
 
-// runStandbyWALCheckpoint periodically TRUNCATE-checkpoints app.db while this
-// node is NOT the publisher. The publisher's own coordinated checkpoint loop
-// recycles the WAL while it leads; a standby has no such loop, so its physical
-// app.db-wal otherwise climbs to its busiest burst's high-water and never
-// shrinks until a restart. The checkpoint is data-safe: wal_checkpoint(TRUNCATE)
-// writes WAL frames into the DB before truncating, and a standby has no LTX
-// tailer whose unread frames it could strand. The under-fence hook re-checks
-// leadership under writeMu so a checkpoint can't slip in right after this node
-// wins the lease and starts its tailer.
+// runStandbyWALCheckpoint periodically TRUNCATE-checkpoints app.db and
+// metadata.db while this node is NOT the publisher. The publisher's own
+// coordinated checkpoint loop recycles both WALs while it leads; a standby
+// has no such loop, so its physical WALs otherwise climb to their busiest
+// burst's high-water and never shrink until a restart. The checkpoint is
+// data-safe: wal_checkpoint(TRUNCATE) writes WAL frames into the DB before
+// truncating, and a standby has no LTX tailer whose unread frames it could
+// strand. The under-fence hook re-checks leadership under the connection's
+// serialization so a checkpoint can't slip in right after this node wins the
+// lease and starts its tailers.
 func (n *Node) runStandbyWALCheckpoint(ctx context.Context, interval time.Duration) {
+	standDownOrCheckpoint := func(hooks ltxstream.CheckpointHooks) error {
+		if n.HoldsPublisherLease() {
+			return errStandbyStandDown
+		}
+		// No tailer to coordinate with on a standby: run the bare
+		// checkpoint.
+		res, err := hooks.Checkpoint()
+		if err == nil && res.Busy {
+			return ltxstream.ErrCheckpointBusy
+		}
+		return err
+	}
 	tick := time.NewTicker(interval)
 	defer tick.Stop()
 	for {
@@ -174,18 +197,17 @@ func (n *Node) runStandbyWALCheckpoint(ctx context.Context, interval time.Durati
 			return
 		case <-tick.C:
 			if n.HoldsPublisherLease() {
-				continue // publisher's coordinated checkpoint owns the WAL
+				continue // publisher's coordinated checkpoint owns the WALs
 			}
-			err := n.appCheckpoint(ctx, "TRUNCATE", func(checkpoint func() error) error {
-				if n.HoldsPublisherLease() {
-					return errStandbyStandDown
+			for label, fence := range map[string]publisher.CheckpointFunc{
+				"app": n.appCheckpoint, "meta": n.metaCheckpoint,
+			} {
+				err := fence(ctx, "TRUNCATE", standDownOrCheckpoint)
+				if err != nil && !errors.Is(err, errStandbyStandDown) {
+					// BUSY (an apply held the writer) or transient: retry
+					// next tick. Debug, not warn — it self-corrects.
+					n.log.Debug("standby WAL checkpoint", "stream", label, "err", err)
 				}
-				return checkpoint()
-			})
-			if err != nil && !errors.Is(err, errStandbyStandDown) {
-				// BUSY (an apply held the writer) or transient: retry next
-				// tick. Debug, not warn — it self-corrects.
-				n.log.Debug("standby WAL checkpoint", "err", err)
 			}
 		}
 	}

@@ -163,13 +163,25 @@ app.db-syzy/
 ```
 
 `app.db` must run in WAL mode. `syzy_open` enables WAL or fails clearly.
-Litestream-class WAL tailers and normal SQLite checkpointing remain
-compatible with `app.db`.
+Litestream-class WAL tailers remain compatible with `app.db`. When a
+publisher tails a database, it owns WAL recycling: the coordinated pass
+drains the tailer, verifies a PASSIVE checkpoint's frame counts, then runs
+the recycle write as one write transaction that revalidates the drained
+generation under SQLite's write lock before committing. SQLite restarts
+the fully-backfilled WAL inside that commit (truncated via
+`journal_size_limit=0`), and the commit's recorded frame count plus the
+header salts prove the outcome, because nothing can move between the
+validation and the commit (`ltxstream.CheckpointUnderLock` is the
+contract). Any uncoordinated restart is caught by that validation or the
+tailer's resume salt check and forces a loud rebaseline — safe, but not
+free — so auto-checkpointing on published databases is disabled (host
+writer) or demoted to a high emergency backstop (other openers).
 
 Metadata pragmas: `journal_mode=WAL`, `synchronous=NORMAL`,
-`wal_autocheckpoint=500`. The metadata holds the periodic snapshot of
-in-memory CRDT state and is not on the commit hot path; NORMAL is
-enough.
+`journal_size_limit=0`, and `wal_autocheckpoint` set to a high backstop
+threshold (the host process owns metadata WAL recycling; see above). The
+metadata holds the periodic snapshot of in-memory CRDT state and is not on
+the commit hot path; NORMAL is enough.
 
 The metadata schema keeps released columns as inert reserved fields until a
 coordinated file-format migration can rebuild the table. Removing a runtime
@@ -1924,12 +1936,13 @@ patches are documented in [BLOB_PATCH.md](BLOB_PATCH.md).
 - App-installed `preupdate`/`commit`/`rollback`/`wal`/`trace_v2` hooks on
   the writer silently disable replication (one hook each per connection;
   DDL capture uses `trace_v2`).
-- `wal_hook` install disables autocheckpoint on the writer conn (applier
-  goroutine checkpoints instead). `PRAGMA wal_autocheckpoint=N` on that
-  conn re-enables it and silently uninstalls our hook — don't. This is a
-  per-connection SQLite behavior; other connections may still checkpoint
-  `app.db` normally, and Litestream-style physical WAL backup remains
-  compatible.
+- `wal_hook` install disables autocheckpoint on the writer conn (the
+  trampoline's threshold checkpoint stands in, unless the embedder disables
+  it because a publisher owns WAL bounding). `PRAGMA wal_autocheckpoint=N`
+  on that conn re-enables SQLite's own hook and silently uninstalls ours —
+  don't. Other connections can still checkpoint `app.db`; on a published
+  database that forces a loud rebaseline (see the WAL recycle ownership
+  rule above).
 
 ### Operational
 

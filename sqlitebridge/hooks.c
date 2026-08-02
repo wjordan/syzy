@@ -351,11 +351,23 @@ static void syzy_tramp_preupdate(void *p, sqlite3 *db, int op,
 // in-flight WAL position.
 #define SYZY_WAL_CHECKPOINT_THRESHOLD 2000
 
+void syzy_set_wal_checkpoint_threshold(syzy_conn_state *s, int n) {
+	s->wal_checkpoint_threshold = n;
+}
+
+// syzy_wal_threshold resolves the per-conn override: 0 (the calloc
+// default) selects SYZY_WAL_CHECKPOINT_THRESHOLD, negative disables.
+static int syzy_wal_threshold(const syzy_conn_state *s) {
+	if (s->wal_checkpoint_threshold == 0) return SYZY_WAL_CHECKPOINT_THRESHOLD;
+	return s->wal_checkpoint_threshold;
+}
+
 static int syzy_tramp_wal(void *p, sqlite3 *db, const char *zDb, int nFrame) {
 	syzy_conn_state *s = (syzy_conn_state *)p;
 	int ret = 0;
+	int thr = syzy_wal_threshold(s);
 	syzyGoWALHook(s->hook_handle, db, zDb, nFrame, &ret);
-	if (ret == SQLITE_OK && nFrame >= SYZY_WAL_CHECKPOINT_THRESHOLD) {
+	if (ret == SQLITE_OK && thr > 0 && nFrame >= thr) {
 		sqlite3_wal_checkpoint(db, zDb);
 	}
 	return ret;
@@ -379,8 +391,9 @@ static int syzy_tramp_wal_producer(void *p, sqlite3 *db, const char *zDb, int nF
 	s->buf_len = 0;
 	s->journal_truncated = 0;
 	int ret = 0;
+	int thr = syzy_wal_threshold(s);
 	syzyGoProducerWALHook(s->hook_handle, touch, touch_len, nFrame, &ret);
-	if (ret == SQLITE_OK && nFrame >= SYZY_WAL_CHECKPOINT_THRESHOLD) {
+	if (ret == SQLITE_OK && thr > 0 && nFrame >= thr) {
 		sqlite3_wal_checkpoint(db, zDb);
 	}
 	return ret;

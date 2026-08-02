@@ -182,7 +182,17 @@ func (o *opener) claimLocks() error {
 		// without a fresh flock.
 		o.daemonClaim = layout.AdoptDaemon(o.adopt.daemonFile)
 	} else {
-		o.daemonClaim, err = layout.ClaimDaemon(o.cfg.Path)
+		// Brief bounded retry: O_CLOEXEC closes fork-inherited FDs at
+		// exec, not at fork, so any concurrently forking thread keeps a
+		// just-released flock alive for a moment through the child's
+		// inherited descriptor. A genuine holder outlives every retry.
+		for wait := 5 * time.Millisecond; ; wait *= 2 {
+			o.daemonClaim, err = layout.ClaimDaemon(o.cfg.Path)
+			if err == nil || !errors.Is(err, layout.ErrDaemonLocked) || wait > 200*time.Millisecond {
+				break
+			}
+			time.Sleep(wait)
+		}
 		if err != nil {
 			if errors.Is(err, layout.ErrDaemonLocked) {
 				return errors.New("syzy: daemon role already held by another process (multi-process not yet supported)")
@@ -284,6 +294,13 @@ func (o *opener) openConns() error {
 	if err := o.appWrite.Exec(`PRAGMA journal_mode = WAL; ` + connPragmas(o.cfg.DisableMmap)); err != nil {
 		return fmt.Errorf("syzy: configure writer: %w", err)
 	}
+	// Bound the WAL file: when this connection's commit restarts a
+	// fully-backfilled WAL (SQLite's walRestartLog), truncate it in the
+	// same commit. The publisher's coordinated recycle relies on this —
+	// its recycle write runs on this connection.
+	if err := o.appWrite.Exec(`PRAGMA journal_size_limit = 0`); err != nil {
+		return fmt.Errorf("syzy: configure writer journal size limit: %w", err)
+	}
 	// Shrink any WAL inherited from a prior run before opening for full
 	// operation. Prior to the auto-checkpoint fix, crashes could leave a
 	// multi-hundred-MB WAL on disk; without this, recovery starts under
@@ -295,12 +312,20 @@ func (o *opener) openConns() error {
 	// When the publisher is wired in, it owns WAL recycling: SQLite's
 	// auto-checkpoint must NOT race ahead of the LTX tailer's Sync
 	// (that's what forces full rebaselines). Disable it here; the
-	// publisher's checkpoint loop runs a coordinated TRUNCATE under
-	// writer fence + tailer drain.
+	// publisher's checkpoint loop runs a coordinated recycle gated on
+	// tailer drain.
 	if o.cfg.ObjectBackend != nil {
 		if err := o.appWrite.Exec(`PRAGMA wal_autocheckpoint = 0`); err != nil {
 			return fmt.Errorf("syzy: disable app autocheckpoint: %w", err)
 		}
+		// Also disable the wal_hook trampolines' backstop checkpoint (it
+		// bypasses wal_autocheckpoint = 0 above threshold, and an
+		// uncoordinated backfill lets the next commit restart the WAL out
+		// from under the LTX tailer), and enable frame capture — after
+		// the pragma, which clobbers any wal_hook — so RecycleCommit can
+		// prove its restarts even before (or without) the producer.
+		o.appWrite.SetWALCheckpointThreshold(-1)
+		o.appWrite.EnableWALFrameCapture()
 		if err := o.sc.DisableAutoCheckpoint(); err != nil {
 			return fmt.Errorf("syzy: disable meta autocheckpoint: %w", err)
 		}
