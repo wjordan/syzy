@@ -2,7 +2,9 @@ package sqlitebridge
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -168,6 +170,87 @@ func TestWALHookFires(t *testing.T) {
 	if lastFrames < 1 {
 		t.Errorf("wal hook frames = %d; want >= 1", lastFrames)
 	}
+}
+
+// TestWALCheckpointThreshold covers the wal_hook trampolines' backstop
+// checkpoint: above the threshold the trampoline backfills the WAL (so the
+// next commit restarts and, with journal_size_limit, truncates it); with the
+// threshold disabled the WAL must be left alone — an embedder that owns WAL
+// bounding (a publisher tailing the log) cannot tolerate an uncoordinated
+// backfill.
+func TestWALCheckpointThreshold(t *testing.T) {
+	// One committed transaction of ~2100 pages exceeds the built-in
+	// 2000-frame threshold in a single wal_hook fire.
+	bigTxn := func(t *testing.T, c *Conn, base int) {
+		t.Helper()
+		if err := c.Exec(`BEGIN`); err != nil {
+			t.Fatalf("BEGIN: %v", err)
+		}
+		for i := range 2100 {
+			if err := c.Exec(fmtInsertBlob(base + i)); err != nil {
+				t.Fatalf("INSERT %d: %v", i, err)
+			}
+		}
+		if err := c.Exec(`COMMIT`); err != nil {
+			t.Fatalf("COMMIT: %v", err)
+		}
+	}
+	open := func(t *testing.T) (*Conn, string) {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "wal.db")
+		c, err := Open(path, 0)
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		t.Cleanup(func() { _ = c.Close() })
+		if err := c.Exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=OFF;
+			PRAGMA wal_autocheckpoint=0; PRAGMA journal_size_limit=0`); err != nil {
+			t.Fatalf("pragmas: %v", err)
+		}
+		c.SetWALHook(func(string, int) int { return 0 })
+		if err := c.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB)`); err != nil {
+			t.Fatalf("CREATE: %v", err)
+		}
+		return c, path + "-wal"
+	}
+
+	t.Run("default backfills above threshold", func(t *testing.T) {
+		c, walPath := open(t)
+		bigTxn(t, c, 0)
+		// The trampoline backfilled, so this commit restarts the WAL and
+		// journal_size_limit truncates it.
+		if err := c.Exec(`INSERT INTO t VALUES (1000000, NULL)`); err != nil {
+			t.Fatalf("post INSERT: %v", err)
+		}
+		if got := statSize(t, walPath); got > 1<<20 {
+			t.Fatalf("WAL size after threshold backfill + commit = %d; want truncated (< 1MB)", got)
+		}
+	})
+	t.Run("disabled leaves WAL alone", func(t *testing.T) {
+		c, walPath := open(t)
+		c.SetWALCheckpointThreshold(-1)
+		bigTxn(t, c, 0)
+		before := statSize(t, walPath)
+		if err := c.Exec(`INSERT INTO t VALUES (1000000, NULL)`); err != nil {
+			t.Fatalf("post INSERT: %v", err)
+		}
+		if got := statSize(t, walPath); got < before {
+			t.Fatalf("WAL shrank %d -> %d with backstop disabled; want append-only", before, got)
+		}
+	})
+}
+
+func fmtInsertBlob(id int) string {
+	return `INSERT INTO t VALUES (` + strconv.Itoa(id) + `, zeroblob(4000))`
+}
+
+func statSize(t *testing.T, path string) int64 {
+	t.Helper()
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	return st.Size()
 }
 
 func TestTraceHookStmt(t *testing.T) {

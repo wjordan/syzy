@@ -214,32 +214,228 @@ func (t *Tailer) Drain(ctx context.Context) error {
 	return t.syncLocked(ctx)
 }
 
-// CheckpointUnderLock performs a coordinated WAL recycle atomically with
-// respect to a concurrent Sync. The caller must already hold the database's
-// writer fence; this method then holds the position mutex across the last-mile
-// drain, checkpoint, and position reset so the next Sync reads the fresh WAL
-// header. The writer-fence-before-tailer order is required by baseline
-// snapshots, which drain this tailer while holding the same fence. Holding t.mu
-// across checkpoint and reset prevents the Run-loop Sync from observing the
-// recycled WAL against the stale position and rebaselining on every checkpoint.
-func (t *Tailer) CheckpointUnderLock(ctx context.Context, checkpoint func() error) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	// The writer fence is held, so this pass catches every last frame.
-	if err := t.syncLocked(ctx); err != nil {
-		return err
-	}
-	if err := checkpoint(); err != nil {
-		return err
-	}
-	t.pos = Position{}
-	return nil
+// CheckpointResult is one PRAGMA wal_checkpoint row. PASSIVE mode never
+// resets the wal-index header, so its NLog and NCkpt are the real frame
+// counts; a recycling mode (RESTART/TRUNCATE) zeroes mxFrame before the
+// pragma reads it back and reports 0/0 unconditionally.
+type CheckpointResult struct {
+	Busy  bool  // checkpoint could not run or could not finish its backfill
+	NLog  int64 // committed frames in the WAL
+	NCkpt int64 // frames backfilled into the database
 }
 
-// syncLocked runs one tail pass; the caller must hold t.mu. Split out of Sync so
-// CheckpointUnderLock can drain without releasing the lock between the drain,
-// the WAL recycle, and the position reset.
+// CheckpointHooks are the database operations CheckpointUnderLock composes
+// into a coordinated WAL recycle. The embedder supplies them because only it
+// owns connections to the tailed database.
+type CheckpointHooks struct {
+	// Checkpoint runs PRAGMA wal_checkpoint(PASSIVE) and reports SQLite's
+	// (busy, log, checkpointed) row. PASSIVE backfills frames without
+	// touching the WAL header, so it can never strand unread frames.
+	Checkpoint func() (CheckpointResult, error)
+	// Recycle brackets the recycle write in one write transaction on the
+	// embedder's writer connection: BEGIN IMMEDIATE, validate() (rolling
+	// back and returning its error on failure), one minimal committing
+	// write, COMMIT. It returns the WAL's total frame count recorded by
+	// the connection's wal_hook for that commit (0 when no capture is
+	// wired; nothing is adopted then). See CheckpointUnderLock for why
+	// the validation must ride inside the commit's own locked
+	// transaction.
+	Recycle func(validate func() error) (walFrames int64, err error)
+}
+
+// ErrCheckpointBusy reports a coordinated checkpoint pass that could not
+// recycle the WAL: a reader held off the backfill, or new commits kept
+// landing between drain and checkpoint. Nothing was recycled and the tailer
+// position is still valid; retry on the next cycle.
+var ErrCheckpointBusy = errors.New("ltxstream: checkpoint busy; WAL not recycled")
+
+// CheckpointUnderLock performs a coordinated WAL recycle atomically with
+// respect to a concurrent Sync, holding the position mutex across the final
+// drain, verification, recycle write, and position reset. Per attempt:
+//
+//  1. Drain: read and emit every committed frame.
+//  2. hooks.Checkpoint (PASSIVE): backfill the WAL, reporting real frame
+//     counts.
+//  3. Verify NLog == NCkpt == frames drained; otherwise the WAL is not
+//     quiesced — retry, then give up until the next cycle. Nothing has
+//     been recycled, so nothing can have been lost.
+//  4. hooks.Recycle: inside one write transaction — whose write lock
+//     freezes appends, restarts, and resets — revalidate that the WAL
+//     still holds exactly the drained generation (same salts, no
+//     committed frame beyond the drained offset), then commit a minimal
+//     write. SQLite restarts a fully-backfilled WAL inside such a commit
+//     (walRestartLog: fresh salts, frames from offset 32, file truncated
+//     via journal_size_limit); no out-of-band checkpoint can pin the WAL
+//     from validation through restart the way this lock does. Stale
+//     validation rolls back, then retries (a commit landed behind the
+//     drain) or defers (the generation was replaced).
+//  5. Prove the transition before replacing the position. The restart is
+//     best-effort — a reader holding a non-zero read mark suppresses it
+//     and the commit appends — and the commit's frame count settles which
+//     happened: reset to the commit's own frames means it restarted the
+//     validated generation; grown by them means suppressed. The header
+//     must also show exactly one transition (walRestartHdr sets salt1 to
+//     exactly old+1), revalidated on the same reader that drains the new
+//     generation. A suppressed restart with salts unchanged drains the
+//     appended write in place and defers. Anything else — further
+//     restarts, or a foreign restart supplying the salt increment a
+//     suppressed commit lacked — keeps the position and defers, and the
+//     next Sync's salt check escalates to a loud rebaseline. An
+//     uncoordinated checkpointer can therefore cost a rebaseline, never
+//     a silent gap.
+func (t *Tailer) CheckpointUnderLock(ctx context.Context, hooks CheckpointHooks) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	const attempts = 3
+	for range attempts {
+		if err := t.syncLocked(ctx); err != nil {
+			return err
+		}
+		res, err := hooks.Checkpoint()
+		if err != nil {
+			return err
+		}
+		if res.Busy || res.NCkpt != res.NLog {
+			return ErrCheckpointBusy
+		}
+		if res.NLog <= 0 {
+			// Empty (or absent) WAL: nothing to recycle.
+			return nil
+		}
+		if int64(t.pos.FrameN) != res.NLog {
+			// Commits landed between the drain and the checkpoint's header
+			// read. They are backfilled but not yet emitted, so a restart
+			// now would strand them: drain and re-verify.
+			continue
+		}
+		frames, err := hooks.Recycle(func() error { return t.validateDrained(ctx) })
+		if err != nil {
+			if errors.Is(err, ErrCheckpointBusy) {
+				continue
+			}
+			return fmt.Errorf("recycle write: %w", err)
+		}
+		if frames <= 0 {
+			// Embedder wiring bug, not a runtime race: without the commit's
+			// frame count no transition can be proven, so never adopt.
+			return fmt.Errorf("ltxstream: recycle write reported no wal frame count; wal-frame capture not wired")
+		}
+		// Sound only because validation rode inside the commit's write
+		// lock: the WAL provably held exactly res.NLog drained frames when
+		// the commit ran, so fewer frames now means it restarted and more
+		// means the restart was suppressed (contract step 5).
+		restarted := frames <= res.NLog
+		// walRestartHdr sets salt1 to exactly old+1 through the shared
+		// wal-index header, so restarts are countable across connections
+		// (unlike the header's checkpoint-sequence field — see Salt1).
+		salt1, salt2, err := readWALHeader(t.cfg.WALPath, t.cfg.Logger)
+		if err != nil {
+			return fmt.Errorf("recycle post-check: %w", err)
+		}
+		switch {
+		case salt1 == t.pos.Salt1 && salt2 == t.pos.Salt2:
+			// Restart prevented by a reader: the recycle write appended to
+			// the tailed generation. Drain it in place and retry on a later
+			// cycle; zeroing the position here would re-emit the whole
+			// generation and bypass the resume salt check.
+			if err := t.syncLocked(ctx); err != nil {
+				return err
+			}
+			return ErrCheckpointBusy
+		case restarted && salt1 == t.pos.Salt1+1:
+			// The recycle commit restarted the validated generation and no
+			// further restart preceded the sample. Adopt through a drain
+			// that revalidates the sampled salts on the file it reads, so
+			// a later restart cannot slip a generation past the zero
+			// position.
+			return t.syncFrom(ctx, Position{}, &walGen{salt1: salt1, salt2: salt2})
+		default:
+			// Unprovable transition (contract step 5). Keep the position;
+			// the next Sync surfaces the salt mismatch and demands a
+			// rebaseline.
+			return fmt.Errorf("ltxstream: unprovable wal transition during recycle (salt1 %08x -> %08x, recycle commit restarted=%t); rebaseline will follow", t.pos.Salt1, salt1, restarted)
+		}
+	}
+	return ErrCheckpointBusy
+}
+
+// validateDrained is the revalidation CheckpointUnderLock passes to
+// hooks.Recycle (contract step 4). It runs inside the recycle write
+// transaction, whose write lock keeps the observation true through the
+// commit: the header must still carry the drained generation's salts, and
+// no committed frame may follow the drained offset. Checksum-valid frames
+// with no commit flag are cache-spill remnants of a rolled-back
+// transaction (ROLLBACK rewinds mxFrame, not the file); under the write
+// lock no transaction is in flight, so they cannot be a commit's prefix,
+// and the recycle write overwrites or truncates them.
+func (t *Tailer) validateDrained(ctx context.Context) error {
+	f, err := os.Open(t.cfg.WALPath)
+	if err != nil {
+		return fmt.Errorf("recycle revalidation: %w", err)
+	}
+	defer f.Close()
+	r, err := NewWALReaderWithOffset(ctx, f, t.pos.Offset, t.pos.Salt1, t.pos.Salt2, t.cfg.Logger)
+	if err != nil {
+		// Salt or checksum drift: the drained generation was replaced
+		// after the verify; defer, rebaseline follows.
+		return fmt.Errorf("recycle revalidation: %w", err)
+	}
+	buf := make([]byte, r.PageSize())
+	for {
+		_, commit, err := r.ReadFrame(ctx, buf)
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("recycle revalidation: %w", err)
+		}
+		if commit != 0 {
+			// A commit landed behind the drain after the verify.
+			// Retryable: drain it and re-verify.
+			return fmt.Errorf("recycle revalidation: commit appended behind the drain: %w", ErrCheckpointBusy)
+		}
+	}
+}
+
+// readWALHeader opens the WAL at path and parses its 32-byte header,
+// returning the generation salts. Fails on a missing, torn, or
+// checksum-invalid header.
+func readWALHeader(path string, logger *slog.Logger) (salt1, salt2 uint32, err error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer f.Close()
+	r, err := NewWALReader(f, logger)
+	if err != nil {
+		return 0, 0, err
+	}
+	return r.Salt1(), r.Salt2(), nil
+}
+
+// syncLocked runs one tail pass from the current position; the caller must
+// hold t.mu. Split out of Sync so CheckpointUnderLock can drain without
+// releasing the lock between the drain, the WAL recycle, and the position
+// reset.
 func (t *Tailer) syncLocked(ctx context.Context) error {
+	return t.syncFrom(ctx, t.pos, nil)
+}
+
+// walGen identifies one WAL generation by its header salts.
+type walGen struct {
+	salt1, salt2 uint32
+}
+
+// syncFrom runs one tail pass starting from pos; the caller must hold t.mu.
+// expect, when non-nil, requires the live WAL header to match that exact
+// generation before any frames are consumed: the caller proved that
+// generation fully accounted for, and a different header appearing between
+// the caller's sample and this open means further restarts occurred whose
+// frames this tailer cannot account for. Validation happens on the same
+// opened file the pass drains from, and t.pos is replaced only on success —
+// on mismatch (or any error) it is left untouched for the caller's resume
+// salt check to escalate.
+func (t *Tailer) syncFrom(ctx context.Context, pos Position, expect *walGen) error {
 	walFile, err := os.Open(t.cfg.WALPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -250,8 +446,6 @@ func (t *Tailer) syncLocked(ctx context.Context) error {
 		return fmt.Errorf("open wal: %w", err)
 	}
 	defer walFile.Close()
-
-	pos := t.pos
 
 	var r *WALReader
 	if pos.IsZero() {
@@ -279,6 +473,12 @@ func (t *Tailer) syncLocked(ctx context.Context) error {
 			}
 			return fmt.Errorf("resume wal reader: %w", err)
 		}
+	}
+
+	if expect != nil && (r.Salt1() != expect.salt1 || r.Salt2() != expect.salt2) {
+		return fmt.Errorf(
+			"ltxstream: wal generation %08x-%08x differs from expected %08x-%08x: further restarts occurred; rebaseline will follow",
+			r.Salt1(), r.Salt2(), expect.salt1, expect.salt2)
 	}
 
 	pageSize := r.PageSize()

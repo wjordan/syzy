@@ -7,6 +7,7 @@ package sqlitebridge
 import "C"
 
 import (
+	"fmt"
 	"unsafe"
 )
 
@@ -169,9 +170,32 @@ func (c *Conn) Exec(sql string) error {
 			e.Msg = C.GoString(errmsg) // sx_exec's own message is per-statement; prefer it
 			C.sx_free(unsafe.Pointer(errmsg))
 		}
-		return e
+		return c.refineCommitHookError(e)
 	}
 	return nil
+}
+
+// QueryInt64Row executes sql and returns the integer columns of its first
+// row. For statements like PRAGMA wal_checkpoint or PRAGMA data_version
+// whose result is one row of integers.
+func (c *Conn) QueryInt64Row(sql string) ([]int64, error) {
+	stmt, _, err := c.Prepare(sql)
+	if err != nil {
+		return nil, err
+	}
+	defer stmt.Finalize()
+	hasRow, err := stmt.Step()
+	if err != nil {
+		return nil, err
+	}
+	if !hasRow {
+		return nil, fmt.Errorf("sqlitebridge: %q returned no rows", sql)
+	}
+	out := make([]int64, stmt.ColumnCount())
+	for i := range out {
+		out[i] = stmt.ColumnInt64(i)
+	}
+	return out, nil
 }
 
 // Changes returns the number of rows modified by the most recent INSERT,

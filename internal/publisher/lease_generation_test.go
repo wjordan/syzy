@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/wjordan/objectstore"
+	"github.com/wjordan/syzy/internal/ltxstream"
 	"github.com/wjordan/syzy/internal/objstore"
 )
 
@@ -133,13 +134,13 @@ func TestRunCancelsLeaderGoroutinesBeforeReturn(t *testing.T) {
 		CheckpointInterval: time.Millisecond,
 		CompactInterval:    time.Hour,
 		RetentionGrace:     time.Hour,
-		AppCheckpoint: func(ctx context.Context, _ string, underFence func(func() error) error) error {
-			return underFence(func() error {
+		AppCheckpoint: func(ctx context.Context, _ string, underFence func(ltxstream.CheckpointHooks) error) error {
+			return underFence(fakeCheckpointHooks(func() error {
 				enterOnce.Do(func() { close(entered) })
 				<-ctx.Done()
 				exitOnce.Do(func() { close(exited) })
 				return ctx.Err()
-			})
+			}))
 		},
 	})
 	// claimOrTakeover owns generation assignment; the helper's test-only seed

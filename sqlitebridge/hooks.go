@@ -7,6 +7,7 @@ package sqlitebridge
 import "C"
 
 import (
+	"fmt"
 	"runtime/cgo"
 	"unsafe"
 )
@@ -85,12 +86,21 @@ type connState struct {
 	handle      cgo.Handle
 	cstate      *C.syzy_conn_state
 	commit      CommitHook
+	commitCause error
 	rollback    RollbackHook
 	preupdate   PreupdateHook
 	wal         WALHook
 	producerWAL ProducerWALHook
 	trace       TraceHook
 	traceMask   TraceEvent
+
+	// captureWAL keeps a wal_hook trampoline installed with no callback so
+	// commitWALFrames is still recorded; commitWALFrames holds the WAL
+	// frame count SQLite reported for this connection's most recent
+	// committed write (recorded inside the committing writer's locked
+	// region, so it is exact per commit).
+	captureWAL      bool
+	commitWALFrames int64
 }
 
 func (c *Conn) ensureState() *connState {
@@ -128,6 +138,14 @@ func (c *Conn) SetCommitHook(fn CommitHook) {
 	c.reinstallCommit()
 }
 
+// SetCommitHookCause attaches a Go cause to the next
+// SQLITE_CONSTRAINT_COMMITHOOK returned by this connection. A commit hook
+// that returns nonzero may call this first to preserve a distinction SQLite's
+// integer hook result cannot encode. Passing nil clears a pending cause.
+func (c *Conn) SetCommitHookCause(err error) {
+	c.ensureState().commitCause = err
+}
+
 // SetRollbackHook registers fn. Pass nil to clear.
 func (c *Conn) SetRollbackHook(fn RollbackHook) {
 	c.ensureState().rollback = fn
@@ -144,6 +162,16 @@ func (c *Conn) SetPreupdateHook(fn PreupdateHook) {
 func (c *Conn) SetWALHook(fn WALHook) {
 	c.ensureState().wal = fn
 	c.reinstallWAL()
+}
+
+// SetWALCheckpointThreshold overrides the WAL frame count at which this
+// connection's wal_hook trampolines run their backstop PASSIVE checkpoint
+// (the auto-checkpoint replacement that sqlite3_wal_hook displaces). n == 0
+// restores the built-in default; n < 0 disables the backstop for embedders
+// that own WAL bounding themselves (e.g. a publisher's coordinated recycle,
+// which an uncoordinated backfill would force to rebaseline).
+func (c *Conn) SetWALCheckpointThreshold(n int) {
+	C.syzy_set_wal_checkpoint_threshold(c.ensureState().cstate, C.int(n))
 }
 
 // ProducerWALHook is the specialized callback signature for
@@ -214,11 +242,71 @@ func (c *Conn) reinstallWAL() {
 	switch {
 	case c.state.producerWAL != nil:
 		C.syzy_install_producer_wal_hook(c.db, c.state.cstate)
-	case c.state.wal != nil:
+	case c.state.wal != nil || c.state.captureWAL:
 		C.syzy_install_wal_hook(c.db, c.state.cstate)
 	default:
 		C.syzy_install_wal_hook(c.db, nil)
 	}
+}
+
+// EnableWALFrameCapture keeps a wal_hook trampoline installed on this
+// connection even with no callback registered, so TakeCommitWALFrames can
+// report the frame count of the connection's own commits — recorded by
+// SQLite inside the committing writer's locked region, the only race-free
+// way to tell a WAL-restarting commit (count reset) from an appending one.
+// Installing a wal_hook displaces SQLite's wal_autocheckpoint and vice
+// versa, so enable this after autocheckpoint is configured; mind
+// SetWALCheckpointThreshold for the trampoline's own backstop.
+func (c *Conn) EnableWALFrameCapture() {
+	c.ensureState().captureWAL = true
+	c.reinstallWAL()
+}
+
+// TakeCommitWALFrames returns the WAL frame count recorded for this
+// connection's most recent committed write and clears it. 0 means no
+// commit fired the connection's wal_hook since the last take (nothing
+// committed, or no trampoline installed — see EnableWALFrameCapture).
+func (c *Conn) TakeCommitWALFrames() int64 {
+	if c.state == nil {
+		return 0
+	}
+	n := c.state.commitWALFrames
+	c.state.commitWALFrames = 0
+	return n
+}
+
+// RecycleCommit runs the coordinated WAL-recycle write bracket
+// (ltxstream.CheckpointHooks.Recycle): BEGIN IMMEDIATE, validate()
+// (rolled back on failure), a same-value PRAGMA user_version rewrite —
+// a minimal commit dirtying page 1, which invites SQLite to restart a
+// fully-backfilled WAL — then COMMIT, returning the frame count recorded
+// for that commit (see TakeCommitWALFrames; requires
+// EnableWALFrameCapture or another wal_hook on this connection). The
+// write lock held from BEGIN IMMEDIATE keeps validate's observation true
+// through the commit.
+func (c *Conn) RecycleCommit(validate func() error) (int64, error) {
+	if err := c.Exec(`BEGIN IMMEDIATE`); err != nil {
+		return 0, err
+	}
+	rollback := func(err error) (int64, error) {
+		_ = c.Exec(`ROLLBACK`)
+		return 0, err
+	}
+	if err := validate(); err != nil {
+		return rollback(err)
+	}
+	row, err := c.QueryInt64Row(`PRAGMA user_version`)
+	if err != nil {
+		return rollback(err)
+	}
+	c.TakeCommitWALFrames()
+	if err := c.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, row[0])); err != nil {
+		return rollback(err)
+	}
+	if err := c.Exec(`COMMIT`); err != nil {
+		return rollback(err)
+	}
+	return c.TakeCommitWALFrames(), nil
 }
 
 // ReassertWALHook re-installs the registered wal_hook trampoline.
@@ -297,6 +385,7 @@ func syzyGoPreupdateHook(
 //export syzyGoWALHook
 func syzyGoWALHook(handle C.uintptr_t, _ *C.sqlite3, zDb *C.char, nFrame C.int, ret *C.int) {
 	s := cgo.Handle(handle).Value().(*connState)
+	s.commitWALFrames = int64(nFrame)
 	if s.wal != nil {
 		*ret = C.int(s.wal(C.GoString(zDb), int(nFrame)))
 	}
@@ -305,6 +394,7 @@ func syzyGoWALHook(handle C.uintptr_t, _ *C.sqlite3, zDb *C.char, nFrame C.int, 
 //export syzyGoProducerWALHook
 func syzyGoProducerWALHook(handle C.uintptr_t, touchData *C.uchar, touchLen C.size_t, nFrame C.int, ret *C.int) {
 	s := cgo.Handle(handle).Value().(*connState)
+	s.commitWALFrames = int64(nFrame)
 	if s.producerWAL == nil {
 		return
 	}

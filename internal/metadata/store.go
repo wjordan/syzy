@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/wjordan/syzy/internal/ltxstream"
 	"github.com/wjordan/syzy/internal/syzylog"
 	"github.com/wjordan/syzy/sqlitebridge"
 )
@@ -145,8 +146,8 @@ func (s *Store) checkSchemaVersion() error {
 
 // DisableAutoCheckpoint sets PRAGMA wal_autocheckpoint=0. Used when
 // the publisher takes ownership of WAL recycling: SQLite no longer
-// auto-checkpoints, the publisher drains the LTX tailer first and
-// then issues a coordinated RESTART. Re-enable via wal_autocheckpoint
+// auto-checkpoints, the publisher drains the LTX tailer first and then
+// runs the coordinated recycle. Re-enable via wal_autocheckpoint
 // pragma as needed.
 func (s *Store) DisableAutoCheckpoint() error {
 	s.mu.Lock()
@@ -154,31 +155,48 @@ func (s *Store) DisableAutoCheckpoint() error {
 	if s.conn == nil {
 		return ErrClosed
 	}
-	return s.conn.Exec(`PRAGMA wal_autocheckpoint = 0`)
+	if err := s.conn.Exec(`PRAGMA wal_autocheckpoint = 0`); err != nil {
+		return err
+	}
+	// The publisher owns WAL bounding now: disable the trampoline's own
+	// backstop, and enable frame capture (after the pragma, which clobbers
+	// any wal_hook) so RecycleCommit can prove its restarts.
+	s.conn.SetWALCheckpointThreshold(-1)
+	s.conn.EnableWALFrameCapture()
+	return nil
 }
 
 // Checkpoint issues PRAGMA wal_checkpoint(<mode>) on the metadata connection
-// under Store.mu. underFence, when non-nil, runs after Store.mu is acquired and
-// receives the checkpoint operation. This lets the publisher acquire the
-// metadata tailer after the writer fence and hold it across the last drain,
-// checkpoint, and position reset.
+// under Store.mu. underFence, when non-nil, runs after Store.mu is acquired
+// and receives the checkpoint hooks (Recycle is sqlitebridge.RecycleCommit
+// on this connection), letting the publisher acquire the metadata tailer
+// after this serialization and hold it across the last drain, checkpoint,
+// and position reset.
 //
 // mode is one of "PASSIVE", "FULL", "RESTART", "TRUNCATE"
-// (case-insensitive). RESTART/TRUNCATE recycle the WAL with a fresh
-// salt; the publisher resets its tailer position to zero on success.
-func (s *Store) Checkpoint(mode string, underFence func(checkpoint func() error) error) error {
+// (case-insensitive); the coordinated recycle uses PASSIVE and lets
+// Recycle's commit restart the WAL.
+func (s *Store) Checkpoint(mode string, underFence func(hooks ltxstream.CheckpointHooks) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.conn == nil {
 		return ErrClosed
 	}
-	checkpoint := func() error {
-		return s.conn.Exec(fmt.Sprintf(`PRAGMA wal_checkpoint(%s)`, mode))
+	checkpoint := func() (ltxstream.CheckpointResult, error) {
+		row, err := s.conn.QueryInt64Row(fmt.Sprintf(`PRAGMA wal_checkpoint(%s)`, mode))
+		if err != nil {
+			return ltxstream.CheckpointResult{}, err
+		}
+		return ltxstream.CheckpointResult{Busy: row[0] != 0, NLog: row[1], NCkpt: row[2]}, nil
 	}
-	if underFence != nil {
-		return underFence(checkpoint)
+	if underFence == nil {
+		_, err := checkpoint()
+		return err
 	}
-	return checkpoint()
+	return underFence(ltxstream.CheckpointHooks{
+		Checkpoint: checkpoint,
+		Recycle:    s.conn.RecycleCommit,
+	})
 }
 
 func (s *Store) Close() error {

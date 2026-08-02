@@ -163,13 +163,25 @@ app.db-syzy/
 ```
 
 `app.db` must run in WAL mode. `syzy_open` enables WAL or fails clearly.
-Litestream-class WAL tailers and normal SQLite checkpointing remain
-compatible with `app.db`.
+Litestream-class WAL tailers remain compatible with `app.db`. When a
+publisher tails a database, it owns WAL recycling: the coordinated pass
+drains the tailer, verifies a PASSIVE checkpoint's frame counts, then runs
+the recycle write as one write transaction that revalidates the drained
+generation under SQLite's write lock before committing. SQLite restarts
+the fully-backfilled WAL inside that commit (truncated via
+`journal_size_limit=0`), and the commit's recorded frame count plus the
+header salts prove the outcome, because nothing can move between the
+validation and the commit (`ltxstream.CheckpointUnderLock` is the
+contract). Any uncoordinated restart is caught by that validation or the
+tailer's resume salt check and forces a loud rebaseline — safe, but not
+free — so auto-checkpointing on published databases is disabled (host
+writer) or demoted to a high emergency backstop (other openers).
 
 Metadata pragmas: `journal_mode=WAL`, `synchronous=NORMAL`,
-`wal_autocheckpoint=500`. The metadata holds the periodic snapshot of
-in-memory CRDT state and is not on the commit hot path; NORMAL is
-enough.
+`journal_size_limit=0`, and `wal_autocheckpoint` set to a high backstop
+threshold (the host process owns metadata WAL recycling; see above). The
+metadata holds the periodic snapshot of in-memory CRDT state and is not on
+the commit hot path; NORMAL is enough.
 
 The metadata schema keeps released columns as inert reserved fields until a
 coordinated file-format migration can rebuild the table. Removing a runtime
@@ -620,9 +632,11 @@ in [`internal/producer/producer.go`](../../internal/producer/producer.go)
    `(pk, key) → value` claims, and `Reserve` them against the
    leaseholder in one batched round-trip. A conflict or unavailable
    leaseholder sets the reject flag. Then return nonzero iff the reject
-   flag is set, surfacing as `SQLITE_CONSTRAINT_COMMITHOOK` to the app
-   (the coordinated conflict and the DDL reject share this code;
-   `sqlite.IsCoordinatedCommitRejected` matches it).
+   flag is set, surfacing as `SQLITE_CONSTRAINT_COMMITHOOK` to the app.
+   The Go error also wraps `unique.ErrConflict` or
+   `unique.ErrUnavailable`, preserving the reason that SQLite's commit
+   hook return value cannot encode; DDL rejects share the SQLite code
+   but carry neither coordinated cause.
    DML without a coordinated key never crosses into Go here and never
    sets the flag. See [Coordinated Uniqueness](#coordinated-uniqueness).
 4. App commits; SQLite fsyncs the WAL.
@@ -815,6 +829,12 @@ Safety rests on three independently-simple facts:
    that window (bounded, rare), surfacing a retryable "unavailable"
    error — never a silent conflict.
 
+The commit hook preserves that decision at the application boundary. A
+reservation conflict wraps `unique.ErrConflict` and is final; backend
+unavailability wraps `unique.ErrUnavailable` and may be retried after the
+writer has been released. Both retain `SQLITE_CONSTRAINT_COMMITHOOK` as the
+underlying SQLite error, so low-level SQLite diagnostics remain accurate.
+
 ### Registry interface
 
 `unique.Registry` is the contract every backend implements, mirroring
@@ -869,11 +889,10 @@ reserves. The reservation already guaranteed cluster-wide exclusivity
 so no apply ever has a competing row — `NOT NULL` applies cleanly. The
 apply hot path keeps its ~12–15µs cost. Receivers reconstruct the table
 *without* a SQLite UNIQUE index (the typed `CreateTable` carries only
-columns + PK; unique keys live in `syzy_key`), so the **originator's**
-own UNIQUE index is the local backstop that rejects same-node duplicates
-before reserve, while cross-node exclusivity rests entirely on the
-reservation. Coordinated correctness therefore does not depend on a
-receiver-side index.
+columns + PK; unique keys live in `syzy_key`), and the originator
+normalizes away its physical index after DDL admission. The reservation
+gate therefore handles same-node and cross-node conflicts uniformly;
+coordinated correctness never depends on physical UNIQUE enforcement.
 
 ### Partial keys
 
@@ -1917,12 +1936,13 @@ patches are documented in [BLOB_PATCH.md](BLOB_PATCH.md).
 - App-installed `preupdate`/`commit`/`rollback`/`wal`/`trace_v2` hooks on
   the writer silently disable replication (one hook each per connection;
   DDL capture uses `trace_v2`).
-- `wal_hook` install disables autocheckpoint on the writer conn (applier
-  goroutine checkpoints instead). `PRAGMA wal_autocheckpoint=N` on that
-  conn re-enables it and silently uninstalls our hook — don't. This is a
-  per-connection SQLite behavior; other connections may still checkpoint
-  `app.db` normally, and Litestream-style physical WAL backup remains
-  compatible.
+- `wal_hook` install disables autocheckpoint on the writer conn (the
+  trampoline's threshold checkpoint stands in, unless the embedder disables
+  it because a publisher owns WAL bounding). `PRAGMA wal_autocheckpoint=N`
+  on that conn re-enables SQLite's own hook and silently uninstalls ours —
+  don't. Other connections can still checkpoint `app.db`; on a published
+  database that forces a loud rebaseline (see the WAL recycle ownership
+  rule above).
 
 ### Operational
 

@@ -668,13 +668,13 @@ nullability:
   *before* the local commit through a synchronous global reservation.
   The second writer to claim a value never commits: its commit is
   vetoed by the commit hook and fails with
-  `SQLITE_CONSTRAINT_COMMITHOOK` (detect via
-  `sqlite.IsCoordinatedCommitRejected`; retry the transaction — a
-  genuine conflict fails identically each time). This is a CP
-  operation: one round-trip per write that touches the key,
-  unavailable during a leader handover — a handover outlasting the
-  in-commit retry budget surfaces as the same commit rejection, never
-  a silent conflict. The mechanism lives in
+  `SQLITE_CONSTRAINT_COMMITHOOK`, wrapped as a coordinated conflict
+  (`sqlite.IsCoordinatedConflict`). A leaseholder handover or partition
+  that outlasts the in-commit retry budget carries the same SQLite code
+  but is wrapped as unavailable (`sqlite.IsCoordinatedUnavailable`).
+  Conflict is final; only unavailable is retryable off the writer. This
+  is a CP operation: one round-trip per write that touches the key, and
+  unavailability never degrades into a silent conflict. The mechanism lives in
   [ARCHITECTURE.md#coordinated-uniqueness](ARCHITECTURE.md#coordinated-uniqueness).
 
 `NOT NULL UNIQUE` selects the coordinated mode automatically — there is
@@ -820,7 +820,9 @@ replica rather than keeping a private durable store.
   computes the txn's net coordinated values and reserves each against
   the leaseholder in one batched round-trip. Success → the commit
   proceeds; conflict → the commit is rejected as
-  `SQLITE_CONSTRAINT_COMMITHOOK`. A crash between reservation and commit
+  `SQLITE_CONSTRAINT_COMMITHOOK` wrapping `unique.ErrConflict`; an
+  unavailable leaseholder rejects with the same SQLite code wrapping
+  `unique.ErrUnavailable`. A crash between reservation and commit
   leaves at most a row-less grant — a safe leak (a value blocked, never
   a duplicate), reclaimed by GC.
 - **Participation predicate (partial keys).** A total key's row

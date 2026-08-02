@@ -460,11 +460,11 @@ func TestRunFinalCheckpointShipsPendingWALBeforeRelease(t *testing.T) {
 	var checkpointCalls atomic.Int64
 	p, be, cancel, done := startRunTestPublisher(t, func(cfg *Config) {
 		cfg.WALPath = dbPath + "-wal"
-		cfg.AppCheckpoint = func(_ context.Context, _ string, underFence func(func() error) error) error {
-			return underFence(func() error {
+		cfg.AppCheckpoint = func(_ context.Context, _ string, underFence func(ltxstream.CheckpointHooks) error) error {
+			return underFence(fakeCheckpointHooks(func() error {
 				checkpointCalls.Add(1)
 				return nil
-			})
+			}))
 		}
 	})
 	// Establish that the Run tailer has completed its initial pass and is now

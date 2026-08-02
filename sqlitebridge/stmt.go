@@ -130,7 +130,7 @@ func (s *Stmt) Step() (hasRow bool, err error) {
 	case C.SQLITE_DONE:
 		return false, nil
 	default:
-		return false, newErrorFromDB(rc, s.conn.db)
+		return false, s.conn.refineCommitHookError(newErrorFromDB(rc, s.conn.db))
 	}
 }
 

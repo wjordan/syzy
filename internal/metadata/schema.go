@@ -158,10 +158,19 @@ CREATE TABLE IF NOT EXISTS apply_quarantine (
 // internal walTryBeginRead retry loop (100 retries, ~10s budget,
 // independent of busy_timeout). applySchema reads the current
 // journal_mode and only writes WAL when needed.
+// wal_autocheckpoint here is a backstop, not the steady-state WAL-bounding
+// mechanism: the host process owns metadata WAL recycling (the publisher's
+// coordinated recycle while leading, the standby checkpoint loop otherwise).
+// An auto-checkpoint from any other opener (guest syzy.so, CLI) backfills the
+// WAL uncoordinated, letting the next commit restart it out from under the
+// host's LTX tailer and forcing a rebaseline — so the threshold is set high
+// enough that it only fires when the host has been absent for a long burst,
+// while still bounding WAL growth in that pathological case.
 const pragmaSetupSQL = `
 PRAGMA busy_timeout = 5000;
 PRAGMA synchronous = NORMAL;
-PRAGMA wal_autocheckpoint = 500;
+PRAGMA wal_autocheckpoint = 10000;
+PRAGMA journal_size_limit = 0;
 PRAGMA foreign_keys = OFF;
 `
 

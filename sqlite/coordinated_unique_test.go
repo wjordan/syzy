@@ -26,6 +26,9 @@ func retryInsert(t *testing.T, node *syzy.Node, sql string) {
 		if err == nil {
 			return
 		}
+		if !syzy.IsCoordinatedUnavailable(err) {
+			t.Fatalf("INSERT failed permanently: %v", err)
+		}
 		if time.Now().After(deadline) {
 			t.Fatalf("INSERT never succeeded: %v", err)
 		}
@@ -33,9 +36,8 @@ func retryInsert(t *testing.T, node *syzy.Node, sql string) {
 	}
 }
 
-// TestCoordinatedUnique_SingleNode confirms NOT NULL UNIQUE is admitted
-// and enforced on a single node (in-process Local registry; SQLite's own
-// index is the local backstop).
+// TestCoordinatedUnique_SingleNode confirms NOT NULL UNIQUE is admitted and
+// enforced by the in-process reservation registry on a single node.
 func TestCoordinatedUnique_SingleNode(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -51,9 +53,11 @@ func TestCoordinatedUnique_SingleNode(t *testing.T) {
 	if err := node.Exec(`INSERT INTO users (email) VALUES ('a@x.com')`); err != nil {
 		t.Fatalf("first insert: %v", err)
 	}
-	// Duplicate email is rejected.
+	// Duplicate email is rejected as a final conflict.
 	if err := node.Exec(`INSERT INTO users (email) VALUES ('a@x.com')`); err == nil {
 		t.Fatal("duplicate email accepted; want UNIQUE rejection")
+	} else if !syzy.IsCoordinatedConflict(err) {
+		t.Fatalf("duplicate classification = %v", err)
 	}
 	// A distinct email succeeds.
 	if err := node.Exec(`INSERT INTO users (email) VALUES ('b@x.com')`); err != nil {
@@ -121,6 +125,10 @@ func TestCoordinatedUnique_LeaseholderBacked(t *testing.T) {
 	// Duplicate rejected.
 	if err := node.Exec(`INSERT INTO users (email) VALUES ('a@x.com')`); err == nil {
 		t.Fatal("duplicate accepted via leaseholder; want rejection")
+	} else if !syzy.IsCoordinatedConflict(err) || syzy.IsCoordinatedUnavailable(err) {
+		t.Fatalf("duplicate classification = %v", err)
+	} else if !sqlitebridge.IsCode(err, sqlitebridge.ResultConstraintCommitHook) {
+		t.Fatalf("duplicate lost commit-hook code: %v", err)
 	}
 	// Distinct succeeds; changing its value reserves the new and releases
 	// the old (reclaim-after-quarantine is covered by the reservation-table
@@ -154,15 +162,10 @@ func TestServeClones_FailsClosedWithoutBundleSource(t *testing.T) {
 }
 
 // TestCoordinatedUnique_TransferAppliesOnOriginator reproduces the
-// originator apply wedge: the DDL-originating node used to be the only
-// replica holding a physical UNIQUE index (its statement ran verbatim;
-// receivers get metadata only). A same-transaction transfer committed on
-// ANOTHER writer with the claimant INSERT ordered before the releasing
-// DELETE — legal under the reservation gate's netting, and unblocked
-// locally since receivers have no index — produced a changeset the
-// originator's per-statement index checking could never apply: a
-// permanent quarantine-retry wedge. Index normalization strips the
-// originator's physical index at DDL time, so the transfer must apply.
+// originator apply boundary: a same-transaction transfer committed on
+// another writer may order the claimant INSERT before the releasing DELETE.
+// That is legal under reservation netting, so index normalization must leave
+// the originator free of physical UNIQUE enforcement when it applies.
 func TestCoordinatedUnique_TransferAppliesOnOriginator(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

@@ -29,6 +29,11 @@ import (
 // the CAP cost of coordinated uniqueness, made explicit.
 var ErrUnavailable = errors.New("unique: reservation backend unavailable")
 
+// ErrConflict means a coordinated value is already reserved by another row.
+// It is final for the attempted write: retrying the same claim cannot succeed
+// unless a separate transaction releases the value first.
+var ErrConflict = errors.New("unique: reservation conflict")
+
 // Claim is one reservation: the value Value of unique key Key on table
 // Table, owned by row Owner. Table and Key are crdt.TableID / crdt.KeyID
 // bytes; Value is the canonical encoding of the (non-NULL) key tuple;

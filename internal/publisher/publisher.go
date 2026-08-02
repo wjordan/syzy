@@ -3,14 +3,20 @@
 // runs two LTX tailers — one over app.db's WAL (db/0000/), one over
 // metadata.db's WAL (metadata/0000/) — uploading L0 deltas to S3.
 //
-// WAL recycle discipline (Litestream-style): SQLite's auto-checkpoint is
-// disabled; the publisher pre-drains each tailer, acquires the corresponding
-// writer fence, then takes the tailer lock for the last-mile drain, PRAGMA
-// wal_checkpoint(TRUNCATE), and position reset. The writer-fence-before-tailer
-// order composes with baseline snapshots, while CheckpointUnderLock keeps a
-// concurrent Sync from observing the recycled WAL against the stale position.
-// Steady state has zero rebaselines because the recycle is gated on tailer
-// catch-up by construction.
+// WAL recycle discipline: SQLite's auto-checkpoint is disabled; the publisher
+// pre-drains each tailer, acquires the corresponding writer fence, then takes
+// the tailer lock for the last-mile drain, a verified PASSIVE checkpoint, and
+// a recycle write bracketed in one write transaction that revalidates the
+// drained generation under SQLite's write lock before committing — the
+// simultaneity that lets the commit's recorded frame count and the header
+// salts prove the outcome (ltxstream.CheckpointUnderLock has the full
+// contract; a suppressed or unprovable transition defers). The
+// writer-fence-before-tailer order composes with baseline snapshots, while
+// the tailer lock keeps a concurrent Sync from observing the recycled WAL
+// against the stale position. Steady state has zero rebaselines because the
+// restart only ever happens after the tailer provably drained the whole WAL;
+// an uncoordinated checkpoint by any other connection surfaces as a loud
+// rebaseline through the tailer's resume salt check.
 //
 // Lease semantics (described in internal/objstore/layout.go):
 //   - Heartbeat every HeartbeatInterval (default 60s) renews
@@ -68,7 +74,7 @@ const (
 	// (row_clock<->app.db orphans). This caps that skew.
 	DefaultRebaselineMaxBaselineSkew = 100000
 	// DefaultCheckpointInterval is the cadence at which the publisher
-	// drains its tailer and issues a coordinated WAL TRUNCATE to keep
+	// drains its tailer and performs the coordinated WAL recycle to keep
 	// the WAL bounded. Matches SQLite's default auto-checkpoint
 	// cadence at ~1 commit/sec; tune higher under bursty load.
 	DefaultCheckpointInterval = time.Minute
@@ -109,15 +115,18 @@ type BaselineFunc func(ctx context.Context, txid uint64) (appLTX, metaLTX []byte
 // anchor.
 type MetaBaselineFunc func(ctx context.Context, txid uint64) (metaLTX []byte, cleanup func(), err error)
 
-// CheckpointFunc runs PRAGMA wal_checkpoint(<mode>) under the writer fence
-// appropriate for that connection (writeMu for app.db, Store.mu for
-// metadata.db). underFence, when non-nil, runs inside that fence and receives
-// the checkpoint operation so it can place the LTX tailer's last-mile drain,
-// checkpoint, and position reset under the tailer lock without inverting the
-// global writer-fence-before-tailer order. It must call checkpoint exactly once
-// or return an error without calling it. mode is one of "PASSIVE", "FULL",
-// "RESTART", "TRUNCATE" (case-insensitive).
-type CheckpointFunc func(ctx context.Context, mode string, underFence func(checkpoint func() error) error) error
+// CheckpointFunc runs PRAGMA wal_checkpoint(<mode>) under the embedder's
+// process-local serialization for that connection (writeMu for app.db,
+// Store.mu for metadata.db). underFence, when non-nil, runs inside that
+// serialization and receives the checkpoint hooks — the PASSIVE checkpoint
+// and the recycle write — so it can place the LTX tailer's last-mile drain,
+// checkpoint verification, recycle, and position reset under the tailer lock
+// without inverting the global writer-fence-before-tailer order. mode is one
+// of "PASSIVE", "FULL", "RESTART", "TRUNCATE" (case-insensitive) and applies
+// to hooks.Checkpoint and the bare (underFence == nil) path alike; the
+// coordinated recycle passes PASSIVE and lets hooks.Recycle's commit restart
+// the WAL.
+type CheckpointFunc func(ctx context.Context, mode string, underFence func(hooks ltxstream.CheckpointHooks) error) error
 
 // Config wires a Publisher to its dependencies.
 type Config struct {
@@ -175,8 +184,8 @@ type Config struct {
 	ClaimSettle time.Duration
 
 	// CheckpointInterval is the cadence at which the publisher drains
-	// each tailer and issues a coordinated wal_checkpoint(TRUNCATE) to
-	// keep WALs bounded. Zero → DefaultCheckpointInterval.
+	// each tailer and performs the coordinated WAL recycle to keep
+	// WALs bounded. Zero → DefaultCheckpointInterval.
 	CheckpointInterval time.Duration
 
 	// CompactInterval is the cadence at which L0 files are merged
@@ -754,7 +763,7 @@ run:
 	leadOps.Wait()
 
 	if runErr == nil {
-		// Best-effort final drain/TRUNCATE reduces restart work and WAL size. The
+		// Best-effort final drain/recycle reduces restart work and WAL size. The
 		// next claim's mandatory coupled baseline is the correctness boundary; a
 		// lost or unhealthy owner must not attempt this cleanup.
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -798,7 +807,7 @@ run:
 	return runErr
 }
 
-// runCheckpointLoop drives a periodic coordinated WAL TRUNCATE for
+// runCheckpointLoop drives a periodic coordinated WAL recycle for
 // both streams. Disabled when neither AppCheckpoint nor MetaCheckpoint
 // is wired (single-node mode without a publisher).
 func (p *Publisher) runCheckpointLoop(ctx context.Context) {
@@ -834,19 +843,21 @@ func (p *Publisher) logFinalCheckpoint(label string, err error) {
 	p.cfg.Logger.Warn("publisher: final "+label+" checkpoint", "err", err)
 }
 
-// checkpointStream drains s's tailer and issues a coordinated
-// wal_checkpoint(TRUNCATE) under the connection's writer fence, then resets
-// the tailer position so the next Sync reads the fresh WAL header. No-op when
-// s.fence isn't wired or the tailer isn't running.
+// checkpointStream drains s's tailer and performs a coordinated WAL recycle
+// under the connection's writer fence: a verified PASSIVE checkpoint followed
+// by a recycle commit that makes SQLite restart the WAL under the writer's
+// own lock, then a position reset so the next Sync reads the fresh WAL
+// header. No-op when s.fence isn't wired or the tailer isn't running.
 //
 // The bulk pre-drain runs before the fence. The fence is then acquired before
-// the tailer's position mutex; under both, the last-mile drain, TRUNCATE, and
-// post-recycle position reset run as one unit (CheckpointUnderLock). That lock
-// order prevents a cycle with a baseline that holds the writer fence while
-// draining the tailer. Resetting the position outside the tailer lock would let
-// the Run-loop Sync observe the recycled WAL against the pre-checkpoint
-// position and rebaseline on every checkpoint. recycleMu still serializes the
-// two streams' recycles against an out-of-band onRecycle rebaseline.
+// the tailer's position mutex; under both, the last-mile drain, checkpoint
+// verification, recycle, and position reset run as one unit
+// (CheckpointUnderLock). That lock order prevents a cycle with a baseline
+// that holds the writer fence while draining the tailer. Resetting the
+// position outside the tailer lock would let the Run-loop Sync observe the
+// recycled WAL against the pre-checkpoint position and rebaseline on every
+// checkpoint. recycleMu still serializes the two streams' recycles against an
+// out-of-band onRecycle rebaseline.
 func (p *Publisher) checkpointStream(ctx context.Context, s *stream) error {
 	if s.fence == nil {
 		return nil
@@ -862,14 +873,22 @@ func (p *Publisher) checkpointStream(ctx context.Context, s *stream) error {
 	if err := t.Drain(ctx); err != nil {
 		return fmt.Errorf("pre-drain checkpoint %s tailer: %w", s.label, err)
 	}
-	// TRUNCATE, not RESTART: RESTART leaves the old frames in the file and the
-	// old salt in the header until the next write, so the tailer re-adopts a
-	// stale salt and trips a mismatch when the next write bumps it. TRUNCATE
-	// empties the WAL, so the next write lays down a fresh header whose salt the
-	// tailer adopts cleanly.
-	if err := s.fence(ctx, "TRUNCATE", func(checkpoint func() error) error {
-		return t.CheckpointUnderLock(ctx, checkpoint)
-	}); err != nil {
+	// PASSIVE, not TRUNCATE: PASSIVE reports real frame counts (a recycling
+	// mode resets the header before the pragma reads them back) and never
+	// discards frames, so CheckpointUnderLock can verify the tailer drained
+	// the whole WAL before hooks.Recycle's commit restarts it under the
+	// writer's own lock. An out-of-band TRUNCATE cannot hold the write lock
+	// from the final drain through the truncation, so a foreign commit could
+	// slip into that gap and be absorbed unread.
+	err := s.fence(ctx, "PASSIVE", func(hooks ltxstream.CheckpointHooks) error {
+		return t.CheckpointUnderLock(ctx, hooks)
+	})
+	if errors.Is(err, ltxstream.ErrCheckpointBusy) {
+		// WAL not recycled; tailer position still valid. Retry next tick.
+		p.cfg.Logger.Debug("publisher: "+s.label+" checkpoint busy; deferred", "err", err)
+		return nil
+	}
+	if err != nil {
 		return fmt.Errorf("checkpoint %s tailer: %w", s.label, err)
 	}
 	return nil
@@ -937,7 +956,7 @@ func (p *Publisher) claimOrTakeover(ctx context.Context) error {
 			// We're the previous holder (process restart). The in-memory
 			// tailer position died with the predecessor, and the WAL may
 			// have been checkpointed since its last ship (the standby
-			// TRUNCATE loop, or the predecessor's shutdown truncate racing
+			// TRUNCATE loop, or the predecessor's shutdown recycle racing
 			// writes) — committed-but-unshipped txns then live only in the
 			// DB file, invisible to a fresh WAL-header read, and the L0
 			// chain silently loses their pages. Continuity cannot be
