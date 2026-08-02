@@ -149,6 +149,8 @@ type Attached struct {
 
 	originClaim *layout.OriginClaim
 	schemaShut  io.Closer
+	uniqueShut  io.Closer
+	helperConn  *sqlitebridge.Conn
 	producer    *producer.Producer
 	meta        *metadata.Store
 	ctrl        *ctrlsock.Client
@@ -163,10 +165,12 @@ type Attached struct {
 //  4. Seeds the catalog from the live schema
 //  5. Loads the nodestate cache
 //  6. Resolves the schema-log handle without Head, Read, or Append
-//  7. Creates the producer (preupdate hooks + journal writes go through
+//  7. Resolves the coordinated-unique reservation registry if
+//     SYZY_UNIQUE_DIAL is set and its endpoint answers
+//  8. Creates the producer (preupdate hooks + journal writes go through
 //     this conn from now on)
-//  8. Wires SYZY_WAKE_VSOCK if set
-//  9. Registers the syzy_changes virtual table
+//  9. Wires SYZY_WAKE_VSOCK if set
+//  10. Registers the syzy_changes virtual table
 //
 // The conn is expected to already be open (sqlitebridge.Open or
 // WrapHandle); the producer installs its hooks on it.
@@ -253,12 +257,28 @@ func Attach(conn *sqlitebridge.Conn, cfg Config) (*Attached, error) {
 	}
 	step("nodestate_us")
 
+	uniqueReg, uniqueShut := openUniqueRegistry(logger)
+	if uniqueShut != nil {
+		undo = append(undo, func() { _ = uniqueShut.Close() })
+	}
+	var helper *sqlitebridge.Conn
+	if uniqueReg != nil {
+		helper, err = openHelperConn(cfg.DBPath)
+		if err != nil {
+			return fail("unique helper: %w", err)
+		}
+		undo = append(undo, func() { _ = helper.Close() })
+	}
+	step("unique_us")
+
 	prod, err := producer.New(conn, sc, cat, producer.Config{
-		JournalDir:   layout.JournalDir(cfg.DBPath, originClaim.Origin),
-		Cache:        cache,
-		Origin:       originClaim.Origin,
-		ProducerOnly: true,
-		SchemaLog:    schemaLog,
+		JournalDir:     layout.JournalDir(cfg.DBPath, originClaim.Origin),
+		Cache:          cache,
+		Origin:         originClaim.Origin,
+		ProducerOnly:   true,
+		SchemaLog:      schemaLog,
+		AppHelper:      helper,
+		UniqueRegistry: uniqueReg,
 	})
 	if err != nil {
 		return fail("producer: %w", err)
@@ -288,6 +308,8 @@ func Attach(conn *sqlitebridge.Conn, cfg Config) (*Attached, error) {
 		Origin:      originClaim.Origin,
 		originClaim: originClaim,
 		schemaShut:  schemaShut,
+		uniqueShut:  uniqueShut,
+		helperConn:  helper,
 		producer:    prod,
 		meta:        sc,
 		ctrl:        ctrl,
@@ -310,6 +332,15 @@ func (a *Attached) Close() error {
 	if a.producer != nil {
 		record(a.producer.Close())
 		a.producer = nil
+	}
+	// After the producer: its close path may still release pending claims.
+	if a.uniqueShut != nil {
+		record(a.uniqueShut.Close())
+		a.uniqueShut = nil
+	}
+	if a.helperConn != nil {
+		record(a.helperConn.Close())
+		a.helperConn = nil
 	}
 	if a.schemaShut != nil {
 		record(a.schemaShut.Close())

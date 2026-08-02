@@ -199,6 +199,13 @@ type Node struct {
 	leaseholder     *unique.Leaseholder
 	leaseholderDone chan struct{}
 
+	// uniqueReg is the coordinated-uniqueness reservation backend this
+	// node's producer claims against (nil when coordinated keys are
+	// rejected — see the Config.LoopbackUnique discussion). Exposed via
+	// UniqueRegistry so an embedder can front it for secondary producers
+	// that cannot resolve a backend themselves (unique.ServeProxy).
+	uniqueReg unique.Registry
+
 	// uniqueRead is the leaseholder's aux read connection over the app DB,
 	// used by Enumerate to rebuild the reservation index. Closed in Close
 	// after the maintenance loop is joined; leaking it keeps the DB file
@@ -221,6 +228,16 @@ type Node struct {
 	originAddrMu sync.Mutex
 	originAddr   map[crdt.Origin]string
 }
+
+// UniqueRegistry returns the coordinated-uniqueness reservation backend
+// this node claims against, or nil when this node rejects coordinated
+// (NOT NULL UNIQUE) keys. Embedders front it for secondary producers that
+// have a stream to this node but no backend access of their own — serve it
+// with unique.ServeProxy and point the producer's SYZY_UNIQUE_DIAL at the
+// listener. A proxied claim is arbitrated exactly like one of this node's
+// own, so serving nil-vs-non-nil also tells the secondary whether
+// coordinated keys are supported at all.
+func (n *Node) UniqueRegistry() unique.Registry { return n.uniqueReg }
 
 // Exec runs SQL with no result. Suitable for DDL and non-parameterized
 // DML against the replicated writer connection.

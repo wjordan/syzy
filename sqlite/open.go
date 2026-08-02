@@ -592,6 +592,7 @@ func (o *opener) assembleNode() {
 		producer:     o.prod,
 		leaseholder:  o.leaseholder,
 		uniqueRead:   o.uniqueRead,
+		uniqueReg:    o.uniqueReg,
 		snap:         snap,
 		log:          o.log,
 		clusterID:    o.clusterID,
