@@ -162,7 +162,7 @@ func (n *Node) closeWithOpts(releaseClaims, markClean bool) error {
 
 	// Drain the database-touching phase of in-flight ServeBundle /
 	// PublishSnapshot. Both re-check n.closed under writeMu. A publisher
-	// snapshot that already pinned has independent backup handles/temp files;
+	// snapshot that already completed has independent staged files;
 	// stopPublisher later joins that generation operation before DB teardown.
 	n.writeMu.Lock()
 	n.writeMu.Unlock()

@@ -298,9 +298,9 @@ func (n *Node) WriterDB() *sql.DB { return n.writerDB }
 
 // pinnedSnapshot is the writer-barrier-consistent capture shared by
 // ServeBundle (live tcp clone) and PublishSnapshot (live S3 publish).
-// Holds the pinned metadata.db + app.db backup handles plus the
-// frontier/schema_seq metadata captured at the same logical commit
-// boundary. Caller must invoke Close exactly once.
+// Holds staged metadata.db + app.db copies plus the frontier/schema_seq
+// metadata captured at the same logical commit boundary. Caller must invoke
+// Close exactly once.
 
 // JoinCluster seeds the metadata at appPath with clusterID, so a
 // subsequent Open treats that database as a member of the cluster.

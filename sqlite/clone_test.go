@@ -402,14 +402,14 @@ func TestClone_ServeBundle_ConcurrentWriters(t *testing.T) {
 }
 
 // TestServeBundle_BarrierBlocksWriters verifies that holding the
-// writer barrier during ServeBundle's drain+snapshot+pin window
+// writer barrier during ServeBundle's drain+snapshot+copy window
 // serializes against concurrent INSERT attempts: an INSERT issued
 // while the barrier is held must not commit until after the bundle
-// has finished pinning. Without the barrier, INSERTs would commit
+// has finished copying. Without the barrier, INSERTs would commit
 // freely between metadata.db and app.db backups.
 //
 // We use a *blocking* writer on the receiver side of the bundle
-// pipe to keep ServeBundle in its post-pin streaming phase, then
+// pipe to keep ServeBundle in its post-copy streaming phase, then
 // observe that an INSERT issued while ServeBundle was running has
 // committed by the time the bundle drains. The point of the test is
 // that ServeBundle never panics or wedges under contention; we can't
