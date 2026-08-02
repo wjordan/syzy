@@ -162,6 +162,68 @@ int syzy_autoload_hook(sqlite3 *db, char **pzErrMsg,
 #endif
 }
 
+// sx_real resolves the real implementation an interposer must forward to.
+//
+// dlsym(RTLD_NEXT) alone is not enough. It walks only the GLOBAL link map,
+// while a language runtime that loads its SQLite binding with dlopen(...,
+// RTLD_LOCAL) puts libsqlite3 in a LOCAL scope. CPython does exactly that:
+// its default dlopen flags are RTLD_NOW with no RTLD_GLOBAL, so importing
+// the sqlite3 module maps libsqlite3 where RTLD_NEXT cannot see it. The
+// binding's own calls still reach these interposers, because the global
+// scope is searched first, so we get the call and cannot answer it: every
+// dlsym(RTLD_NEXT) below returns NULL and the interposer falls back to a
+// stub. sqlite3_initialize then reports success without initializing, and
+// sqlite3_open_v2 returns an error without writing *ppDb; the caller reads
+// whatever the stack held there. CPython's connect() raises MemoryError if
+// that happens to be NULL and takes a SIGSEGV if it does not.
+//
+// RTLD_NOLOAD is deliberate: it promotes the copy already mapped into the
+// process into the global scope, and returns NULL rather than mapping a
+// second, independent SQLite whose handles could never be mixed with the
+// caller's.
+static void *sx_real(const char *name) {
+    void *fn = dlsym(RTLD_NEXT, name);
+    if (fn != NULL) return fn;
+
+    // Published release/acquire so a racing thread either repeats the
+    // (idempotent, refcounted) dlopen or sees the finished handle, never a
+    // half-set NULL that would become a spurious hard failure.
+    static void *lib = NULL;
+    void *h = __atomic_load_n(&lib, __ATOMIC_ACQUIRE);
+    if (h == NULL) {
+        static const char *const sonames[] = {"libsqlite3.so.0", "libsqlite3.so"};
+        for (size_t k = 0; h == NULL && k < sizeof(sonames) / sizeof(sonames[0]); k++) {
+            h = dlopen(sonames[k], RTLD_NOW | RTLD_GLOBAL | RTLD_NOLOAD);
+        }
+        if (h == NULL) {
+            if (sx_dbg()) fprintf(stderr, "syzy-shim: libsqlite3 not mapped\n");
+            return NULL;
+        }
+        __atomic_store_n(&lib, h, __ATOMIC_RELEASE);
+    }
+    fn = dlsym(h, name);
+    if (fn == NULL && sx_dbg()) {
+        fprintf(stderr, "syzy-shim: %s missing from libsqlite3\n", name);
+    }
+    return fn;
+}
+
+// sx_no_real reports an unresolvable real symbol and yields SQLITE_ERROR.
+// An interposer that cannot forward must fail loudly: a faked SQLITE_OK
+// leaves libsqlite3 uninitialized, and an error return that skips the
+// caller's out-parameter leaves it holding whatever was on the stack.
+static int sx_no_real(const char *name) {
+    fprintf(stderr, "syzy-shim: no real %s to forward to; is libsqlite3 loaded?\n", name);
+    return SQLITE_ERROR;
+}
+
+// sx_no_prep is sx_no_real for the prepare family, which documents *ppStmt
+// as NULL on error.
+static int sx_no_prep(sqlite3_stmt **ppStmt, const char *name) {
+    if (ppStmt != NULL) *ppStmt = NULL;
+    return sx_no_real(name);
+}
+
 // The interposers below must be referenced by their bare sqlite3_xxx
 // names so the dynamic linker can resolve client-app calls to them.
 // syzy_sqlite.h's macros would expand them to sqlite3_api->open*
@@ -240,9 +302,9 @@ int sqlite3_initialize(void) {
     // Libsqlite3 would then walk a NULL global config and crash with
     // a NULL function pointer (IP=0).
     if (real_init == NULL) {
-        real_init = (xInit)dlsym(RTLD_NEXT, "sqlite3_initialize");
+        real_init = (xInit)sx_real("sqlite3_initialize");
     }
-    if (real_init == NULL) return 0;
+    if (real_init == NULL) return sx_no_real("sqlite3_initialize");
     if (sx_in_shim) return real_init();
     sx_in_shim = 1;
     int rc = real_init();
@@ -277,8 +339,11 @@ int sqlite3_open_v2(const char *filename, sqlite3 **ppDb,
     typedef int (*xOpenV2)(const char *, sqlite3 **, int, const char *);
     static xOpenV2 real_open_v2 = NULL;
     if (real_open_v2 == NULL) {
-        real_open_v2 = (xOpenV2)dlsym(RTLD_NEXT, "sqlite3_open_v2");
-        if (real_open_v2 == NULL) return 1; // SQLITE_ERROR
+        real_open_v2 = (xOpenV2)sx_real("sqlite3_open_v2");
+        if (real_open_v2 == NULL) {
+            if (ppDb != NULL) *ppDb = NULL;
+            return sx_no_real("sqlite3_open_v2");
+        }
     }
     if (!sx_in_shim) {
         sx_in_shim = 1;
@@ -303,8 +368,11 @@ int sqlite3_open(const char *filename, sqlite3 **ppDb) {
     static xOpen real_open = NULL;
     static xOpenV2 real_open_v2 = NULL;
     if (real_open == NULL) {
-        real_open = (xOpen)dlsym(RTLD_NEXT, "sqlite3_open");
-        if (real_open == NULL) return 1;
+        real_open = (xOpen)sx_real("sqlite3_open");
+        if (real_open == NULL) {
+            if (ppDb != NULL) *ppDb = NULL;
+            return sx_no_real("sqlite3_open");
+        }
     }
     int steer = 0;
     if (!sx_in_shim) {
@@ -318,7 +386,7 @@ int sqlite3_open(const char *filename, sqlite3 **ppDb) {
         // with sqlite3_open's documented flags to pick the wrapper.
         if (sx_dbg()) fprintf(stderr, "syzy-shim: steering open onto syzy-app\n");
         if (real_open_v2 == NULL) {
-            real_open_v2 = (xOpenV2)dlsym(RTLD_NEXT, "sqlite3_open_v2");
+            real_open_v2 = (xOpenV2)sx_real("sqlite3_open_v2");
         }
         if (real_open_v2 != NULL) {
             int rc = real_open_v2(filename, ppDb,
@@ -336,8 +404,11 @@ int sqlite3_open16(const void *filename, sqlite3 **ppDb) {
     typedef int (*xOpen16)(const void *, sqlite3 **);
     static xOpen16 real_open16 = NULL;
     if (real_open16 == NULL) {
-        real_open16 = (xOpen16)dlsym(RTLD_NEXT, "sqlite3_open16");
-        if (real_open16 == NULL) return 1;
+        real_open16 = (xOpen16)sx_real("sqlite3_open16");
+        if (real_open16 == NULL) {
+            if (ppDb != NULL) *ppDb = NULL;
+            return sx_no_real("sqlite3_open16");
+        }
     }
     if (!sx_in_shim) {
         sx_in_shim = 1;
@@ -535,8 +606,11 @@ static void sx_once_remove(sqlite3_stmt *stmt) {
 static int sx_real_finalize(sqlite3_stmt *stmt) {
     typedef int (*xFinalize)(sqlite3_stmt *);
     static xFinalize real = NULL;
-    if (real == NULL) real = (xFinalize)dlsym(RTLD_NEXT, "sqlite3_finalize");
-    if (real == NULL) return SQLITE_MISUSE;
+    if (real == NULL) real = (xFinalize)sx_real("sqlite3_finalize");
+    if (real == NULL) {
+        sx_no_real("sqlite3_finalize");
+        return SQLITE_MISUSE;
+    }
     return real(stmt);
 }
 
@@ -587,8 +661,8 @@ int sqlite3_wal_autocheckpoint(sqlite3 *db, int nFrame) {
     typedef int (*xWalAC)(sqlite3 *, int);
     static xWalAC real = NULL;
     if (real == NULL) {
-        real = (xWalAC)dlsym(RTLD_NEXT, "sqlite3_wal_autocheckpoint");
-        if (real == NULL) return 1; // SQLITE_ERROR
+        real = (xWalAC)sx_real("sqlite3_wal_autocheckpoint");
+        if (real == NULL) return sx_no_real("sqlite3_wal_autocheckpoint");
     }
     int rc = real(db, nFrame);
     sx_reassert_hook(db);
@@ -670,8 +744,8 @@ int sqlite3_prepare_v2(sqlite3 *db, const char *zSql, int nByte,
         sqlite3_stmt **ppStmt, const char **pzTail) {
     static void *real = NULL;
     if (real == NULL) {
-        real = dlsym(RTLD_NEXT, "sqlite3_prepare_v2");
-        if (real == NULL) return 1; // SQLITE_ERROR
+        real = sx_real("sqlite3_prepare_v2");
+        if (real == NULL) return sx_no_prep(ppStmt, "sqlite3_prepare_v2");
     }
     sx_prep p = {real, 0, 0};
     return sx_prepare_common(&p, db, zSql, nByte, ppStmt, pzTail);
@@ -681,8 +755,8 @@ int sqlite3_prepare(sqlite3 *db, const char *zSql, int nByte,
         sqlite3_stmt **ppStmt, const char **pzTail) {
     static void *real = NULL;
     if (real == NULL) {
-        real = dlsym(RTLD_NEXT, "sqlite3_prepare");
-        if (real == NULL) return 1;
+        real = sx_real("sqlite3_prepare");
+        if (real == NULL) return sx_no_prep(ppStmt, "sqlite3_prepare");
     }
     sx_prep p = {real, 0, 0};
     return sx_prepare_common(&p, db, zSql, nByte, ppStmt, pzTail);
@@ -697,10 +771,10 @@ int sqlite3_prepare_v3(sqlite3 *db, const char *zSql, int nByte,
     static void *real_v3 = NULL;
     static void *real_v2 = NULL;
     if (real_v3 == NULL && real_v2 == NULL) {
-        real_v3 = dlsym(RTLD_NEXT, "sqlite3_prepare_v3");
+        real_v3 = sx_real("sqlite3_prepare_v3");
         if (real_v3 == NULL) {
-            real_v2 = dlsym(RTLD_NEXT, "sqlite3_prepare_v2");
-            if (real_v2 == NULL) return 1;
+            real_v2 = sx_real("sqlite3_prepare_v2");
+            if (real_v2 == NULL) return sx_no_prep(ppStmt, "sqlite3_prepare_v3");
         }
     }
     sx_prep p = {real_v3 != NULL ? real_v3 : real_v2,
@@ -722,8 +796,8 @@ int sqlite3_exec(sqlite3 *db, const char *zSql,
             int (*)(void *, int, char **, char **), void *, char **);
     static xExec real = NULL;
     if (real == NULL) {
-        real = (xExec)dlsym(RTLD_NEXT, "sqlite3_exec");
-        if (real == NULL) return 1;
+        real = (xExec)sx_real("sqlite3_exec");
+        if (real == NULL) return sx_no_real("sqlite3_exec");
     }
     if (sx_in_shim || sx_step_depth > 0 || db == NULL || zSql == NULL) {
         return real(db, zSql, cb, arg, errmsg);
@@ -772,8 +846,11 @@ int sqlite3_step(sqlite3_stmt *pStmt) {
     typedef int (*xStep)(sqlite3_stmt *);
     static xStep real = NULL;
     if (real == NULL) {
-        real = (xStep)dlsym(RTLD_NEXT, "sqlite3_step");
-        if (real == NULL) return 21; // SQLITE_MISUSE
+        real = (xStep)sx_real("sqlite3_step");
+        if (real == NULL) {
+            sx_no_real("sqlite3_step");
+            return SQLITE_MISUSE;
+        }
     }
     if (__atomic_load_n(&sx_once_count, __ATOMIC_ACQUIRE) > 0 &&
             pStmt != NULL && sx_once_replayed(pStmt)) return SQLITE_AUTH;
@@ -787,7 +864,7 @@ int sqlite3_step(sqlite3_stmt *pStmt) {
         pStmt != NULL && sx_watch_take(pStmt)) {
         typedef sqlite3 *(*xDbHandle)(sqlite3_stmt *);
         static xDbHandle dbh = NULL;
-        if (dbh == NULL) dbh = (xDbHandle)dlsym(RTLD_NEXT, "sqlite3_db_handle");
+        if (dbh == NULL) dbh = (xDbHandle)sx_real("sqlite3_db_handle");
         if (dbh != NULL) sx_reassert_hook(dbh(pStmt));
     }
     return rc;

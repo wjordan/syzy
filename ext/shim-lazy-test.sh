@@ -19,7 +19,10 @@ echo "=== 2: lazy-specific assertions"
 WORK="$(mktemp -d /tmp/syzy-shim-lazy.XXXXXX)"
 DAEMON_PID=""
 cleanup() {
-  [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null || true
+  if [ -n "$DAEMON_PID" ]; then
+    kill "$DAEMON_PID" 2>/dev/null || true
+    wait "$DAEMON_PID" 2>/dev/null || true # let it stop writing before rm
+  fi
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -53,6 +56,21 @@ done
 # Attach side effect: the shim-created probe table was rewritten.
 s="$(sqlite3 "$DB" "SELECT sql FROM sqlite_master WHERE name='lazyprobe'")"
 grep -q "gen_id('lazyprobe')" <<<"$s" || fail "lazyprobe not rewritten (engine attach missing): $s"
+
+echo "--- runtime whose sqlite binding is dlopen'd RTLD_LOCAL"
+# CPython imports its sqlite3 module with RTLD_NOW and no RTLD_GLOBAL, so
+# libsqlite3 lands in a local scope that dlsym(RTLD_NEXT) cannot reach. The
+# binding's calls still arrive here (global scope is searched first), so an
+# interposer that only consults RTLD_NEXT gets the call and has nothing to
+# forward to. That used to segfault on the first connect().
+if command -v python3 >/dev/null 2>&1 && python3 -c "import sqlite3" 2>/dev/null; then
+  py() { python3 -c "import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute('SELECT 42').fetchone()[0])" "$1"; }
+  [ "$(py ':memory:')" = 42 ] || fail "python3 :memory: under the shim"
+  [ "$(py "$WORK/py.db")" = 42 ] || fail "python3 unrelated file DB under the shim"
+  [ "$(py "$DB")" = 42 ] || fail "python3 on the attached DB under the shim"
+else
+  echo "    (skipped: no python3 with sqlite3)"
+fi
 
 echo "--- matching DB with missing engine: open fails loud"
 if SYZY_ENGINE="$WORK/nonexistent.so" "$WORK/client" "$DB" exec "SELECT 1" 2>"$WORK/loud.err"; then

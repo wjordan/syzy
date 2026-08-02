@@ -68,7 +68,6 @@ import "C"
 import (
 	"bufio"
 	"fmt"
-	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -78,6 +77,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/wjordan/syzy/internal/syzylog"
 	"github.com/wjordan/syzy/sqlite/syzyext"
 	"github.com/wjordan/syzy/sqlitebridge"
 )
@@ -95,7 +95,7 @@ func startParkControl() {
 		}
 		ln, err := net.Listen("unix", fmt.Sprintf("@syzy-park.%d", os.Getpid()))
 		if err != nil {
-			slog.Warn("syzy: park control listen failed", "error", err)
+			syzylog.Default().Warn("syzy: park control listen failed", "error", err)
 			return
 		}
 		go serveParkControl(ln)
@@ -202,7 +202,7 @@ func parkAttachments() error {
 	for _, st := range targetEntries() {
 		if st.attached != nil {
 			if err := st.attached.Close(); err != nil {
-				slog.Warn("syzy: park detach", "db", st.dbPath, "error", err)
+				syzylog.Default().Warn("syzy: park detach", "db", st.dbPath, "error", err)
 			}
 			st.attached = nil
 		}
@@ -214,7 +214,7 @@ func parkAttachments() error {
 	if err := parkStep(stepParkCommit); err != nil {
 		return err
 	}
-	slog.Info("syzy: parked", "pid", os.Getpid())
+	syzylog.Default().Info("syzy: parked", "pid", os.Getpid())
 	return nil
 }
 
@@ -250,6 +250,6 @@ func unparkAttachments() error {
 	if err := parkStep(stepUnparkOpen); err != nil {
 		return err
 	}
-	slog.Info("syzy: unparked", "pid", os.Getpid())
+	syzylog.Default().Info("syzy: unparked", "pid", os.Getpid())
 	return nil
 }

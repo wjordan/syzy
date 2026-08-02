@@ -98,6 +98,10 @@ export SYZY_DB="$WORK/data/app.db"
 export SYZY_AUTOLOAD=1
 export SYZY_AUTOSPAWN=0
 export SYZY_ENGINE="$ROOT/ext/syzy.so"
+# The engine's diagnostics are opt-in (syzylog discards by default so the
+# extension never writes uninvited into a host process's stderr). The attach
+# assertion below reads them, so ask for them.
+export SYZY_LOG=info
 
 # The daemon creates the <db>-syzy layout (metadata.db etc.) that
 # attach expects, and drains the client's journals — the same role the
