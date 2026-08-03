@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/wjordan/objectstore"
@@ -326,28 +327,51 @@ func restoreFromBucket(
 	return nil
 }
 
-// verifyMaterializedDB runs SQLite's quick_check over a materialized
-// database and fails on any structural fault. quick_check walks every
-// page of every btree (skipping only index-content cross-checks), so a
-// truncated, holed, or torn image is caught while still staged.
+// verifyMaterializedFaults bounds how many integrity_check findings are
+// collected. One is enough to fail the restore; a handful makes the error
+// describe the shape of the damage instead of only its first symptom.
+const verifyMaterializedFaults = 10
+
+// verifyMaterializedDB runs SQLite's integrity_check over a materialized
+// database and fails on any fault. quick_check is insufficient here: it skips
+// index-content cross-checks, including the primary-key ordering of WITHOUT
+// ROWID tables such as those in metadata.db.
+//
+// The elapsed time is logged because the full check does more work than
+// quick_check and restore operators need that cost to be observable.
 func verifyMaterializedDB(path string) error {
+	t0 := time.Now()
 	conn, err := sqlitebridge.Open(path, sqlitebridge.OpenReadOnly|sqlitebridge.OpenURI|sqlitebridge.OpenNoMutex)
 	if err != nil {
 		return fmt.Errorf("verify %s: open: %w", filepath.Base(path), err)
 	}
 	defer conn.Close()
-	stmt, _, err := conn.Prepare(`PRAGMA quick_check(1)`)
+	stmt, _, err := conn.Prepare(fmt.Sprintf(`PRAGMA integrity_check(%d)`, verifyMaterializedFaults))
 	if err != nil {
 		return fmt.Errorf("verify %s: %w", filepath.Base(path), err)
 	}
 	defer stmt.Finalize()
-	if hasRow, err := stmt.Step(); err != nil {
-		return fmt.Errorf("verify %s: %w", filepath.Base(path), err)
-	} else if !hasRow {
-		return fmt.Errorf("verify %s: quick_check returned no rows", filepath.Base(path))
+	var faults []string
+	var rows int
+	for {
+		hasRow, err := stmt.Step()
+		if err != nil {
+			return fmt.Errorf("verify %s: %w", filepath.Base(path), err)
+		}
+		if !hasRow {
+			break
+		}
+		rows++
+		if result := stmt.ColumnText(0); result != "ok" {
+			faults = append(faults, result)
+		}
 	}
-	if res := stmt.ColumnText(0); res != "ok" {
-		return fmt.Errorf("verify %s: quick_check: %s", filepath.Base(path), res)
+	if rows == 0 {
+		return fmt.Errorf("verify %s: integrity_check returned no rows", filepath.Base(path))
 	}
+	if len(faults) > 0 {
+		return fmt.Errorf("verify %s: integrity_check: %s", filepath.Base(path), strings.Join(faults, "; "))
+	}
+	slog.Debug("syzy restore: image verified", "db", filepath.Base(path), "dur", time.Since(t0).Round(time.Millisecond))
 	return nil
 }

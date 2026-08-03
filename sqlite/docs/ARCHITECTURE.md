@@ -1433,9 +1433,12 @@ frontier — both likewise only after grace.
 **Full restore (`Restore`, `RestoreFromBucket`).** Read HEAD → app and metadata
 baseline LTX FileRefs. Both baselines are required. Apply each baseline, then a
 non-overlapping LTX chain that prefers L1 over covered L0 retained for grace.
-Both databases are completely materialized and verified before installation, so
-the opened replica has no read dependency on object storage. A HEAD without
-either baseline has no restorable state.
+Both databases are completely materialized before installation, then each image
+must pass SQLite's full `integrity_check`, including b-tree key ordering and
+table/index consistency. Any finding aborts the restore while the image is still
+staged. The opened replica therefore has no read dependency on object storage
+and never adopts an image that merely passes SQLite's narrower `quick_check`. A
+HEAD without either baseline has no restorable state.
 
 **Lazy bootstrap (`lazyrestore` optional package).** `lazyrestore.Prepare`
 restores `metadata.db` completely, pins the matching app TXID, builds a
