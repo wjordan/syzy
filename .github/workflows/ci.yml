@@ -10,13 +10,27 @@ permissions:
 
 jobs:
   test:
-    name: build & test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: build & test (${{ matrix.name }})
+    runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
+        include:
+          # Linux runs on the self-hosted `kedge` pool: one disposable
+          # microVM per job, with an in-VM dockerd that the Postgres
+          # step below needs. There is no macOS pool, so macOS stays on
+          # GitHub-hosted runners.
+          - {name: linux, runs-on: kedge}
+          - {name: macos, runs-on: macos-14}
+    # Tests that bind a Unix socket build the path under t.TempDir(),
+    # whose test-name segment runs to ~45 characters. darwin's sun_path
+    # holds 103 bytes and its default TMPDIR is a 47-character
+    # /var/folders/<hash>/T path, so the pair overflows and bind(2)
+    # fails with a bare EINVAL. /tmp buys back those 43 characters; on
+    # Linux this is already the default and changes nothing.
+    env:
+      TMPDIR: /tmp
     steps:
       - uses: actions/checkout@v4
 
@@ -72,7 +86,7 @@ jobs:
 
   bench-smoke:
     name: bench (smoke)
-    runs-on: ubuntu-latest
+    runs-on: kedge
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4

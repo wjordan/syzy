@@ -92,10 +92,10 @@ func TestChecksumStateTracksGroundTruth(t *testing.T) {
 	}
 
 	p := func(marker byte) []byte { return bytes.Repeat([]byte{marker}, ckPageSize) }
-	apply(map[uint32][]byte{2: p(0xA1)}, 3)               // overwrite
-	apply(map[uint32][]byte{4: p(0xA2), 5: p(0xA3)}, 5)   // growth
-	apply(map[uint32][]byte{1: p(0xA4)}, 2)               // shrink to 2 pages
-	apply(map[uint32][]byte{2: p(0xA5), 3: p(0xA6)}, 3)   // regrow
+	apply(map[uint32][]byte{2: p(0xA1)}, 3)             // overwrite
+	apply(map[uint32][]byte{4: p(0xA2), 5: p(0xA3)}, 5) // growth
+	apply(map[uint32][]byte{1: p(0xA4)}, 2)             // shrink to 2 pages
+	apply(map[uint32][]byte{2: p(0xA5), 3: p(0xA6)}, 3) // regrow
 
 	// An abandoned stage must not move the state.
 	before := state.Checksum()

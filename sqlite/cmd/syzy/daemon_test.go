@@ -11,7 +11,12 @@ import (
 )
 
 func TestResolveListenAddr_FileClusterPicksUnixSocket(t *testing.T) {
-	dir := t.TempDir()
+	// Short dir on purpose: this test is about routing a file cluster to
+	// a unix socket under peers/, not about what happens when that path
+	// overflows sun_path — TestResolveListenAddr_DeepPathFallsBackToShortSocket
+	// owns that. t.TempDir() is long enough on darwin to trip the
+	// fallback and turn this into a test of the other behavior.
+	dir := shortTempDir(t)
 	dbPath := filepath.Join(dir, "app.db")
 	root := "file://" + dir
 

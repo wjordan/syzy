@@ -682,16 +682,16 @@ func New(cfg Config) (*Publisher, error) {
 	}
 	p := &Publisher{cfg: cfg, now: time.Now, seeded: make(chan struct{}), runDone: make(chan struct{})}
 	p.app = stream{
-		label:      "app",
-		walPath:    cfg.WALPath,
-		prefix:     objstore.DBPrefix,
-		nextTXID:   p.allocBucketTXID,
-		record:     p.stats.recordL0,
+		label:    "app",
+		walPath:  cfg.WALPath,
+		prefix:   objstore.DBPrefix,
+		nextTXID: p.allocBucketTXID,
+		record:   p.stats.recordL0,
 		rebaseline: func(ctx context.Context) (*ltxstream.ChecksumState, error) {
 			appCk, _, err := p.takeCoupledBaselines(ctx)
 			return appCk, err
 		},
-		fence:      cfg.AppCheckpoint,
+		fence: cfg.AppCheckpoint,
 	}
 	p.meta = stream{
 		label:      "meta",

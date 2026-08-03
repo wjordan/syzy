@@ -67,7 +67,8 @@ func TestBaselineMutationsRejectOldGeneration(t *testing.T) {
 		run  func(context.Context, *Publisher) error
 	}{
 		{name: "coupled", run: func(ctx context.Context, p *Publisher) error {
-			_, _, err := p.takeCoupledBaselines(ctx); return err
+			_, _, err := p.takeCoupledBaselines(ctx)
+			return err
 		}},
 		{name: "external coupled", run: func(ctx context.Context, p *Publisher) error {
 			leadCtx, leadCancel := context.WithCancelCause(context.Background())
@@ -81,7 +82,8 @@ func TestBaselineMutationsRejectOldGeneration(t *testing.T) {
 			return publishTestCoupledBaseline(ctx, p, []byte("external-app"), []byte("external-meta"))
 		}},
 		{name: "metadata only", run: func(ctx context.Context, p *Publisher) error {
-			_, err := p.takeMetaBaselineOnly(ctx); return err
+			_, err := p.takeMetaBaselineOnly(ctx)
+			return err
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
