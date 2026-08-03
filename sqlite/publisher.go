@@ -11,6 +11,7 @@ import (
 	"github.com/wjordan/syzy/internal/layout"
 	"github.com/wjordan/syzy/internal/ltxstream"
 	"github.com/wjordan/syzy/internal/publisher"
+	"github.com/wjordan/syzy/sqlitebridge"
 )
 
 // startPublisher wires Node into the publisher controller (lease,
@@ -83,7 +84,7 @@ func (n *Node) publisherMetaBaseline(ctx context.Context, txid uint64) (publishe
 // hooks (Recycle is sqlitebridge.RecycleCommit on appWrite), allowing the
 // publisher to acquire the app tailer only after this serialization and
 // keep its last drain, checkpoint, and position reset atomic.
-func (n *Node) appCheckpoint(_ context.Context, mode string, underFence func(hooks ltxstream.CheckpointHooks) error) error {
+func (n *Node) appCheckpoint(ctx context.Context, mode string, underFence func(hooks ltxstream.CheckpointHooks) error) error {
 	n.writeMu.Lock()
 	defer n.writeMu.Unlock()
 	if n.writerDB == nil {
@@ -108,10 +109,36 @@ func (n *Node) appCheckpoint(_ context.Context, mode string, underFence func(hoo
 	}
 	return underFence(ltxstream.CheckpointHooks{
 		Checkpoint: checkpoint,
-		// The bracket runs directly on appWrite (the single conn behind
-		// writerDB); writeMu serializes all writers around it.
-		Recycle: n.appWrite.RecycleCommit,
+		Recycle: func(validate func() error) (int64, error) {
+			return n.recycleAppWAL(ctx, validate)
+		},
 	})
+}
+
+// recycleAppWAL runs the WAL-recycle write bracket on appWrite with writerDB's
+// single pooled connection checked out for the bracket's duration. writeMu
+// (held by appCheckpoint) excludes other writers, but reads route through
+// writerDB serialized only by the pool's conn checkout; running the bracket
+// directly on appWrite let them interleave with its open write transaction on
+// the NOMUTEX connection (observed in production as a SIGSEGV inside
+// sqlite3_bind_text).
+func (n *Node) recycleAppWAL(ctx context.Context, validate func() error) (int64, error) {
+	conn, err := n.writerDB.Conn(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer conn.Close()
+	var frames int64
+	err = conn.Raw(func(dc any) error {
+		pc, ok := dc.(*sqlitebridge.PinnedConn)
+		if !ok {
+			return fmt.Errorf("syzy: raw conn = %T", dc)
+		}
+		var rerr error
+		frames, rerr = pc.Conn().RecycleCommit(validate)
+		return rerr
+	})
+	return frames, err
 }
 
 // metaCheckpoint composes Store.Checkpoint: the metadata connection's

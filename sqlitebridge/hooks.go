@@ -284,6 +284,12 @@ func (c *Conn) TakeCommitWALFrames() int64 {
 // EnableWALFrameCapture or another wal_hook on this connection). The
 // write lock held from BEGIN IMMEDIATE keeps validate's observation true
 // through the commit.
+//
+// The caller owns the Conn's cross-goroutine serialization for the whole
+// bracket. In particular, if the Conn sits behind an OpenDB pool, run the
+// bracket with the pooled connection checked out ((*sql.Conn).Raw):
+// database/sql reads serialize only on that checkout, and interleaving
+// one with the bracket is undefined behavior on a NOMUTEX connection.
 func (c *Conn) RecycleCommit(validate func() error) (int64, error) {
 	if err := c.Exec(`BEGIN IMMEDIATE`); err != nil {
 		return 0, err

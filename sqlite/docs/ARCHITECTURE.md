@@ -1412,7 +1412,13 @@ app tailer`, while `metadata.db` uses `Store.mu → metadata tailer`.
 A coordinated WAL recycle may pre-drain the tailer before taking the
 fence, then, while holding the fence, takes the tailer mutex and performs
 the last-mile drain, checkpoint, and position reset as one atomic unit.
-It must never request a writer fence while holding a tailer mutex. This
+It must never request a writer fence while holding a tailer mutex.
+Innermost, the `app.db` recycle write bracket runs with the writer
+pool's single connection checked out: ordinary reads serialize only on
+that pool checkout (not on `writeMu`), and the bracket must exclude
+them from the `NOMUTEX` writer connection for its whole write
+transaction. (`metadata.db` needs no equivalent: every access to its
+connection already holds `Store.mu`.) This
 ordering lets a coupled baseline drain a tailer while its writer barrier
 is open without cycling against the checkpoint loop, while the atomic
 last-mile sequence prevents a concurrent tail pass from observing a
