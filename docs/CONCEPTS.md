@@ -87,8 +87,11 @@ missing origin/sequence ranges from peers, and can fall back to object-store
 epochs when configured.
 
 The SQLite engine uses coupled LTX histories and clone for physical recovery.
-The Postgres engine uses native base backups or bucket restore; both replay
-above the restored frontier to reach the current logical tip.
+The Postgres engine uses native base backups or bucket restore, then replays
+retained history above the restored frontier. A previously active Postgres
+member recovered behind self-origin history it already published must rejoin
+under a fresh origin before writing, so it cannot assign new content to an
+existing Dot.
 
 ## Schema
 

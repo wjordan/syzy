@@ -445,6 +445,16 @@ frontier. With a fixed `-tables` schema, a bigint auto-ID primary-key sequence
 must be pristine or already partitioned for this node; startup rejects a used
 unpartitioned sequence.
 
+Restoring a previously active member from an older image is different. If the
+image predates self-origin sequences that the member already published or
+sealed, the member must not resume that origin: it could assign an existing Dot
+to different content, which peers would correctly discard as a duplicate even
+though the restored member accepted the write locally. Recovery from such a
+rollback or rebuild must assign a fresh origin before accepting writes.
+Reusing the old origin is safe only with proof that the recovered durable sender
+frontier is not behind any externally durable self-origin history; the current
+restore path makes no such proof, so fresh-origin recovery is mandatory.
+
 ### Adopting an existing database
 
 `-adopt` publishes the rows that were already in the database, once, so a

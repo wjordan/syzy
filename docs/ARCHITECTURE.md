@@ -129,7 +129,11 @@ Its authoritative framing is in [TRANSPORT.md](TRANSPORT.md).
 The exact changeset history and persisted CRDT/frontier state provide logical
 durability. Physical recovery is engine-specific: SQLite couples the
 application and metadata LTX histories, while Postgres uses its native backup
-and slot model. Both replay retained changesets above the restored frontier.
+and slot model. Both replay retained changesets above the restored frontier. A
+previously active Postgres member whose recovered image is behind self-origin
+history it already published must use a fresh origin before accepting writes;
+otherwise it could reuse a Dot for different content that peers discard as a
+duplicate.
 
 ## Implementation map
 
