@@ -8,18 +8,11 @@ import (
 	"net"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/wjordan/syzy/sqlitebridge"
 	"github.com/wjordan/syzy/unique"
 	"github.com/wjordan/syzy/wake/vsock"
 )
-
-// uniqueProbeTimeout bounds the one synchronous dial that decides whether
-// the reservation proxy exists. The endpoint is process-local (a unix
-// socket or a vsock bridge to the host), so a healthy listener answers in
-// microseconds; anything slower is treated as absent.
-const uniqueProbeTimeout = 2 * time.Second
 
 // openUniqueRegistry resolves the coordinated-uniqueness reservation
 // backend for an attached producer from SYZY_UNIQUE_DIAL ("unix:<path>" or
@@ -42,24 +35,6 @@ func openUniqueRegistry(log *slog.Logger) (unique.Registry, io.Closer) {
 		log.Warn("syzyext: SYZY_UNIQUE_DIAL invalid; coordinated unique keys stay rejected", "spec", spec, "error", err)
 		return nil, nil
 	}
-	probe := make(chan error, 1)
-	go func() {
-		conn, err := dialAddr()
-		if conn != nil {
-			_ = conn.Close()
-		}
-		probe <- err
-	}()
-	select {
-	case err := <-probe:
-		if err != nil {
-			log.Warn("syzyext: unique reservation endpoint unreachable; coordinated unique keys stay rejected", "spec", spec, "error", err)
-			return nil, nil
-		}
-	case <-time.After(uniqueProbeTimeout):
-		log.Warn("syzyext: unique reservation probe timed out; coordinated unique keys stay rejected", "spec", spec)
-		return nil, nil
-	}
 	client, err := unique.NewProxyClient(spec, func(ctx context.Context) (net.Conn, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -68,6 +43,11 @@ func openUniqueRegistry(log *slog.Logger) (unique.Registry, io.Closer) {
 	})
 	if err != nil {
 		log.Warn("syzyext: unique reservation client failed; coordinated unique keys stay rejected", "spec", spec, "error", err)
+		return nil, nil
+	}
+	if err := client.Probe(context.Background()); err != nil {
+		_ = client.Close()
+		log.Warn("syzyext: unique reservation endpoint unavailable; coordinated unique keys stay rejected", "spec", spec, "error", err)
 		return nil, nil
 	}
 	return client, client

@@ -214,7 +214,8 @@ type Config struct {
 	// UNIQUE) keys. When non-nil, such keys are admitted at DDL time and
 	// enforced by a reserve-before-commit round-trip; when nil (the
 	// default) NOT NULL UNIQUE is rejected at admission, since there is no
-	// way to enforce by-construction uniqueness without one. See
+	// way to enforce by-construction uniqueness without one; an existing
+	// coordinated catalog makes New fail for the same reason. See
 	// sqlite/docs/ARCHITECTURE.md#coordinated-uniqueness.
 	UniqueRegistry unique.Registry
 
@@ -306,6 +307,9 @@ func New(app *sqlitebridge.Conn, sc *metadata.Store, cat *catalog.Catalog, cfg C
 			return nil, fmt.Errorf("producer: stamp replicate_underscore: %w", err)
 		}
 	}
+	if cfg.UniqueRegistry == nil && cat.HasCoordinatedKeys() {
+		return nil, fmt.Errorf("producer: %w: coordinated (NOT NULL UNIQUE) keys have no physical index", unique.ErrRegistryRequired)
+	}
 
 	syncMode, syncReason, err := resolveJournalSyncMode(app, cfg.JournalSync)
 	if err != nil {
@@ -370,15 +374,6 @@ func New(app *sqlitebridge.Conn, sc *metadata.Store, cat *catalog.Catalog, cfg C
 			origin, func() int64 { return time.Now().UnixMicro() },
 			replicateUnderscore, cfg.UniqueRegistry != nil)
 	}
-	if cfg.UniqueRegistry == nil && cat.HasCoordinatedKeys() {
-		// The reservation gate is the only enforcement of a coordinated
-		// key — no node holds a physical UNIQUE index for one — so this
-		// writer will commit duplicates. Loud rather than fatal: refusing
-		// the attach outright is a deployment decision this layer does
-		// not own.
-		syzylog.Printf("producer: WARNING: this database has coordinated (NOT NULL UNIQUE) keys but no reservation backend is configured; writes through this producer are NOT gated and can commit duplicate values")
-	}
-
 	// Resolve any pending LocalDDL intent before accepting writes. This
 	// brings the catalog in line with an Append that committed
 	// cluster-wide before a crash interrupted the wal_hook commit.
@@ -611,12 +606,18 @@ func (p *Producer) rejectCoordinatedTxnDML() int {
 // coordinated key values the transaction's rows now hold, and stashes the
 // values they vacated for release at walHook (post-commit). Returns 0 to
 // allow the commit, 1 to reject it (a cross-node conflict or an
-// unavailable backend). A no-op (returns 0) when no registry is wired or
-// the schema has no coordinated keys.
+// unavailable backend). A no-op only when the schema has no coordinated
+// keys. The nil-registry branch is defensive: a coordinated DDL event may
+// enter the live catalog after this producer was created.
 func (p *Producer) reserveCoordinated() int {
 	p.pendingReleases = nil
-	if p.reg == nil || !p.cat.HasCoordinatedKeys() {
+	if !p.cat.HasCoordinatedKeys() {
 		return 0
+	}
+	if p.reg == nil {
+		syzylog.Printf("producer: commit rejected: %v", unique.ErrRegistryRequired)
+		p.app.SetCommitHookCause(unique.ErrRegistryRequired)
+		return 1
 	}
 	touch := p.app.TouchJournal() // peek; walHook reads + clears later
 	if len(touch) == 0 {

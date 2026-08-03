@@ -34,6 +34,12 @@ var ErrUnavailable = errors.New("unique: reservation backend unavailable")
 // unless a separate transaction releases the value first.
 var ErrConflict = errors.New("unique: reservation conflict")
 
+// ErrRegistryRequired means a writer opened a catalog that already has
+// coordinated keys without configuring a Registry. Such a writer must not
+// start: coordinated keys have no physical UNIQUE index, so an ungated write
+// could commit a duplicate.
+var ErrRegistryRequired = errors.New("unique: reservation backend required by catalog")
+
 // Claim is one reservation: the value Value of unique key Key on table
 // Table, owned by row Owner. Table and Key are crdt.TableID / crdt.KeyID
 // bytes; Value is the canonical encoding of the (non-NULL) key tuple;

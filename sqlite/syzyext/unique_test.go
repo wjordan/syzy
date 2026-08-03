@@ -122,3 +122,39 @@ func TestAttachUniqueDialUnreachableRejectsCoordinatedDDL(t *testing.T) {
 		t.Fatal("coordinated DDL admitted with unreachable reservation endpoint")
 	}
 }
+
+func TestAttachWithoutRegistryRejectsExistingCoordinatedCatalog(t *testing.T) {
+	ln, err := net.Listen("unix", filepath.Join(t.TempDir(), "unique.sock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := unique.ServeProxy(ln, unique.NewLocal())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+
+	conn, dbPath := attachFixture(t, map[string]string{
+		"SYZY_UNIQUE_DIAL": "unix:" + ln.Addr().String(),
+	})
+	if err := conn.Exec(coordinatedDDL); err != nil {
+		t.Fatalf("coordinated DDL: %v", err)
+	}
+
+	// A second writer that cannot reach the gate must not attach to the
+	// now-coordinated catalog. The physical UNIQUE index is gone, so a
+	// warning here would let this writer commit duplicates.
+	t.Setenv("SYZY_UNIQUE_DIAL", "")
+	second, err := sqlitebridge.Open(dbPath, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	_, err = Attach(second, Config{
+		DBPath: dbPath,
+		Log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if !errors.Is(err, unique.ErrRegistryRequired) {
+		t.Fatalf("Attach err = %v, want ErrRegistryRequired", err)
+	}
+}

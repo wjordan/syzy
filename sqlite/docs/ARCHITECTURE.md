@@ -864,11 +864,14 @@ type Registry interface {
 Backend selection is by deployment: with object storage a node elects a
 **leaseholder** (one mesh round-trip, no object-store I/O on the hot
 path); without a bucket, an in-process backend (`unique.Local`) serves
-the single-writer case. The `Registry` interface also admits a per-value
-object-store CAS backend (conditional `PUT If-None-Match`, the
-[schemalog S3](../../schemalog/s3.go) primitive, one object per value) for a
-leaderless deployment — not built, but nothing in the interface precludes
-it.
+the single-writer case. A secondary producer without lease-store or mesh access
+may instead set `SYZY_UNIQUE_DIAL` to a `unix:` or `vsock:`
+`unique.ServeProxy`; the proxy carries only claims, leaving lease discovery and
+fencing in the serving node. Its `UniqueProxy` net/rpc stream is capped at 64
+MiB per call, and transport/backend failures become `ErrUnavailable`. The
+extension probes the service before attach; an absent endpoint keeps new
+coordinated DDL disabled, while an existing coordinated catalog without a
+registry makes producer creation fail because no physical UNIQUE index remains.
 
 ### Leaseholder
 

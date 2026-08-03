@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/wjordan/syzy/crdt"
+	"github.com/wjordan/syzy/internal/metadata"
 	"github.com/wjordan/syzy/internal/sqlitecatalog"
 	"github.com/wjordan/syzy/sqlitebridge"
 	"github.com/wjordan/syzy/unique"
@@ -250,5 +251,37 @@ func TestProducer_NoRegistryNoReserveOverhead(t *testing.T) {
 	// Plain inserts work; eventual UNIQUE is unaffected by coordination.
 	if err := f.app.Exec(`INSERT INTO u (id, email) VALUES (x'01', 'a@x.com')`); err != nil {
 		t.Fatalf("insert: %v", err)
+	}
+}
+
+func TestProducer_NoRegistryRejectsCoordinatedCatalogAddedAfterStart(t *testing.T) {
+	f := newDDLFixture(t)
+	if err := f.app.Exec(`CREATE TABLE u (id BLOB PRIMARY KEY NOT NULL, email TEXT NOT NULL)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	f.waitDrain(t)
+	tab, ok := f.cat.Table("u")
+	if !ok {
+		t.Fatal("u missing from catalog")
+	}
+	email, ok := tab.Column("email")
+	if !ok {
+		t.Fatal("email missing from catalog")
+	}
+	if err := f.sc.WithTx(func(tx *metadata.Tx) error {
+		return tx.UpsertKey(metadata.KeyEntry{
+			TableID: tab.ID, KeyID: crdt.KeyID{1}, ColumnID: email.ID,
+			State: metadata.StateActive, Coordinated: true, CreateSeq: 2,
+		})
+	}); err != nil {
+		t.Fatalf("inject coordinated key: %v", err)
+	}
+	if err := f.cat.Reload(); err != nil {
+		t.Fatalf("reload catalog: %v", err)
+	}
+
+	err := f.app.Exec(`INSERT INTO u (id, email) VALUES (x'01', 'a@x.com')`)
+	if !errors.Is(err, unique.ErrRegistryRequired) {
+		t.Fatalf("insert err = %v, want ErrRegistryRequired", err)
 	}
 }

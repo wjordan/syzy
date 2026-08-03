@@ -31,6 +31,7 @@ import (
 	"github.com/wjordan/syzy/internal/syzylog"
 	"github.com/wjordan/syzy/notify"
 	"github.com/wjordan/syzy/sqlitebridge"
+	"github.com/wjordan/syzy/unique"
 	"github.com/wjordan/syzy/wake/vsock"
 )
 
@@ -120,7 +121,8 @@ func AttachWithRetry(conn *sqlitebridge.Conn, cfg Config) (*Attached, error) {
 // sun_path or a half-upgraded install.
 func permanent(err error) bool {
 	return errors.Is(err, ctrlsock.ErrVersionMismatch) ||
-		errors.Is(err, layout.ErrSocketPathTooLong)
+		errors.Is(err, layout.ErrSocketPathTooLong) ||
+		errors.Is(err, unique.ErrRegistryRequired)
 }
 
 // Config describes how to attach a producer to an already-open
