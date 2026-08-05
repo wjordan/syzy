@@ -42,16 +42,31 @@ func OpenDB(conn *Conn) *sql.DB {
 // A read-only WAL reader requires a concurrent read-write connection to have
 // initialized the -shm; callers must keep that writer open on the same file.
 func OpenReadPool(path string, n int) (*sql.DB, error) {
+	return OpenReadPoolWithOptions(path, n, ReadPoolOptions{})
+}
+
+// ReadPoolOptions tunes the connections OpenReadPool opens.
+type ReadPoolOptions struct {
+	// Pragmas runs on every new read connection after the built-in
+	// busy_timeout, to match the writer's I/O settings.
+	Pragmas string
+}
+
+// OpenReadPoolWithOptions is OpenReadPool with per-connection setup.
+func OpenReadPoolWithOptions(path string, n int, opts ReadPoolOptions) (*sql.DB, error) {
 	if n < 1 {
 		n = 1
 	}
-	db := sql.OpenDB(&readConnector{path: path})
+	db := sql.OpenDB(&readConnector{path: path, pragmas: opts.Pragmas})
 	db.SetMaxOpenConns(n)
 	db.SetMaxIdleConns(n)
 	return db, nil
 }
 
-type readConnector struct{ path string }
+type readConnector struct {
+	path    string
+	pragmas string
+}
 
 func (c *readConnector) Connect(_ context.Context) (driver.Conn, error) {
 	conn, err := Open(c.path, OpenReadOnly|OpenURI|OpenNoMutex)
@@ -62,6 +77,12 @@ func (c *readConnector) Connect(_ context.Context) (driver.Conn, error) {
 	if err := conn.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
 		_ = conn.Close()
 		return nil, err
+	}
+	if c.pragmas != "" {
+		if err := conn.Exec(c.pragmas); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
 	}
 	return &PinnedConn{conn: conn, ownsConn: true}, nil
 }

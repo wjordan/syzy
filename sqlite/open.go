@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -67,6 +68,7 @@ type opener struct {
 	appApply    *sqlitebridge.Conn
 	appHelper   *sqlitebridge.Conn
 	appBlobRead *sqlitebridge.Conn
+	readerDB    *sql.DB
 
 	clusterID   crdt.ClusterID
 	cache       *nodestate.Cache
@@ -333,6 +335,22 @@ func (o *opener) openConns() error {
 		if err := o.sc.DisableAutoCheckpoint(); err != nil {
 			return fmt.Errorf("syzy: disable meta autocheckpoint: %w", err)
 		}
+	}
+
+	// Read-only pool, so reads don't serialize on the pinned writer.
+	// Opened after the writer sets journal_mode=WAL, which a read-only
+	// connection needs done but cannot do itself.
+	if n := o.cfg.ReadPoolSize; n >= 0 {
+		if n == 0 {
+			n = defaultReadPoolSize
+		}
+		o.readerDB, err = sqlitebridge.OpenReadPoolWithOptions(o.cfg.Path, n,
+			sqlitebridge.ReadPoolOptions{Pragmas: connPragmas(o.cfg.DisableMmap)})
+		if err != nil {
+			return fmt.Errorf("syzy: open read pool: %w", err)
+		}
+		readerDB := o.readerDB
+		o.push(func() { _ = readerDB.Close() })
 	}
 
 	o.appApply, err = openAuxConn(o.cfg.Path, "apply", o.cfg.DisableMmap, o.cfg.ObjectBackend != nil)
@@ -609,6 +627,8 @@ func (o *opener) assembleNode() {
 	writerDB := sqlitebridge.OpenDB(o.node.appWrite)
 	o.node.writerDB = writerDB
 	o.push(func() { _ = writerDB.Close() })
+
+	o.node.readerDB = o.readerDB
 
 	// Wire the producer's per-Changeset records into the notify feed.
 	// Self-origin commits flow through here; remote applies wire in

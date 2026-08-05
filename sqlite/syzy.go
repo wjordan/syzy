@@ -47,6 +47,10 @@ const drainTimeout = 30 * time.Second
 // for teardown-path tests.
 const defaultHandoffDrainTimeout = 5 * time.Second
 
+// defaultReadPoolSize bounds concurrent readers. Readers pin WAL frames
+// while they run, so the pool stays finite to keep checkpointing viable.
+const defaultReadPoolSize = 16
+
 // DefaultSnapshotRetention is the journal-GC age floor used when
 // Config.SnapshotRetention is zero and ObjectBackend is set: segments
 // stay on disk this long past being snapshotted, bounding disk while
@@ -96,6 +100,7 @@ type Node struct {
 	appHelper   *sqlitebridge.Conn // non-nil only when DDL replication is enabled
 	appBlobRead *sqlitebridge.Conn // read-only conn the producer's drainer uses to materialize blob_patch
 	writerDB    *sql.DB            // application-facing pool over appWrite; owned by Node
+	readerDB    *sql.DB            // read-only pool over appPath serving DB reads; nil when disabled
 	writeMu     sync.Mutex
 	meta        *metadata.Store
 	catalog     *catalog.Catalog
@@ -312,6 +317,10 @@ func (n *Node) AppPath() string { return n.appPath }
 // same pool *sqlite.DB exposes; share it rather than opening a second
 // OpenDB on AppConn (the PinnedConn connector is one-shot).
 func (n *Node) WriterDB() *sql.DB { return n.writerDB }
+
+// ReaderDB returns the read-only pool serving *sqlite.DB reads, or nil
+// when Config.ReadPoolSize disabled it. Hook-free and write-incapable.
+func (n *Node) ReaderDB() *sql.DB { return n.readerDB }
 
 // pinnedSnapshot is the writer-barrier-consistent capture shared by
 // ServeBundle (live tcp clone) and PublishSnapshot (live S3 publish).

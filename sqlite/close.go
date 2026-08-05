@@ -267,6 +267,13 @@ func (n *Node) closeWithOpts(releaseClaims, markClean bool) error {
 	}
 	n.secondaries = nil
 	n.secMu.Unlock()
+	// Before the writer: a lingering WAL read lock busies out its
+	// closing checkpoint.
+	if n.readerDB != nil {
+		if err := n.readerDB.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if n.writerDB != nil {
 		if err := n.writerDB.Close(); err != nil {
 			errs = append(errs, err)

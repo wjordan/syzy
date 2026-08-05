@@ -23,11 +23,14 @@ type Executor interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
-// DB is a small application-facing facade over a Node. Ordinary SQL goes
-// through the node-owned writer pool; transactions pin that pool's single
-// connection so BlobWriteAt can use sqlite3_blob_write inside the same
-// transaction. DB facades do not own the underlying pool, so multiple
-// NewDB(node) handles are safe and Close is a no-op.
+// DB is a small application-facing facade over a Node. Writes and
+// transactions go through the node-owned writer pool; transactions pin that
+// pool's single connection so BlobWriteAt can use sqlite3_blob_write inside
+// the same transaction. Reads go to the read-only pool (Config.ReadPoolSize)
+// and see the last committed snapshot, so a read issued while a transaction
+// is open returns pre-transaction rows instead of waiting for the commit.
+// DB facades do not own the pools, so multiple NewDB(node) handles are safe
+// and Close is a no-op.
 type DB struct {
 	node *Node
 	sql  *sql.DB
@@ -82,11 +85,20 @@ func (d *DB) Exec(query string, args ...any) (sql.Result, error) {
 	return d.ExecContext(context.Background(), query, args...)
 }
 
+// readSQL returns the node's read-only pool, or the pinned writer when
+// the pool is disabled.
+func (d *DB) readSQL() *sql.DB {
+	if d.node != nil && d.node.readerDB != nil {
+		return d.node.readerDB
+	}
+	return d.sql
+}
+
 func (d *DB) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
 	if d == nil || d.sql == nil {
 		return nil, errors.New("syzy: DB is closed")
 	}
-	return d.sql.QueryContext(ctx, query, args...)
+	return d.readSQL().QueryContext(ctx, query, args...)
 }
 
 func (d *DB) Query(query string, args ...any) (*sql.Rows, error) {
@@ -94,7 +106,7 @@ func (d *DB) Query(query string, args ...any) (*sql.Rows, error) {
 }
 
 func (d *DB) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
-	return d.sql.QueryRowContext(ctx, query, args...)
+	return d.readSQL().QueryRowContext(ctx, query, args...)
 }
 
 func (d *DB) QueryRow(query string, args ...any) *sql.Row {

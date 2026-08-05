@@ -138,6 +138,12 @@ type Config struct {
 	// inside cgo, which releases the P and lets STW complete.
 	DisableMmap bool
 
+	// ReadPoolSize sizes the read-only pool serving DB.QueryContext and
+	// DB.QueryRowContext, so reads do not serialize on the pinned writer
+	// connection. 0 selects defaultReadPoolSize; negative disables the
+	// pool and routes reads back through the writer.
+	ReadPoolSize int
+
 	// ReplicateUnderscoreTables passes through to producer.Config and
 	// stamps the per-slot flag on first Open. sqlite_* always stays
 	// local-only; underscore-prefixed names switch from "local by
