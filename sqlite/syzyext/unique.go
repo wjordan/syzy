@@ -6,9 +6,9 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"os"
 	"strings"
 
+	"github.com/wjordan/syzy/internal/syzyenv"
 	"github.com/wjordan/syzy/sqlitebridge"
 	"github.com/wjordan/syzy/unique"
 	"github.com/wjordan/syzy/wake/vsock"
@@ -25,8 +25,8 @@ import (
 // presence is the capability signal. Skipping the probe would hand the
 // producer a non-nil registry unconditionally, admitting coordinated DDL
 // on clusters that can never grant its reservations.
-func openUniqueRegistry(log *slog.Logger) (unique.Registry, io.Closer) {
-	spec := strings.TrimSpace(os.Getenv("SYZY_UNIQUE_DIAL"))
+func openUniqueRegistry(log *slog.Logger, vars *syzyenv.Vars) (unique.Registry, io.Closer) {
+	spec := strings.TrimSpace(vars.Get("SYZY_UNIQUE_DIAL"))
 	if spec == "" {
 		return nil, nil
 	}

@@ -56,6 +56,7 @@ Run the complete checks with:
 make vet
 make test
 make test-pg
+make test-ext       # builds ext/*.so first; those tests skip without it
 ```
 
 To test the module without ambient workspace resolution:

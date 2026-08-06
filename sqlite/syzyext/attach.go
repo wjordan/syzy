@@ -17,7 +17,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"os"
 	"strings"
 	"time"
 
@@ -28,6 +27,7 @@ import (
 	"github.com/wjordan/syzy/internal/nodestate"
 	"github.com/wjordan/syzy/internal/producer"
 	"github.com/wjordan/syzy/internal/sqlitecatalog"
+	"github.com/wjordan/syzy/internal/syzyenv"
 	"github.com/wjordan/syzy/internal/syzylog"
 	"github.com/wjordan/syzy/notify"
 	"github.com/wjordan/syzy/sqlitebridge"
@@ -115,14 +115,16 @@ func AttachWithRetry(conn *sqlitebridge.Conn, cfg Config) (*Attached, error) {
 }
 
 // permanent reports whether err is a misconfiguration rather than a
-// race. The retry loop exists for startup races — the daemon spawning
+// race. The retry loop exists for startup races: the daemon spawning
 // concurrently, a busy database, attribute churn under concurrent
-// writers — none of which describe a socket path that cannot fit in
-// sun_path or a half-upgraded install.
+// writers. None of those describe a socket path that cannot fit in
+// sun_path, a half-upgraded install, or an unparseable config file.
 func permanent(err error) bool {
 	return errors.Is(err, ctrlsock.ErrVersionMismatch) ||
 		errors.Is(err, layout.ErrSocketPathTooLong) ||
-		errors.Is(err, unique.ErrRegistryRequired)
+		errors.Is(err, unique.ErrRegistryRequired) ||
+		errors.Is(err, syzyenv.ErrMalformed) ||
+		errors.Is(err, ErrNoDaemonBinary)
 }
 
 // Config describes how to attach a producer to an already-open
@@ -141,6 +143,11 @@ type Config struct {
 
 	// Log receives operational logs. nil → syzylog.Default().
 	Log *slog.Logger
+
+	// Vars resolves the attach-time knobs. nil → LoadVars(DBPath),
+	// which is what the extension entry points pass anyway (they read
+	// AutoSpawn from the same view before calling).
+	Vars *syzyenv.Vars
 }
 
 // Attached is the runtime state of one attached producer. Close
@@ -209,7 +216,16 @@ func Attach(conn *sqlitebridge.Conn, cfg Config) (*Attached, error) {
 		stepStart = now
 	}
 
-	ctrl, err := attachOrSpawnDaemon(cfg.DBPath, cfg.AutoSpawn)
+	vars := cfg.Vars
+	if vars == nil {
+		loaded, err := LoadVars(cfg.DBPath)
+		if err != nil {
+			return nil, fmt.Errorf("config: %w", err)
+		}
+		vars = loaded
+	}
+
+	ctrl, err := attachOrSpawnDaemon(cfg.DBPath, cfg.AutoSpawn, vars)
 	if err != nil {
 		return nil, fmt.Errorf("attach daemon: %w", err)
 	}
@@ -238,7 +254,7 @@ func Attach(conn *sqlitebridge.Conn, cfg Config) (*Attached, error) {
 	undo = append(undo, func() { _ = originClaim.Release() })
 	step("origin_us")
 
-	schemaLog, schemaShut, err := OpenSchemaLog(cfg.DBPath)
+	schemaLog, schemaShut, err := OpenSchemaLog(cfg.DBPath, vars)
 	if err != nil {
 		return fail("schema log: %w", err)
 	}
@@ -259,7 +275,7 @@ func Attach(conn *sqlitebridge.Conn, cfg Config) (*Attached, error) {
 	}
 	step("nodestate_us")
 
-	uniqueReg, uniqueShut := openUniqueRegistry(logger)
+	uniqueReg, uniqueShut := openUniqueRegistry(logger, vars)
 	if uniqueShut != nil {
 		undo = append(undo, func() { _ = uniqueShut.Close() })
 	}
@@ -288,7 +304,7 @@ func Attach(conn *sqlitebridge.Conn, cfg Config) (*Attached, error) {
 	undo = append(undo, func() { _ = prod.Close() })
 	step("producer_us")
 
-	if spec := strings.TrimSpace(os.Getenv("SYZY_WAKE_VSOCK")); spec != "" {
+	if spec := strings.TrimSpace(vars.Get("SYZY_WAKE_VSOCK")); spec != "" {
 		dial, err := vsock.DialAddr(spec)
 		if err != nil {
 			syzylog.Printf("SYZY_WAKE_VSOCK %q: %v (keeping futex wake)", spec, err)

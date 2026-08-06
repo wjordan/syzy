@@ -18,6 +18,8 @@ import (
 	"os"
 	"strings"
 	"sync/atomic"
+
+	"github.com/wjordan/syzy/internal/syzyenv"
 )
 
 var current atomic.Pointer[slog.Logger]
@@ -29,7 +31,7 @@ func Default() *slog.Logger {
 	if l := current.Load(); l != nil {
 		return l
 	}
-	l := fromEnv(os.Getenv("SYZY_LOG"))
+	l := fromEnv(syzyenv.Getenv("SYZY_LOG"))
 	// Losing the race is fine: both racers built an equivalent logger.
 	current.CompareAndSwap(nil, l)
 	return current.Load()

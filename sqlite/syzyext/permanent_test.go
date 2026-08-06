@@ -23,6 +23,9 @@ func TestPermanent(t *testing.T) {
 			fmt.Errorf("attach daemon: %w", fmt.Errorf("ctrlsock: %w", ctrlsock.ErrVersionMismatch)), true},
 		{"wrapped socket path",
 			fmt.Errorf("start mesh: %w", layout.CheckUnixSocketPath("/"+string(make([]byte, 200)))), true},
+		{"no daemon binary", ErrNoDaemonBinary, true},
+		{"wrapped no daemon binary",
+			fmt.Errorf("attach daemon: %w", ErrNoDaemonBinary), true},
 		// The retry loop exists for these; classifying one as permanent
 		// would break recovery from a startup race.
 		{"database is locked", errors.New("database is locked"), false},

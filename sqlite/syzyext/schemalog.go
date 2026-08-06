@@ -11,6 +11,7 @@ import (
 
 	"github.com/wjordan/syzy/internal/clusterurl"
 	"github.com/wjordan/syzy/internal/layout"
+	"github.com/wjordan/syzy/internal/syzyenv"
 	"github.com/wjordan/syzy/schemalog"
 	"github.com/wjordan/syzy/wake/vsock"
 )
@@ -27,11 +28,11 @@ import (
 // Returns (nil, nil, nil) when no schema log is desired (case 3): the
 // producer's trace_v2 hook then rejects DDL, which is correct for
 // deployments that pre-apply schema on every peer.
-func OpenSchemaLog(dbPath string) (schemalog.Log, io.Closer, error) {
-	if path := strings.TrimSpace(os.Getenv("SYZY_SCHEMA_LOG")); path != "" {
+func OpenSchemaLog(dbPath string, vars *syzyenv.Vars) (schemalog.Log, io.Closer, error) {
+	if path := strings.TrimSpace(vars.Get("SYZY_SCHEMA_LOG")); path != "" {
 		return schemalog.Dial(path, "", "")
 	}
-	if dial := strings.TrimSpace(os.Getenv("SYZY_SCHEMA_LOG_DIAL")); dial != "" {
+	if dial := strings.TrimSpace(vars.Get("SYZY_SCHEMA_LOG_DIAL")); dial != "" {
 		if strings.HasPrefix(dial, "unix:") || strings.HasPrefix(dial, "vsock:") {
 			dialAddr, err := vsock.DialAddr(dial)
 			if err != nil {
@@ -50,14 +51,14 @@ func OpenSchemaLog(dbPath string) (schemalog.Log, io.Closer, error) {
 		}
 		return schemalog.Dial("", dial, "")
 	}
-	if s3 := strings.TrimSpace(os.Getenv("SYZY_SCHEMA_LOG_S3")); s3 != "" {
+	if s3 := strings.TrimSpace(vars.Get("SYZY_SCHEMA_LOG_S3")); s3 != "" {
 		return schemalog.Dial("", "", s3)
 	}
-	if root := strings.TrimSpace(os.Getenv("SYZY_CLUSTER")); root != "" {
+	if root := strings.TrimSpace(vars.Get("SYZY_CLUSTER")); root != "" {
 		_, schemaURL := clusterurl.Split(root, false)
 		return clusterurl.OpenSchema(context.Background(), schemaURL)
 	}
-	if strings.TrimSpace(os.Getenv("SYZY_OBJECT_BACKEND")) != "" {
+	if strings.TrimSpace(vars.Get("SYZY_OBJECT_BACKEND")) != "" {
 		return nil, nil, nil
 	}
 	return OpenDefaultSchemaLog(dbPath)

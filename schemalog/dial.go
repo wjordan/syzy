@@ -5,7 +5,8 @@ import (
 	"fmt"
 	"io"
 	"net/url"
-	"os"
+
+	"github.com/wjordan/syzy/internal/syzyenv"
 )
 
 // Dial resolves a triple of CLI/env strings into a Log + closer.
@@ -62,8 +63,8 @@ func openS3URL(raw string) (*S3, error) {
 	region := q.Get("region")
 	prefix := q.Get("prefix")
 	u.RawQuery = ""
-	access := os.Getenv("AWS_ACCESS_KEY_ID")
-	secret := os.Getenv("AWS_SECRET_ACCESS_KEY")
+	access := syzyenv.Getenv("AWS_ACCESS_KEY_ID")
+	secret := syzyenv.Getenv("AWS_SECRET_ACCESS_KEY")
 	if access == "" || secret == "" {
 		return nil, errors.New("AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set")
 	}

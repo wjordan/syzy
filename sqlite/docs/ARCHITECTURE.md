@@ -146,6 +146,7 @@ app.db-shm
 
 app.db-syzy/
   daemon.lock                     -- daemon-role flock
+  env                             -- optional attach-time configuration
   metadata.db                      -- metadata checkpoint (SQLite WAL)
   metadata.db-wal
   metadata.db-shm
@@ -233,6 +234,41 @@ the `_syzy_applied` counter applied-marker table
 changeset first applies — local bookkeeping, never replicated or
 journaled. All other replication state lives in the metadata. Recovery
 from metadata loss is `syzy_clone`.
+
+### Configuration
+
+An attaching producer resolves each `SYZY_*` knob from the process
+environment first, then from the database's env file. Empty counts as
+unset, so a file value fills a gap the environment left.
+
+The file is `$SYZY_ENV_FILE` when set (and must then exist), otherwise
+`<app.db>-syzy/env` when present. It is shell-sourceable: `KEY=VALUE`
+one per line, an optional `export ` prefix, `#` comments, blank lines,
+and optional matching quotes around a value that are stripped without
+further escape processing. Keys must be `SYZY_*`; a key that is not,
+a line with no `=`, or a repeated key is a configuration error that
+fails the attach rather than being ignored. Attach does not retry it.
+A file that exists but cannot be read fails the same way, so write it
+readable by every process that opens the database, not only by the
+process that wrote it.
+
+Two classes of knob, and the split is not stylistic:
+
+- **Attach-time configuration** reads from either source:
+  `SYZY_AUTOSPAWN`, `SYZY_BIN`, `SYZY_WAKE_VSOCK`, `SYZY_SCHEMA_LOG`,
+  `SYZY_SCHEMA_LOG_DIAL`, `SYZY_SCHEMA_LOG_S3`, `SYZY_CLUSTER`,
+  `SYZY_OBJECT_BACKEND`, `SYZY_UNIQUE_DIAL`.
+- **Bootstrap** is environment-only: `SYZY_DB`, `SYZY_AUTOLOAD`,
+  `SYZY_ENGINE`, `SYZY_ENV_FILE`, `SYZY_APP_PARK`, `SYZY_DEBUG`,
+  `SYZY_LOG`. These select the database and load the engine, so they
+  are needed before any file belonging to a database can be found, and
+  the pure-C preload shim reads several of them without a Go runtime
+  to parse a file with.
+
+The file exists because a process's environment is fixed at exec: a
+host that snapshots a process and restores it against a database
+chosen later cannot configure it any other way. Deployments that can
+set the environment need nothing here.
 
 ### Metadata Schema
 

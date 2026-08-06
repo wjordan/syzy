@@ -6,6 +6,7 @@
 //	app.db                                user's SQLite database
 //	app.db-syzy/
 //	├── daemon.lock                       held by the daemon-role process
+//	├── env                               optional attach-time config
 //	├── metadata.db                        frontier, applied_gaps, row_clock,
 //	│                                     catalog (daemon-role-only writer)
 //	└── origins/
@@ -72,6 +73,13 @@ func OriginJournalDirIn(metaDir string, origin crdt.Origin) string {
 // frontiers, row clocks, schema catalog) that lives next to appDB.
 func MetaDB(appDB string) string {
 	return filepath.Join(MetaDir(appDB), "metadata.db")
+}
+
+// EnvFile returns the path to the database's optional attach-time
+// configuration file. See internal/syzyenv for the format and the
+// resolution order against the process environment.
+func EnvFile(appDB string) string {
+	return filepath.Join(MetaDir(appDB), "env")
 }
 
 // DaemonLock returns the path to the daemon-role coordination lock.

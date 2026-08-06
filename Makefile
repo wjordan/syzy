@@ -14,7 +14,7 @@ LDFLAGS ?= $(if $(VERSION),-s -w -X github.com/wjordan/syzy/internal/buildinfo.v
 PG_BIN := bin/syzy-pg
 PG_PKG := ./cmd/syzy-pg
 
-.PHONY: all build build-pg test test-pg ext vet fmt clean
+.PHONY: all build build-pg test test-pg test-ext ext vet fmt clean
 
 all: build
 
@@ -34,12 +34,23 @@ test:
 test-pg:
 	cd pg && $(GO) test -race -count=1 ./...
 
+# Extension tests that load the built ext/*.so (they skip without it),
+# so the artifacts are built first. Not part of `test`: the c-shared
+# link costs more than the tests it enables.
+test-ext: ext
+	$(GO) test -count=1 ./sqlite/cmd/syzy-ext/...
+
 ext:
 	$(MAKE) -C ext LDFLAGS='$(LDFLAGS)'
 
+# The extension reads its knobs through internal/syzyenv, which is
+# libc-backed in that build; os.Getenv there returns "" for variables a
+# host process's setproctitle overwrote. Nothing else may read them.
 vet:
 	$(GO) vet ./...
 	cd pg && $(GO) vet ./...
+	@! git grep -ln --untracked 'os\.Getenv("SYZY_' -- '*.go' ':!*_test.go' ':!internal/syzyenv/*' \
+		|| { echo "read SYZY_* through internal/syzyenv, not os.Getenv"; exit 1; }
 
 fmt:
 	$(GO) fmt ./...

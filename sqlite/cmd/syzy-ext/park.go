@@ -77,6 +77,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/wjordan/syzy/internal/syzyenv"
 	"github.com/wjordan/syzy/internal/syzylog"
 	"github.com/wjordan/syzy/sqlite/syzyext"
 	"github.com/wjordan/syzy/sqlitebridge"
@@ -90,7 +91,7 @@ var parkOnce sync.Once
 // shim's wrapper-VFS gate, so both halves switch off together).
 func startParkControl() {
 	parkOnce.Do(func() {
-		if os.Getenv("SYZY_APP_PARK") == "0" {
+		if syzyenv.Getenv("SYZY_APP_PARK") == "0" {
 			return
 		}
 		ln, err := net.Listen("unix", fmt.Sprintf("@syzy-park.%d", os.Getpid()))
@@ -170,7 +171,7 @@ func parkStep(step int) error {
 
 // targetEntries returns the extMap entries attached to $SYZY_DB.
 func targetEntries() []*extState {
-	target := os.Getenv("SYZY_DB")
+	target := syzyenv.Getenv("SYZY_DB")
 	if target != "" {
 		if r, err := filepath.EvalSymlinks(target); err == nil {
 			target = r
@@ -236,9 +237,15 @@ func unparkAttachments() error {
 		if err != nil {
 			return fmt.Errorf("rewrap %s: %w", st.dbPath, err)
 		}
+		vars, err := syzyext.LoadVars(st.dbPath)
+		if err != nil {
+			_ = writer.Release()
+			return fmt.Errorf("config %s: %w", st.dbPath, err)
+		}
 		attached, err := syzyext.AttachWithRetry(writer, syzyext.Config{
 			DBPath:    st.dbPath,
-			AutoSpawn: os.Getenv("SYZY_AUTOSPAWN") != "0",
+			AutoSpawn: vars.Get("SYZY_AUTOSPAWN") != "0",
+			Vars:      vars,
 		})
 		if err != nil {
 			_ = writer.Release()

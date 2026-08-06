@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/wjordan/syzy/internal/ctrlsock"
 	"github.com/wjordan/syzy/internal/layout"
+	"github.com/wjordan/syzy/internal/syzyenv"
 )
 
 // attachOrSpawnDaemon returns a held-open client connection to the syzy
@@ -35,7 +37,7 @@ import (
 //
 // The forked daemon detaches (Setsid) so it survives the caller
 // exiting; stderr lands at <metadata>/daemon.log.
-func attachOrSpawnDaemon(dbPath string, autoSpawn bool) (*ctrlsock.Client, error) {
+func attachOrSpawnDaemon(dbPath string, autoSpawn bool, vars *syzyenv.Vars) (*ctrlsock.Client, error) {
 	if c, err := ctrlsock.Dial(dbPath); err == nil {
 		return c, nil
 	} else if !errors.Is(err, ctrlsock.ErrNoDaemon) {
@@ -44,7 +46,7 @@ func attachOrSpawnDaemon(dbPath string, autoSpawn bool) (*ctrlsock.Client, error
 	if !autoSpawn {
 		return nil, nil
 	}
-	if err := spawnDaemon(dbPath); err != nil {
+	if err := spawnDaemon(dbPath, vars); err != nil {
 		return nil, err
 	}
 	deadline := time.Now().Add(10 * time.Second)
@@ -64,19 +66,44 @@ func attachOrSpawnDaemon(dbPath string, autoSpawn bool) (*ctrlsock.Client, error
 	}
 }
 
-func spawnDaemon(dbPath string) error {
-	bin := os.Getenv("SYZY_BIN")
+// ErrNoDaemonBinary reports a spawn that failed because no syzy CLI is
+// installed beside the loadable extension. Retrying cannot install
+// one, so AttachWithRetry treats it as permanent.
+var ErrNoDaemonBinary = errors.New("syzyext: no syzy command to spawn")
+
+// lookPath is exec.LookPath against the libc environment. The stdlib
+// version reads $PATH with os.Getenv, which loses it in a host process
+// that overwrote Go's env snapshot (see internal/syzyenv) and reports
+// a missing binary that is plainly installed.
+func lookPath(bin string) (string, error) {
+	if strings.ContainsRune(bin, os.PathSeparator) {
+		return exec.LookPath(bin)
+	}
+	for _, dir := range filepath.SplitList(syzyenv.Getenv("PATH")) {
+		if dir == "" {
+			dir = "."
+		}
+		candidate := filepath.Join(dir, bin)
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
+			return candidate, nil
+		}
+	}
+	return "", exec.ErrNotFound
+}
+
+func spawnDaemon(dbPath string, vars *syzyenv.Vars) error {
+	bin := vars.Get("SYZY_BIN")
 	if bin == "" {
 		bin = "syzy"
 	}
-	resolved, err := exec.LookPath(bin)
+	resolved, err := lookPath(bin)
 	if err != nil {
 		// The extension and the CLI install together, so a loadable
 		// extension with no CLI beside it means a partial install.
 		// Say that instead of leaking an exec errno.
-		return fmt.Errorf("cannot find the %q command on $PATH: the loadable extension "+
-			"spawns it to run replication, and the two install together. Add its "+
-			"directory to $PATH, or set SYZY_BIN to its full path.", bin)
+		return fmt.Errorf("%w: %q is not on $PATH, and the extension spawns it to "+
+			"run replication. Add its directory to $PATH, or set SYZY_BIN to its "+
+			"full path", ErrNoDaemonBinary, bin)
 	}
 	bin = resolved
 	args := []string{"daemon", "-db", dbPath}
@@ -90,7 +117,7 @@ func spawnDaemon(dbPath string) error {
 		{"SYZY_SCHEMA_LOG_DIAL", "-schema-log-dial"},
 		{"SYZY_SCHEMA_LOG_S3", "-schema-log-s3"},
 	} {
-		if v := strings.TrimSpace(os.Getenv(fwd.env)); v != "" {
+		if v := strings.TrimSpace(vars.Get(fwd.env)); v != "" {
 			args = append(args, fwd.flag, v)
 		}
 	}
@@ -105,6 +132,9 @@ func spawnDaemon(dbPath string) error {
 	cmd := exec.Command(bin, args...)
 	cmd.Stdout = nil
 	cmd.Stderr = logFile
+	// Not os.Environ: inside the extension that is Go's stack snapshot,
+	// which the host may have overwritten (see internal/syzyenv).
+	cmd.Env = syzyenv.Environ()
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
 		_ = logFile.Close()

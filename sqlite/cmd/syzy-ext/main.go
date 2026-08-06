@@ -61,7 +61,6 @@ import "C"
 
 import (
 	"fmt"
-	"os"
 	"sync"
 	"unsafe"
 
@@ -164,13 +163,18 @@ func initExtension(db *C.sqlite3) error {
 		return fmt.Errorf("wrap host conn: %w", err)
 	}
 
+	vars, err := syzyext.LoadVars(dbPath)
+	if err != nil {
+		_ = writer.Release()
+		return fmt.Errorf("config: %w", err)
+	}
 	// SYZY_AUTOSPAWN=0 skips the auto-spawn; the extension still
 	// works, but nothing drains the journal until `syzy daemon` starts
 	// manually.
-	autoSpawn := os.Getenv("SYZY_AUTOSPAWN") != "0"
 	attached, err := syzyext.AttachWithRetry(writer, syzyext.Config{
 		DBPath:    dbPath,
-		AutoSpawn: autoSpawn,
+		AutoSpawn: vars.Get("SYZY_AUTOSPAWN") != "0",
+		Vars:      vars,
 	})
 	if err != nil {
 		_ = writer.Release()

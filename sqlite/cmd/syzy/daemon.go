@@ -23,6 +23,7 @@ import (
 	"github.com/wjordan/syzy/internal/layout"
 	"github.com/wjordan/syzy/internal/metadata"
 	"github.com/wjordan/syzy/internal/peerdisc"
+	"github.com/wjordan/syzy/internal/syzyenv"
 	"github.com/wjordan/syzy/internal/syzylog"
 	"github.com/wjordan/syzy/schemalog"
 	syzy "github.com/wjordan/syzy/sqlite"
@@ -412,7 +413,7 @@ func resolveClusterRoot(dbPath, clusterFlag, objectBackendFlag string, hasSeeds 
 	requested := firstNonEmpty(
 		strings.TrimSpace(clusterFlag),
 		strings.TrimSpace(objectBackendFlag),
-		strings.TrimSpace(os.Getenv("SYZY_CLUSTER")),
+		strings.TrimSpace(syzyenv.Getenv("SYZY_CLUSTER")),
 	)
 	if ok {
 		if requested != "" && requested != persisted {

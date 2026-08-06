@@ -4,13 +4,13 @@ import (
 	"context"
 	"errors"
 	"io"
-	"os"
 	"time"
 
 	"github.com/wjordan/syzy/crdt"
 	"github.com/wjordan/syzy/internal/journal"
 	"github.com/wjordan/syzy/internal/layout"
 	"github.com/wjordan/syzy/internal/s3fetch"
+	"github.com/wjordan/syzy/internal/syzyenv"
 )
 
 // Reaper tuning.
@@ -70,7 +70,7 @@ func (n *Node) seedSealerFromSelfLog(self crdt.Origin) {
 func (n *Node) reaperLoop(ctx context.Context, src *s3fetch.Source) {
 	interval := defaultReapInterval
 	// Debug override for fast iteration/validation (e.g. SYZY_REAP_INTERVAL=2s).
-	if v := os.Getenv("SYZY_REAP_INTERVAL"); v != "" {
+	if v := syzyenv.Getenv("SYZY_REAP_INTERVAL"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
 			interval = d
 		}

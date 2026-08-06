@@ -20,7 +20,7 @@ func TestOpenSchemaLogUnixDial(t *testing.T) {
 	t.Cleanup(func() { _ = srv.Close() })
 	t.Setenv("SYZY_SCHEMA_LOG_DIAL", "unix:"+ln.Addr().String())
 
-	log, closer, err := OpenSchemaLog(t.TempDir() + "/app.db")
+	log, closer, err := OpenSchemaLog(t.TempDir()+"/app.db", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

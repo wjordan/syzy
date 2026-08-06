@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+
+	"github.com/wjordan/syzy/internal/syzyenv"
 )
 
 // maxUnixSocketPath is the longest Unix-socket path this platform can
@@ -52,7 +54,10 @@ func CheckUnixSocketPath(path string) error {
 // fallback: callers relocate here rather than failing to bind.
 func socketDir() (string, error) {
 	dir := filepath.Join(os.TempDir(), "syzy-"+strconv.Itoa(os.Getuid()))
-	if d := os.Getenv("XDG_RUNTIME_DIR"); d != "" {
+	// Through syzyenv: inside the extension a plain os.Getenv can miss a
+	// variable the host still has, and a process that picks a different
+	// directory than its peers cannot find their sockets.
+	if d := syzyenv.Getenv("XDG_RUNTIME_DIR"); d != "" {
 		dir = filepath.Join(d, "syzy")
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
