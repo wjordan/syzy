@@ -57,8 +57,9 @@ type opener struct {
 	adopt *Handoff
 	log   *slog.Logger
 
-	ok      bool
-	unwinds []func()
+	ok          bool
+	forceRotate bool
+	unwinds     []func()
 
 	daemonClaim *layout.DaemonClaim
 	originClaim *layout.OriginClaim
@@ -107,6 +108,28 @@ func (o *opener) unwind() {
 // predecessor's handed-off lock (see Attach): no re-flock, no origin rotation,
 // resuming the predecessor's exact origin from its on-disk journal.
 func openWithAdopt(ctx context.Context, cfg Config, adopt *Handoff) (*Node, error) {
+	n, err := openAttempt(ctx, cfg, adopt, false)
+	if err != nil && adopt == nil && errors.Is(err, nodestate.ErrSelfLogIncomplete) {
+		// The claimed origin's snapshot promises seqs its self-log never
+		// captured; that origin must not produce new writes, and exiting
+		// would not bring the missing bytes back. Take the same recovery an
+		// unclean-shutdown restart takes: mint a fresh origin (the prior
+		// origin's directory stays for the secondary-drainer scan) and
+		// reopen. Adopting opens still fail: a handoff asserts exact-origin
+		// resume.
+		log := cfg.Log
+		if log == nil {
+			log = slog.New(slog.DiscardHandler)
+		}
+		log.Warn("syzy: claimed origin's self-log is incomplete; rotating to fresh origin", "err", err)
+		return openAttempt(ctx, cfg, adopt, true)
+	}
+	return n, err
+}
+
+// openAttempt runs one full open. forceRotate makes claimLocks mint a fresh
+// origin regardless of the clean_shutdown flag.
+func openAttempt(ctx context.Context, cfg Config, adopt *Handoff, forceRotate bool) (*Node, error) {
 	if cfg.Path == "" {
 		return nil, errors.New("syzy: Config.Path required")
 	}
@@ -118,7 +141,7 @@ func openWithAdopt(ctx context.Context, cfg Config, adopt *Handoff) (*Node, erro
 		return nil, fmt.Errorf("syzy: ensure metadata dir: %w", err)
 	}
 
-	o := &opener{cfg: cfg, adopt: adopt, log: log}
+	o := &opener{cfg: cfg, adopt: adopt, log: log, forceRotate: forceRotate}
 	defer o.unwind()
 
 	// Phase order is load-bearing (locks before state, state before
@@ -236,7 +259,7 @@ func (o *opener) claimLocks() error {
 		if err != nil {
 			return fmt.Errorf("syzy: read clean_shutdown: %w", err)
 		}
-		uncleanRestart := hadCleanFlag && !wasClean
+		uncleanRestart := o.forceRotate || (hadCleanFlag && !wasClean)
 		switch {
 		case uncleanRestart:
 			// Rotate to a fresh origin even when pinned: never reuse a

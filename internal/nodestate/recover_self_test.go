@@ -1,6 +1,7 @@
 package nodestate
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/wjordan/syzy/crdt"
@@ -192,8 +193,12 @@ func TestRecoverSelf_PromotionGapFatal(t *testing.T) {
 	cache := New(recoverSelfOrigin)
 	// Claim seqs up to 4 (senderNextSeq=5) though the self-log covers only 2.
 	cache.ObserveSelfSeq(recoverSelfOrigin, 4)
-	if err := RecoverSelf(cache, j, nil, nil); err == nil {
+	err := RecoverSelf(cache, j, nil, nil)
+	if err == nil {
 		t.Fatal("RecoverSelf tolerated uncaptured produced seqs; want fatal promotion guard")
+	}
+	if !errors.Is(err, ErrSelfLogIncomplete) {
+		t.Fatalf("promotion guard error = %v, want ErrSelfLogIncomplete (the open path rotates on it)", err)
 	}
 }
 

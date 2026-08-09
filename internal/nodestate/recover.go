@@ -10,6 +10,12 @@ import (
 	"github.com/wjordan/syzy/internal/journal"
 )
 
+// ErrSelfLogIncomplete reports that an origin's persisted senderNextSeq
+// claims seqs its self-log never captured. The origin must not produce
+// new writes; a fresh (non-adopt) open recovers by rotating to a new
+// origin, an adopting open fails.
+var ErrSelfLogIncomplete = errors.New("self-log incomplete")
+
 // CellTables resolves tables that replay with per-column cell-clock
 // bookkeeping (known, live, cell clock group). The engine catalog
 // implements it; nil keeps the row-level replay for every table.
@@ -291,7 +297,7 @@ func RecoverSelf(cache *Cache, j *journal.Journal, tables CellTables, blobs Self
 	// Their clean-shutdown snapshot covers the skipped records; a true
 	// single-node promotion has no legacy self-mirror records.
 	if legacy == 0 && claimedNext > 1 && maxSeq < claimedNext-1 {
-		return fmt.Errorf("nodestate: self-log covers up to seq %d but senderNextSeq=%d — %d locally-produced seq(s) were never captured (single-node run promoted to replicated?); re-provision this node from a peer or S3", maxSeq, claimedNext, claimedNext-1-maxSeq)
+		return fmt.Errorf("nodestate: %w: self-log covers up to seq %d but senderNextSeq=%d — %d locally-produced seq(s) were never captured (single-node run promoted to replicated?)", ErrSelfLogIncomplete, maxSeq, claimedNext, claimedNext-1-maxSeq)
 	}
 	cache.SetSnapshotMarker(self, marker)
 	return nil
