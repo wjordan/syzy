@@ -22,10 +22,14 @@ type Error struct {
 }
 
 func (e Error) Error() string {
-	if e.Msg == "" {
-		return fmt.Sprintf("sqlite: %s (code %d)", errStrFromCode(C.int(e.Code)), e.Code)
+	code := fmt.Sprintf("code %d", e.Code)
+	if e.Extended != 0 && e.Extended != e.Code {
+		code += fmt.Sprintf(", extended %d", e.Extended)
 	}
-	return fmt.Sprintf("sqlite: %s (code %d)", e.Msg, e.Code)
+	if e.Msg == "" {
+		return fmt.Sprintf("sqlite: %s (%s)", errStrFromCode(C.int(e.Code)), code)
+	}
+	return fmt.Sprintf("sqlite: %s (%s)", e.Msg, code)
 }
 
 // IsCode reports whether err wraps a sqlitebridge.Error with the given primary

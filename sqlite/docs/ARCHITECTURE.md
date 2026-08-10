@@ -875,6 +875,10 @@ reservation conflict wraps `unique.ErrConflict` and is final; backend
 unavailability wraps `unique.ErrUnavailable` and may be retried after the
 writer has been released. Both retain `SQLITE_CONSTRAINT_COMMITHOOK` as the
 underlying SQLite error, so low-level SQLite diagnostics remain accurate.
+When SQLite supplies an extended result code, `sqlitebridge.Error` includes
+both the primary and extended numbers in its text form; logs must preserve the
+specific failure rather than collapsing every `SQLITE_IOERR` or constraint
+variant to its primary code.
 
 ### Registry interface
 

@@ -53,6 +53,13 @@ func TestError_CommitHookVetoCarriesExtendedCode(t *testing.T) {
 	}
 }
 
+func TestErrorTextIncludesExtendedCode(t *testing.T) {
+	err := Error{Code: 10, Extended: 266, Msg: "disk I/O error"}
+	if got, want := err.Error(), "sqlite: disk I/O error (code 10, extended 266)"; got != want {
+		t.Fatalf("Error() = %q, want %q", got, want)
+	}
+}
+
 func TestError_CommitHookCausePreservesSQLiteCode(t *testing.T) {
 	c, err := Open(":memory:", 0)
 	if err != nil {
