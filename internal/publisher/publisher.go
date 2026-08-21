@@ -968,10 +968,9 @@ func (p *Publisher) claimOrTakeover(ctx context.Context) error {
 
 		switch {
 		case errors.Is(err, objstore.ErrNoHEAD):
-			// Empty bucket — first publisher. Resolve cluster_id and
-			// retry; the resolve flow stamps a beacon HEAD which the
-			// next iteration will read.
-			if _, rerr := objstore.ResolveClusterID(ctx, p.cfg.Backend); rerr != nil {
+			// Empty bucket: first publisher. Stamp a beacon HEAD with our
+			// cluster_id (a forked database already has one) and re-read.
+			if _, rerr := objstore.ClaimClusterID(ctx, p.cfg.Backend, p.cfg.ClusterID); rerr != nil {
 				return fmt.Errorf("resolve cluster_id: %w", rerr)
 			}
 			continue

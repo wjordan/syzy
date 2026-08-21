@@ -23,6 +23,21 @@ import (
 // The returned string is the canonical 32-char lowercase hex form
 // (matching the publish path's encoding).
 func ResolveClusterID(ctx context.Context, b objectstore.Bucket) (string, error) {
+	return resolveClusterID(ctx, b, "")
+}
+
+// ClaimClusterID is ResolveClusterID for a node that already carries a
+// cluster_id (a forked database): an absent HEAD is stubbed with the
+// node's own id instead of a fresh one. An existing HEAD wins as usual;
+// the caller compares and reports a mismatch.
+func ClaimClusterID(ctx context.Context, b objectstore.Bucket, clusterID string) (string, error) {
+	if clusterID == "" {
+		return "", errors.New("objstore: ClaimClusterID: cluster_id required")
+	}
+	return resolveClusterID(ctx, b, clusterID)
+}
+
+func resolveClusterID(ctx context.Context, b objectstore.Bucket, preferred string) (string, error) {
 	const maxAttempts = 4
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		head, _, err := LoadHEAD(ctx, b)
@@ -35,13 +50,16 @@ func ResolveClusterID(ctx context.Context, b objectstore.Bucket) (string, error)
 		if !errors.Is(err, ErrNoHEAD) {
 			return "", err
 		}
-		// No HEAD yet — try to claim it with a fresh id. Loser of the
-		// race re-loads on the next iteration.
-		var raw [16]byte
-		if _, err := rand.Read(raw[:]); err != nil {
-			return "", fmt.Errorf("objstore: mint cluster_id: %w", err)
+		// No HEAD yet — try to claim it. Loser of the race re-loads on
+		// the next iteration.
+		cid := preferred
+		if cid == "" {
+			var raw [16]byte
+			if _, err := rand.Read(raw[:]); err != nil {
+				return "", fmt.Errorf("objstore: mint cluster_id: %w", err)
+			}
+			cid = hex.EncodeToString(raw[:])
 		}
-		cid := hex.EncodeToString(raw[:])
 		stub := &HEAD{Version: HEADVersion, ClusterID: cid}
 		_, err = CASHead(ctx, b, stub, objectstore.IfAbsent())
 		if err == nil {

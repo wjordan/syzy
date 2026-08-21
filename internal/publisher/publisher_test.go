@@ -493,10 +493,10 @@ func waitForPublisher(t *testing.T, be objectstore.Bucket, nodeID string, timeou
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		head, _, err := objstore.LoadHEAD(context.Background(), be)
-		if err != nil {
+		if err != nil && !errors.Is(err, objstore.ErrNoHEAD) {
 			t.Fatalf("LoadHEAD: %v", err)
 		}
-		if head.Publisher != nil && head.Publisher.NodeID == nodeID {
+		if err == nil && head.Publisher != nil && head.Publisher.NodeID == nodeID {
 			return
 		}
 		time.Sleep(time.Millisecond)
@@ -533,4 +533,49 @@ func waitForBaselineAfter(t *testing.T, be objectstore.Bucket, meta bool, txid u
 	}
 	t.Fatalf("timeout waiting for baseline meta=%v after txid %d, baseline=%+v meta_baseline=%+v",
 		meta, txid, head.Baseline, head.MetaBaseline)
+}
+
+// TestInitialClaim_EmptyBucketKeepsClusterID: a publisher whose database
+// already carries a cluster_id (a forked database) claims an empty bucket
+// under that id rather than minting a second one and refusing itself.
+func TestInitialClaim_EmptyBucketKeepsClusterID(t *testing.T) {
+	t.Parallel()
+	be, err := objectstore.OpenFS(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenFS: %v", err)
+	}
+	baseline, _ := stubBaseline(t)
+	walPath := filepath.Join(t.TempDir(), "missing-app.db-wal")
+	const clusterID = "f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0"
+	p, err := publisher.New(publisher.Config{
+		Backend:           be,
+		ClusterID:         clusterID,
+		NodeID:            "nodeA",
+		WALPath:           walPath,
+		MetaWALPath:       walPath,
+		Baseline:          baseline,
+		MetaBaseline:      stubMetaBaselineFn(t),
+		HeartbeatInterval: 10 * time.Millisecond,
+		LeaseExpiry:       50 * time.Millisecond,
+		LTXSyncInterval:   5 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- p.Run(ctx) }()
+	waitForPublisher(t, be, "nodeA", 500*time.Millisecond)
+	waitForBaselineAfter(t, be, false, 0, 500*time.Millisecond)
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	head, _, err := objstore.LoadHEAD(context.Background(), be)
+	if err != nil {
+		t.Fatalf("LoadHEAD: %v", err)
+	}
+	if head.ClusterID != clusterID {
+		t.Fatalf("HEAD.ClusterID = %s, want %s", head.ClusterID, clusterID)
+	}
 }
