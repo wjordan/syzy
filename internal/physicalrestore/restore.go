@@ -19,7 +19,14 @@ import (
 )
 
 func MaterializeStream(ctx context.Context, be objectstore.Bucket, prefix string, baseline *objstore.Baseline, dst string, capTXID uint64) error {
-	return materializeStream(ctx, be, prefix, baseline, dst, capTXID, func(f *os.File) error { return f.Sync() })
+	return materializeStream(ctx, be, prefix, baseline, dst, capTXID, time.Time{}, func(f *os.File) error { return f.Sync() })
+}
+
+// MaterializeStreamStableBefore materializes the newest chain whose delta
+// objects were last modified no later than stableBefore. The HEAD-referenced
+// baseline remains eligible because it is a self-contained immutable snapshot.
+func MaterializeStreamStableBefore(ctx context.Context, be objectstore.Bucket, prefix string, baseline *objstore.Baseline, dst string, capTXID uint64, stableBefore time.Time) error {
+	return materializeStream(ctx, be, prefix, baseline, dst, capTXID, stableBefore, func(f *os.File) error { return f.Sync() })
 }
 
 // materializeStream keeps one scratch file open across the baseline and every
@@ -28,7 +35,7 @@ func MaterializeStream(ctx context.Context, be objectstore.Bucket, prefix string
 // caller installs it; syncing every immutable intermediate state only turns a
 // restore of N frames into N storage barriers without making a partial image
 // usable after a crash.
-func materializeStream(ctx context.Context, be objectstore.Bucket, prefix string, baseline *objstore.Baseline, dst string, capTXID uint64, syncFile func(*os.File) error) error {
+func materializeStream(ctx context.Context, be objectstore.Bucket, prefix string, baseline *objstore.Baseline, dst string, capTXID uint64, stableBefore time.Time, syncFile func(*os.File) error) error {
 	t0 := time.Now()
 	verifier := &chainVerifier{}
 	dstFile, err := os.OpenFile(dst, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
@@ -41,7 +48,7 @@ func materializeStream(ctx context.Context, be objectstore.Bucket, prefix string
 		return err
 	}
 	t1 := time.Now()
-	plan, err := planLTXChain(ctx, be, prefix, baseline.TXID, capTXID)
+	plan, err := planLTXChain(ctx, be, prefix, baseline.TXID, capTXID, stableBefore)
 	if err != nil {
 		return err
 	}
@@ -114,7 +121,7 @@ type ltxChainPlan struct {
 // selects the non-overlapping chain from that same snapshot. Re-listing for the
 // apply phase doubles remote LIST work and can even choose from a different
 // bucket view than the tip calculation.
-func planLTXChain(ctx context.Context, be objectstore.Bucket, prefix string, baselineTXID, capTXID uint64) (ltxChainPlan, error) {
+func planLTXChain(ctx context.Context, be objectstore.Bucket, prefix string, baselineTXID, capTXID uint64, stableBefore time.Time) (ltxChainPlan, error) {
 	l0Files, err := objstore.ListLTXAfter(ctx, be, prefix, objstore.L0Level, baselineTXID)
 	if err != nil {
 		return ltxChainPlan{}, fmt.Errorf("list L0 after baseline: %w", err)
@@ -122,6 +129,10 @@ func planLTXChain(ctx context.Context, be objectstore.Bucket, prefix string, bas
 	l1Files, err := objstore.ListLTXAfter(ctx, be, prefix, objstore.L1Level, baselineTXID)
 	if err != nil {
 		return ltxChainPlan{}, fmt.Errorf("list L1 after baseline: %w", err)
+	}
+	if !stableBefore.IsZero() {
+		l0Files = filterLTXStableBefore(l0Files, stableBefore)
+		l1Files = filterLTXStableBefore(l1Files, stableBefore)
 	}
 	tip := baselineTXID
 	for _, files := range [][]objstore.LTXFile{l0Files, l1Files} {
@@ -151,6 +162,18 @@ func planLTXChain(ctx context.Context, be objectstore.Bucket, prefix string, bas
 		l0Selected: selection.l0, l1Selected: selection.l1,
 		entries: selection.entries,
 	}, nil
+}
+
+func filterLTXStableBefore(files []objstore.LTXFile, stableBefore time.Time) []objstore.LTXFile {
+	out := files[:0]
+	for _, f := range files {
+		// A zero timestamp comes from a backend that cannot report modification
+		// time. Do not silently discard its entire chain.
+		if f.Modified.IsZero() || !f.Modified.After(stableBefore) {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 // restoreBaseline materializes the baseline LTX into dstPath: one

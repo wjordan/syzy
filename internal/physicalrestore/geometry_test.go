@@ -161,7 +161,7 @@ func TestMaterializeStreamSyncsCompletedImageOnce(t *testing.T) {
 	syncs := 0
 	counted := &listCountingBucket{Bucket: be}
 	err = materializeStream(ctx, counted, objstore.DBPrefix,
-		&objstore.Baseline{TXID: 1, LTXRef: baselineRef}, dst, 0,
+		&objstore.Baseline{TXID: 1, LTXRef: baselineRef}, dst, 0, time.Time{},
 		func(f *os.File) error {
 			syncs++
 			fi, err := f.Stat()
@@ -188,6 +188,36 @@ func TestMaterializeStreamSyncsCompletedImageOnce(t *testing.T) {
 	}
 	if counted.lists != 2 {
 		t.Fatalf("bucket LIST calls = %d, want one L0 and one L1 listing", counted.lists)
+	}
+}
+
+func TestMaterializeStreamStableBeforeExcludesChangingTail(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	be, err := objectstore.OpenFS(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenFS: %v", err)
+	}
+	const pageSize = 512
+	baselineRef := publishTestLTX(t, be, objstore.BaselineLevel, 1, 1,
+		encodeTestLTX(t, pageSize, 3, 1, 1, 0xB1, 1, 2, 3))
+	// This recent tail cannot be applied coherently because its growth frame is
+	// absent. A settled-tail restore excludes it and retains the valid baseline.
+	publishTestLTX(t, be, objstore.L0Level, 3, 3,
+		encodeTestLTX(t, pageSize, 5, 3, 3, 0xC3, 1))
+
+	dst := filepath.Join(t.TempDir(), "app.db")
+	err = MaterializeStreamStableBefore(ctx, be, objstore.DBPrefix,
+		&objstore.Baseline{TXID: 1, LTXRef: baselineRef}, dst, 0, time.Now().Add(-time.Minute))
+	if err != nil {
+		t.Fatalf("MaterializeStreamStableBefore: %v", err)
+	}
+	fi, err := os.Stat(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := int64(3 * pageSize); fi.Size() != want {
+		t.Fatalf("materialized %d bytes, want settled baseline size %d", fi.Size(), want)
 	}
 }
 

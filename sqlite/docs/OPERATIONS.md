@@ -182,6 +182,11 @@ err := syzy.Restore(ctx, "app.db",
 ```
 
 `sqlite.RestoreFromBucket` accepts an already-open `objectstore.Bucket`.
+`RestoreFromBucketWithOptions` also accepts a `TailStability` horizon for a
+cross-region join: it restores the current baseline plus only older delta
+objects, then normal replication catches up after open. This avoids waiting for
+the newest object listing to settle; a zero horizon restores the latest listed
+tail.
 
 ### Full restore and lazy bootstrap
 

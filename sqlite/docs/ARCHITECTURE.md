@@ -1492,7 +1492,14 @@ HEAD without either baseline has no restorable state. Baseline and delta frames
 write into one private staged file without per-frame durability barriers; after
 the complete stream passes its geometry and checksum checks, that file is synced
 once. Restore lists each stream's post-baseline L0/L1 objects once and reuses
-that snapshot to choose the tip and the non-overlapping apply chain.
+that snapshot to choose the tip and the non-overlapping apply chain. A caller
+using `RestoreFromBucketWithOptions` may set `TailStability`; delta objects
+modified inside that horizon are excluded from both stream plans. This installs
+the newest verified settled state instead of depending on a cross-region LIST
+to expose every object at the actively changing tail. The current immutable
+baselines remain eligible because each is a self-contained HEAD-referenced
+snapshot; ordinary replication catches the opened replica up from the settled
+point. A zero horizon preserves latest-tail restore behavior.
 `RestoreFromBucket` adopts those durable staged files directly by
 same-filesystem rename; URL and peer clone streams still sync their received
 copies before installation.

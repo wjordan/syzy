@@ -105,11 +105,28 @@ func restoreOne(ctx context.Context, dstPath, src string, opts RestoreOptions) e
 // callers (including lazyrestore's full-restore fallback) can
 // treat this as "fresh cluster, run the empty-DB path."
 func RestoreFromBucket(ctx context.Context, dstPath string, bucket objectstore.Bucket) error {
+	return RestoreFromBucketWithOptions(ctx, dstPath, bucket, BucketRestoreOptions{})
+}
+
+// BucketRestoreOptions controls physical restoration from an object bucket.
+type BucketRestoreOptions struct {
+	// TailStability excludes delta objects modified within this duration before
+	// the restore began. The current immutable baseline remains eligible.
+	TailStability time.Duration
+}
+
+// RestoreFromBucketWithOptions restores from an already-open bucket with an
+// optional settled-tail horizon. A zero-valued options struct is equivalent to
+// RestoreFromBucket.
+func RestoreFromBucketWithOptions(ctx context.Context, dstPath string, bucket objectstore.Bucket, opts BucketRestoreOptions) error {
 	if dstPath == "" {
 		return errors.New("syzy: RestoreFromBucket: empty dstPath")
 	}
 	if bucket == nil {
 		return errors.New("syzy: RestoreFromBucket: nil bucket")
+	}
+	if opts.TailStability < 0 {
+		return errors.New("syzy: RestoreFromBucket: negative TailStability")
 	}
 	// Bound + retry every object-store call this restore makes (HEAD, list,
 	// chain tip, baseline, frames) so one hung connection cannot wedge the open.
@@ -133,8 +150,12 @@ func RestoreFromBucket(ctx context.Context, dstPath string, bucket objectstore.B
 	defer os.RemoveAll(tmpDir)
 	stagedApp := filepath.Join(tmpDir, "app.db")
 	stagedMeta := filepath.Join(tmpDir, "metadata.db")
+	var stableBefore time.Time
+	if opts.TailStability > 0 {
+		stableBefore = tStart.Add(-opts.TailStability)
+	}
 	materializeT0 := time.Now()
-	if err := restoreFromBucket(ctx, bucket, head, stagedApp, stagedMeta); err != nil {
+	if err := restoreFromBucket(ctx, bucket, head, stagedApp, stagedMeta, stableBefore); err != nil {
 		return fmt.Errorf("syzy: RestoreFromBucket: %w", err)
 	}
 	materializeDur := time.Since(materializeT0)
@@ -258,7 +279,7 @@ func openObjectSource(ctx context.Context, src string) (io.Reader, func(), error
 	stagedApp := filepath.Join(tmpDir, "app.db")
 	stagedMeta := filepath.Join(tmpDir, "metadata.db")
 
-	if err := restoreFromBucket(loadCtx, be, head, stagedApp, stagedMeta); err != nil {
+	if err := restoreFromBucket(loadCtx, be, head, stagedApp, stagedMeta, time.Time{}); err != nil {
 		cleanup()
 		return nil, func() {}, err
 	}
@@ -285,6 +306,7 @@ func restoreFromBucket(
 	be objectstore.Bucket,
 	head *objstore.HEAD,
 	stagedApp, stagedMeta string,
+	stableBefore time.Time,
 ) error {
 	// Restore metadata FIRST: it carries parent_app_txid, the app-side TXID the
 	// row_clock/CRDT state is coupled at. Capping the app (db) stream to it makes
@@ -298,7 +320,7 @@ func restoreFromBucket(
 	if head.MetaBaseline == nil {
 		return ErrNoBaseline
 	}
-	if err := physicalrestore.MaterializeStream(ctx, be, objstore.MetadataPrefix, head.MetaBaseline, stagedMeta, 0); err != nil {
+	if err := materializeBucketStream(ctx, be, objstore.MetadataPrefix, head.MetaBaseline, stagedMeta, 0, stableBefore); err != nil {
 		return fmt.Errorf("meta: %w", err)
 	}
 	tx, err := physicalrestore.ParentAppTXID(stagedMeta)
@@ -306,7 +328,7 @@ func restoreFromBucket(
 		return fmt.Errorf("read parent_app_txid: %w", err)
 	}
 	capTXID = tx
-	if err := physicalrestore.MaterializeStream(ctx, be, objstore.DBPrefix, head.Baseline, stagedApp, capTXID); err != nil {
+	if err := materializeBucketStream(ctx, be, objstore.DBPrefix, head.Baseline, stagedApp, capTXID, stableBefore); err != nil {
 		return fmt.Errorf("app: %w", err)
 	}
 	// Structural verification before the staged pair can be adopted: a
@@ -320,6 +342,13 @@ func restoreFromBucket(
 		return fmt.Errorf("meta: %w", err)
 	}
 	return nil
+}
+
+func materializeBucketStream(ctx context.Context, be objectstore.Bucket, prefix string, baseline *objstore.Baseline, dst string, capTXID uint64, stableBefore time.Time) error {
+	if stableBefore.IsZero() {
+		return physicalrestore.MaterializeStream(ctx, be, prefix, baseline, dst, capTXID)
+	}
+	return physicalrestore.MaterializeStreamStableBefore(ctx, be, prefix, baseline, dst, capTXID, stableBefore)
 }
 
 // verifyMaterializedFaults bounds how many integrity_check findings are

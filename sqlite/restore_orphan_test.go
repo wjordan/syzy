@@ -285,6 +285,82 @@ func TestRestoreConsistency_AppAheadOfMetaPinIsCapped(t *testing.T) {
 	}
 }
 
+func TestRestoreFromBucketTailStabilityExcludesRecentDeltas(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	be, err := objectstore.OpenFS(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenFS: %v", err)
+	}
+	node, err := syzy.Open(ctx, syzy.Config{
+		Path:          filepath.Join(t.TempDir(), "src.db"),
+		ObjectBackend: be,
+		SchemaLog:     schemalog.NewLocal(),
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	for _, sql := range []string{
+		`CREATE TABLE kv (k INT PRIMARY KEY NOT NULL, v TEXT)`,
+		`INSERT INTO kv VALUES (1, 'one')`,
+	} {
+		if err := node.Exec(sql); err != nil {
+			_ = node.Close()
+			t.Fatalf("Exec %q: %v", sql, err)
+		}
+	}
+	waitForBaseline(t, ctx, be)
+	if err := node.PublishSnapshot(ctx); err != nil {
+		_ = node.Close()
+		t.Fatalf("PublishSnapshot: %v", err)
+	}
+	settledHead, _, err := objstore.LoadHEAD(ctx, be)
+	if err != nil {
+		_ = node.Close()
+		t.Fatalf("LoadHEAD settled baseline: %v", err)
+	}
+	if err := node.Exec(`INSERT INTO kv VALUES (2, 'two')`); err != nil {
+		_ = node.Close()
+		t.Fatalf("Exec recent delta: %v", err)
+	}
+	if err := node.PublishSnapshot(ctx); err != nil {
+		_ = node.Close()
+		t.Fatalf("PublishSnapshot recent state: %v", err)
+	}
+	if err := node.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	// Keep the older coupled baseline active while retaining the freshly
+	// published coherent delta objects above it.
+	current, etag, err := objstore.LoadHEAD(ctx, be)
+	if err != nil {
+		t.Fatalf("LoadHEAD current: %v", err)
+	}
+	current.Baseline = settledHead.Baseline
+	current.MetaBaseline = settledHead.MetaBaseline
+	if _, err := objstore.CASHead(ctx, be, current, &etag); err != nil {
+		t.Fatalf("restore settled baseline pointers: %v", err)
+	}
+
+	latest := filepath.Join(t.TempDir(), "latest.db")
+	if err := syzy.RestoreFromBucket(ctx, latest, be); err != nil {
+		t.Fatalf("latest RestoreFromBucket: %v", err)
+	}
+	if got := readKVCount(t, latest); got != 2 {
+		t.Fatalf("latest rows = %d, want 2", got)
+	}
+
+	settled := filepath.Join(t.TempDir(), "settled.db")
+	if err := syzy.RestoreFromBucketWithOptions(ctx, settled, be, syzy.BucketRestoreOptions{
+		TailStability: time.Minute,
+	}); err != nil {
+		t.Fatalf("settled RestoreFromBucket: %v", err)
+	}
+	if got := readKVCount(t, settled); got != 1 {
+		t.Fatalf("settled rows = %d, want baseline row only", got)
+	}
+}
+
 // waitForBaseline blocks until the bucket has a publisher lease and an
 // initial baseline, so PublishSnapshot has a seeded TXID counter.
 func waitForBaseline(t *testing.T, ctx context.Context, be objectstore.Bucket) {
