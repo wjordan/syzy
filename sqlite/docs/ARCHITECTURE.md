@@ -1484,7 +1484,12 @@ must pass SQLite's full `integrity_check`, including b-tree key ordering and
 table/index consistency. Any finding aborts the restore while the image is still
 staged. The opened replica therefore has no read dependency on object storage
 and never adopts an image that merely passes SQLite's narrower `quick_check`. A
-HEAD without either baseline has no restorable state.
+HEAD without either baseline has no restorable state. Baseline and delta frames
+write into one private staged file without per-frame durability barriers; after
+the complete stream passes its geometry and checksum checks, that file is synced
+once. `RestoreFromBucket` adopts those durable staged files directly by
+same-filesystem rename; URL and peer clone streams still sync their received
+copies before installation.
 
 **Lazy bootstrap (`lazyrestore` optional package).** `lazyrestore.Prepare`
 restores `metadata.db` completely, pins the matching app TXID, builds a

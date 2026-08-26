@@ -19,9 +19,24 @@ import (
 )
 
 func MaterializeStream(ctx context.Context, be objectstore.Bucket, prefix string, baseline *objstore.Baseline, dst string, capTXID uint64) error {
+	return materializeStream(ctx, be, prefix, baseline, dst, capTXID, func(f *os.File) error { return f.Sync() })
+}
+
+// materializeStream keeps one scratch file open across the baseline and every
+// delta frame, then invokes syncFile once after the finished image has passed
+// its geometry and checksum checks. The scratch path is private until its
+// caller installs it; syncing every immutable intermediate state only turns a
+// restore of N frames into N storage barriers without making a partial image
+// usable after a crash.
+func materializeStream(ctx context.Context, be objectstore.Bucket, prefix string, baseline *objstore.Baseline, dst string, capTXID uint64, syncFile func(*os.File) error) error {
 	t0 := time.Now()
 	verifier := &chainVerifier{}
-	geo, err := restoreBaseline(ctx, be, baseline.LTXRef, dst, verifier)
+	dstFile, err := os.OpenFile(dst, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	defer dstFile.Close()
+	geo, err := restoreBaseline(ctx, be, baseline.LTXRef, dstFile, verifier)
 	if err != nil {
 		return err
 	}
@@ -47,7 +62,7 @@ func MaterializeStream(ctx context.Context, be objectstore.Bucket, prefix string
 	}
 	listDur := time.Since(t1)
 	t2 := time.Now()
-	files, chainBytes, chainGeo, err := applyLTXChain(ctx, be, prefix, baseline.TXID, through, dst, verifier)
+	files, chainBytes, chainGeo, err := applyLTXChain(ctx, be, prefix, baseline.TXID, through, dstFile, verifier)
 	if err != nil {
 		return fmt.Errorf("apply L0/L1 chain: %w", err)
 	}
@@ -59,15 +74,18 @@ func MaterializeStream(ctx context.Context, be objectstore.Bucket, prefix string
 	// into the stream (e.g. a publisher restart stranding checkpointed-
 	// but-unshipped txns), and the materialized image is malformed.
 	// Refusing here keeps the bad image out of clone.Adopt.
-	if err := verifyMaterializedSize(dst, geo); err != nil {
+	if err := verifyMaterializedSize(dstFile, geo); err != nil {
 		return fmt.Errorf("%s stream: %w", prefix, err)
 	}
 	// End-to-end attestation: the finished file must hash to the last
 	// applied frame's attested post-apply state.
-	if err := verifier.verifyFinal(dst); err != nil {
+	if err := verifier.verifyFinal(dstFile); err != nil {
 		return fmt.Errorf("%s stream: %w", prefix, err)
 	}
 	verifier.logSummary(prefix)
+	if err := syncFile(dstFile); err != nil {
+		return fmt.Errorf("%s stream: sync materialized image: %w", prefix, err)
+	}
 	// Per-stream restore cost. The chain_files count is the number of L0/L1 frames
 	// applied above the baseline; a large value means the baseline is stale and the
 	// restore is replaying a long delta chain (one GET per frame), the dominant
@@ -112,8 +130,8 @@ func chainTip(ctx context.Context, be objectstore.Bucket, prefix string, baselin
 // pointer on one node's metadata and the object on another's bytes.
 // Decoding a foreign baseline silently yields a corrupt database;
 // failing the hash here names the problem instead.
-func restoreBaseline(ctx context.Context, be objectstore.Bucket, ref objstore.FileRef, dstPath string, v *chainVerifier) (ltxGeometry, error) {
-	tmpPath := dstPath + ".baseline.ltx"
+func restoreBaseline(ctx context.Context, be objectstore.Bucket, ref objstore.FileRef, dst *os.File, v *chainVerifier) (ltxGeometry, error) {
+	tmpPath := dst.Name() + ".baseline.ltx"
 	defer os.Remove(tmpPath)
 	if err := FetchVerifiedRef(ctx, be, ref, tmpPath); err != nil {
 		return ltxGeometry{}, fmt.Errorf("baseline %s: %w", ref.Key, err)
@@ -123,7 +141,7 @@ func restoreBaseline(ctx context.Context, be objectstore.Bucket, ref objstore.Fi
 		return ltxGeometry{}, err
 	}
 	defer f.Close()
-	geo, err := decodeLTXReaderToFile(ctx, f, ref.Key, dstPath, true, v)
+	geo, err := decodeLTXReaderToFile(ctx, f, ref.Key, dst, true, v)
 	if err != nil {
 		return ltxGeometry{}, fmt.Errorf("apply baseline: %w", err)
 	}
@@ -177,7 +195,7 @@ type ltxGeometry struct {
 // context. v enforces the file's checksum attestations against the
 // materialized state (see chainVerifier); the decoder itself always
 // verifies the trailer's FileChecksum on Close.
-func decodeLTXReaderToFile(ctx context.Context, r io.Reader, key, dstPath string, fresh bool, v *chainVerifier) (ltxGeometry, error) {
+func decodeLTXReaderToFile(ctx context.Context, r io.Reader, key string, dst *os.File, fresh bool, v *chainVerifier) (ltxGeometry, error) {
 	dec := ltx.NewDecoder(r)
 	if err := dec.DecodeHeader(); err != nil {
 		return ltxGeometry{}, fmt.Errorf("decode header %s: %w", key, err)
@@ -191,15 +209,11 @@ func decodeLTXReaderToFile(ctx context.Context, r io.Reader, key, dstPath string
 		return ltxGeometry{}, err
 	}
 
-	flag := os.O_RDWR | os.O_CREATE
 	if fresh {
-		flag |= os.O_TRUNC
+		if err := dst.Truncate(0); err != nil {
+			return ltxGeometry{}, err
+		}
 	}
-	dst, err := os.OpenFile(dstPath, flag, 0o644)
-	if err != nil {
-		return ltxGeometry{}, err
-	}
-	defer dst.Close()
 
 	if !fresh && attested {
 		// Seed the rolling checksum from the materialized file when no
@@ -247,7 +261,7 @@ func decodeLTXReaderToFile(ctx context.Context, r io.Reader, key, dstPath string
 	} else if err := v.endFile(dst, hdr, dec.Trailer(), attested, key); err != nil {
 		return ltxGeometry{}, err
 	}
-	return geo, dst.Sync()
+	return geo, nil
 }
 
 // verifyMaterializedSize checks a materialized database file against the
@@ -256,11 +270,11 @@ func decodeLTXReaderToFile(ctx context.Context, r io.Reader, key, dstPath string
 // content hole; the image is malformed (SQLite's header claims pages the
 // file lacks) and must not be adopted. A longer file (the chain shrank
 // the database; non-fresh applies never truncate) is trimmed to commit.
-func verifyMaterializedSize(path string, geo ltxGeometry) error {
+func verifyMaterializedSize(f *os.File, geo ltxGeometry) error {
 	if geo.commit == 0 || geo.pageSize == 0 {
 		return nil
 	}
-	fi, err := os.Stat(path)
+	fi, err := f.Stat()
 	if err != nil {
 		return err
 	}
@@ -270,16 +284,16 @@ func verifyMaterializedSize(path string, geo ltxGeometry) error {
 		return fmt.Errorf("materialized %d bytes but the last applied frame committed %d pages of %d bytes (%d): the LTX chain is missing the page writes that grew the database",
 			fi.Size(), geo.commit, geo.pageSize, want)
 	case fi.Size() > want:
-		return os.Truncate(path, want)
+		return f.Truncate(want)
 	}
 	return nil
 }
 
 // applyLTXChain lists L0 and L1 LTX files under streamPrefix, picks
 // those whose TXID range falls inside (after, through], and applies
-// them in ascending MinTXID order to dstPath. Returns the last applied
+// them in ascending MinTXID order to dst. Returns the last applied
 // frame's geometry (zero when the chain is empty).
-func applyLTXChain(ctx context.Context, be objectstore.Bucket, streamPrefix string, after, through uint64, dstPath string, v *chainVerifier) (int, int64, ltxGeometry, error) {
+func applyLTXChain(ctx context.Context, be objectstore.Bucket, streamPrefix string, after, through uint64, dst *os.File, v *chainVerifier) (int, int64, ltxGeometry, error) {
 	l0, err := objstore.ListLTXAfter(ctx, be, streamPrefix, objstore.L0Level, after)
 	if err != nil {
 		return 0, 0, ltxGeometry{}, err
@@ -292,7 +306,7 @@ func applyLTXChain(ctx context.Context, be objectstore.Bucket, streamPrefix stri
 	if err := verifyChainTXIDs(entries); err != nil {
 		return 0, 0, ltxGeometry{}, err
 	}
-	bytes, geo, err := applyLTXEntries(ctx, be, entries, dstPath, v)
+	bytes, geo, err := applyLTXEntries(ctx, be, entries, dst, v)
 	return len(entries), bytes, geo, err
 }
 
@@ -309,7 +323,7 @@ const restorePrefetch = 16
 // apply. Frame bytes are small (page deltas); the bounded window keeps the
 // download buffer to ~restorePrefetch frames regardless of chain length.
 // Returns the last applied frame's geometry (zero when entries is empty).
-func applyLTXEntries(ctx context.Context, be objectstore.Bucket, entries []objstore.LTXFile, dstPath string, v *chainVerifier) (int64, ltxGeometry, error) {
+func applyLTXEntries(ctx context.Context, be objectstore.Bucket, entries []objstore.LTXFile, dst *os.File, v *chainVerifier) (int64, ltxGeometry, error) {
 	var total int64 // applies run serially in PrefetchOrdered, so no lock needed
 	var last ltxGeometry
 	err := PrefetchOrdered(ctx, len(entries), restorePrefetch,
@@ -322,7 +336,7 @@ func applyLTXEntries(ctx context.Context, be objectstore.Bucket, entries []objst
 		},
 		func(i int, data []byte) error {
 			total += int64(len(data))
-			geo, err := decodeLTXReaderToFile(ctx, bytes.NewReader(data), entries[i].Key, dstPath, false, v)
+			geo, err := decodeLTXReaderToFile(ctx, bytes.NewReader(data), entries[i].Key, dst, false, v)
 			if err == nil {
 				last = geo
 			}

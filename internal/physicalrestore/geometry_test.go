@@ -3,6 +3,7 @@ package physicalrestore
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -123,6 +124,56 @@ func TestRestoreLTXStreamGeometryOK(t *testing.T) {
 	}
 	if want := int64(5 * pageSize); fi.Size() != want {
 		t.Fatalf("materialized %d bytes, want %d", fi.Size(), want)
+	}
+}
+
+// TestMaterializeStreamSyncsCompletedImageOnce pins the restore durability
+// boundary: baseline and delta frames build one private scratch image, and only
+// the complete verified result is synced. Per-frame fsync turns a long object
+// chain into the same number of serial storage barriers without making any
+// intermediate image installable.
+func TestMaterializeStreamSyncsCompletedImageOnce(t *testing.T) {
+	ctx := context.Background()
+	be, err := objectstore.OpenFS(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenFS: %v", err)
+	}
+	const pageSize = 512
+
+	baselineRef := publishTestLTX(t, be, objstore.BaselineLevel, 1, 1,
+		encodeTestLTX(t, pageSize, 3, 1, 1, 0xB1, 1, 2, 3))
+	publishTestLTX(t, be, objstore.L0Level, 2, 2,
+		encodeTestLTX(t, pageSize, 5, 2, 2, 0xC2, 1, 4, 5))
+	publishTestLTX(t, be, objstore.L0Level, 3, 3,
+		encodeTestLTX(t, pageSize, 5, 3, 3, 0xC3, 1))
+
+	dst := filepath.Join(t.TempDir(), "app.db")
+	syncs := 0
+	err = materializeStream(ctx, be, objstore.DBPrefix,
+		&objstore.Baseline{TXID: 1, LTXRef: baselineRef}, dst, 0,
+		func(f *os.File) error {
+			syncs++
+			fi, err := f.Stat()
+			if err != nil {
+				return err
+			}
+			if want := int64(5 * pageSize); fi.Size() != want {
+				return fmt.Errorf("sync saw %d bytes, want completed %d-byte image", fi.Size(), want)
+			}
+			page := make([]byte, pageSize)
+			if _, err := f.ReadAt(page, 0); err != nil {
+				return err
+			}
+			if page[0] != 0xC3 {
+				return fmt.Errorf("sync saw page 1 marker %#x, want final frame %#x", page[0], 0xC3)
+			}
+			return f.Sync()
+		})
+	if err != nil {
+		t.Fatalf("materializeStream: %v", err)
+	}
+	if syncs != 1 {
+		t.Fatalf("sync calls = %d, want 1", syncs)
 	}
 }
 

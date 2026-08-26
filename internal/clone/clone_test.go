@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/wjordan/syzy/internal/layout"
+	"github.com/wjordan/syzy/internal/metadata"
 	"github.com/wjordan/syzy/sqlitebridge"
 )
 
@@ -36,6 +37,72 @@ func TestAdopt_RejectsMalformedBundle(t *testing.T) {
 				t.Fatalf("dst leaked: %v", statErr)
 			}
 		})
+	}
+}
+
+func TestAdoptFilesMovesStagedPair(t *testing.T) {
+	dir := t.TempDir()
+	metaPath := filepath.Join(dir, "staged-metadata.db")
+	appPath := filepath.Join(dir, "staged-app.db")
+	dstPath := filepath.Join(dir, "dst.db")
+
+	meta, err := metadata.Open(metaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := meta.Close(); err != nil {
+		t.Fatal(err)
+	}
+	app, err := sqlitebridge.Open(appPath, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Exec(`CREATE TABLE moved (id INTEGER PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stagedAppInfo, err := os.Stat(appPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := AdoptFiles(metaPath, appPath, dstPath); err != nil {
+		t.Fatal(err)
+	}
+	for _, consumed := range []string{metaPath, appPath} {
+		if _, err := os.Stat(consumed); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("source %s was not consumed: %v", consumed, err)
+		}
+	}
+	for _, installed := range []string{dstPath, layout.MetaDB(dstPath)} {
+		if _, err := os.Stat(installed); err != nil {
+			t.Fatalf("installed %s: %v", installed, err)
+		}
+	}
+	installedAppInfo, err := os.Stat(dstPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(stagedAppInfo, installedAppInfo) {
+		t.Fatal("app.db was copied instead of renamed")
+	}
+
+	db, err := sqlitebridge.Open(dstPath, sqlitebridge.OpenReadOnly|sqlitebridge.OpenURI|sqlitebridge.OpenNoMutex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	stmt, _, err := db.Prepare(`SELECT count(*) FROM sqlite_master WHERE name='moved'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stmt.Finalize()
+	if row, err := stmt.Step(); err != nil {
+		t.Fatal(err)
+	} else if !row || stmt.ColumnInt64(0) != 1 {
+		t.Fatal("adopted app.db did not contain staged schema")
 	}
 }
 

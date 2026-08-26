@@ -140,20 +140,8 @@ func RestoreFromBucket(ctx context.Context, dstPath string, bucket objectstore.B
 	if err := restoreFromBucket(ctx, bucket, head, stagedApp, stagedMeta); err != nil {
 		return fmt.Errorf("syzy: RestoreFromBucket: %w", err)
 	}
-	pr, pw := io.Pipe()
-	bundleErr := make(chan error, 1)
-	go func() {
-		err := clone.WriteBundleFromFiles(pw, stagedMeta, stagedApp)
-		_ = pw.CloseWithError(err)
-		bundleErr <- err
-	}()
-	_, adoptErr := clone.Adopt(pr, dstPath)
-	_ = pr.Close()
-	if err := <-bundleErr; err != nil {
-		return fmt.Errorf("syzy: RestoreFromBucket: bundle: %w", err)
-	}
-	if adoptErr != nil {
-		return fmt.Errorf("syzy: RestoreFromBucket: adopt: %w", adoptErr)
+	if _, err := clone.AdoptFiles(stagedMeta, stagedApp, dstPath); err != nil {
+		return fmt.Errorf("syzy: RestoreFromBucket: adopt: %w", err)
 	}
 	// Detect a row_clock <-> app.db divergence in the materialized result
 	// (e.g. a metadata baseline anchored ahead of the app stream, or a

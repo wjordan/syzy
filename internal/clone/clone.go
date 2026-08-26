@@ -422,6 +422,42 @@ func (pb *PinnedBundle) Close() {
 //
 // The newly-minted origin id is returned for logging.
 func Adopt(r io.Reader, dstAppDB string) (crdt.Origin, error) {
+	return adoptInto(dstAppDB, func(stageMetaDB, stageApp string) error {
+		br := bufio.NewReader(r)
+		if err := readMagic(br); err != nil {
+			return err
+		}
+		if err := readNamedFile(br, nameMetaDB, stageMetaDB); err != nil {
+			return err
+		}
+		return readNamedFile(br, nameAppDB, stageApp)
+	})
+}
+
+// AdoptFiles installs already-materialized, durable metadata.db and app.db
+// files without copying their bytes through the clone bundle format. The
+// source files must share a filesystem with dstAppDB and are consumed once
+// staging begins. Identity reset and final installation are identical to
+// Adopt's streamed path.
+func AdoptFiles(metaPath, appPath, dstAppDB string) (crdt.Origin, error) {
+	if metaPath == "" || appPath == "" {
+		return 0, errors.New("clone: AdoptFiles: source paths required")
+	}
+	return adoptInto(dstAppDB, func(stageMetaDB, stageApp string) error {
+		if err := os.Rename(metaPath, stageMetaDB); err != nil {
+			return fmt.Errorf("clone: stage metadata: %w", err)
+		}
+		if err := os.Rename(appPath, stageApp); err != nil {
+			return fmt.Errorf("clone: stage app.db: %w", err)
+		}
+		return nil
+	})
+}
+
+// adoptInto owns the common identity-reset and installation transaction. Its
+// populate callback must place metadata.db and app.db at the supplied staging
+// paths, either by receiving a stream or moving durable local files.
+func adoptInto(dstAppDB string, populate func(stageMetaDB, stageApp string) error) (crdt.Origin, error) {
 	if dstAppDB == "" {
 		return 0, errors.New("clone: Adopt: empty dstAppDB")
 	}
@@ -435,11 +471,6 @@ func Adopt(r io.Reader, dstAppDB string) (crdt.Origin, error) {
 		return 0, fmt.Errorf("clone: %s already exists; move it aside before cloning", metaDir)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return 0, fmt.Errorf("clone: stat %s: %w", metaDir, err)
-	}
-
-	br := bufio.NewReader(r)
-	if err := readMagic(br); err != nil {
-		return 0, err
 	}
 
 	// Stage everything alongside the final paths so the rename is a
@@ -465,11 +496,7 @@ func Adopt(r io.Reader, dstAppDB string) (crdt.Origin, error) {
 		_ = os.Remove(stageApp)
 	}()
 
-	// Two files, in declared order: metadata.db then app.db.
-	if err := readNamedFile(br, nameMetaDB, filepath.Join(stageMeta, "metadata.db")); err != nil {
-		return 0, err
-	}
-	if err := readNamedFile(br, nameAppDB, stageApp); err != nil {
+	if err := populate(filepath.Join(stageMeta, "metadata.db"), stageApp); err != nil {
 		return 0, err
 	}
 

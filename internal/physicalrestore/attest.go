@@ -203,15 +203,10 @@ func (v *chainVerifier) adoptSnapshot(hdr ltx.Header, trailer ltx.Trailer, attes
 // describes a byte-reality this restore was never anchored on). One
 // extra full read on a cold restore, ahead of the quick_check that
 // reads it all anyway.
-func (v *chainVerifier) verifyFinal(path string) error {
+func (v *chainVerifier) verifyFinal(f *os.File) error {
 	if !v.hasFinal || !(v.aligned || v.finalIsSelf) {
 		return nil
 	}
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
 	sum, err := checksumFilePages(f, v.commit, v.pageSize)
 	if err != nil {
 		return fmt.Errorf("checksum materialized file: %w", err)
