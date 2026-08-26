@@ -61,11 +61,12 @@ const (
 	// of the baseline's own size. Bounds cold-restore replay to ~(1+ratio)x
 	// the DB. Structural (size-driven), not wall-clock.
 	DefaultRebaselineChainBytesRatio = 1.0
-	// DefaultRebaselineMaxChainObjects is a failsafe: rebaseline once the
-	// chain exceeds this many objects regardless of bytes, so a tiny
-	// baseline whose bytes-ratio rarely trips can't let the object count
-	// (one restore GET each) balloon unbounded.
-	DefaultRebaselineMaxChainObjects = 5000
+	// DefaultRebaselineMaxChainObjects takes a fresh baseline once the
+	// non-overlapping chain restore would actually fetch reaches this many
+	// objects. Compacted L1 counts once; grace-retained covered L0 does not.
+	// At the default 64-L0 L1 chunk this is roughly the same baseline cadence
+	// as the former raw-object failsafe, but bounds restore GETs directly.
+	DefaultRebaselineMaxChainObjects = 64
 	// DefaultRebaselineMaxBaselineSkew is a failsafe: rebaseline once the
 	// meta baseline leads the db baseline by this many TXIDs, re-coupling
 	// the streams. Out-of-band meta WAL recycles (onMetaRecycle) advance
@@ -1179,18 +1180,25 @@ func (p *Publisher) maybeRebaseline(ctx context.Context) error {
 	dbBaseTXID := head.Baseline.TXID
 	dbBaseBytes := head.Baseline.LTXRef.Size
 
-	var chainObjects int
+	l0, err := objstore.ListLTXAfter(ctx, p.cfg.Backend, objstore.DBPrefix, objstore.L0Level, dbBaseTXID)
+	if err != nil {
+		return err
+	}
+	l1, err := objstore.ListLTXAfter(ctx, p.cfg.Backend, objstore.DBPrefix, objstore.L1Level, dbBaseTXID)
+	if err != nil {
+		return err
+	}
+	sortLTXFiles(l1)
+	l1Coverage := newLTXCoverage(l1, nil)
+	chainObjects := len(l1)
 	var chainBytes int64
-	for _, level := range []int{objstore.L0Level, objstore.L1Level} {
-		files, err := objstore.ListLTX(ctx, p.cfg.Backend, objstore.DBPrefix, level)
-		if err != nil {
-			return err
-		}
-		for _, f := range files {
-			if f.MaxTXID > dbBaseTXID {
-				chainObjects++
-				chainBytes += f.Size
-			}
+	for _, f := range l1 {
+		chainBytes += f.Size
+	}
+	for _, f := range l0 {
+		if !l1Coverage.Covers(f.MinTXID, f.MaxTXID) {
+			chainObjects++
+			chainBytes += f.Size
 		}
 	}
 	var skew uint64

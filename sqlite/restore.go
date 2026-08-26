@@ -126,10 +126,6 @@ func RestoreFromBucket(ctx context.Context, dstPath string, bucket objectstore.B
 		return ErrNoBaseline
 	}
 	headDur := time.Since(tStart)
-	defer func() {
-		slog.Info("syzy restore: from bucket complete",
-			"head_dur", headDur.Round(time.Millisecond), "total_dur", time.Since(tStart).Round(time.Millisecond))
-	}()
 	tmpDir, err := os.MkdirTemp(filepath.Dir(dstPath), ".syzy-restore-*")
 	if err != nil {
 		return fmt.Errorf("syzy: RestoreFromBucket: mkdir tmp: %w", err)
@@ -137,23 +133,34 @@ func RestoreFromBucket(ctx context.Context, dstPath string, bucket objectstore.B
 	defer os.RemoveAll(tmpDir)
 	stagedApp := filepath.Join(tmpDir, "app.db")
 	stagedMeta := filepath.Join(tmpDir, "metadata.db")
+	materializeT0 := time.Now()
 	if err := restoreFromBucket(ctx, bucket, head, stagedApp, stagedMeta); err != nil {
 		return fmt.Errorf("syzy: RestoreFromBucket: %w", err)
 	}
+	materializeDur := time.Since(materializeT0)
+	adoptT0 := time.Now()
 	if _, err := clone.AdoptFiles(stagedMeta, stagedApp, dstPath); err != nil {
 		return fmt.Errorf("syzy: RestoreFromBucket: adopt: %w", err)
 	}
+	adoptDur := time.Since(adoptT0)
 	// Detect a row_clock <-> app.db divergence in the materialized result
 	// (e.g. a metadata baseline anchored ahead of the app stream, or a
 	// holed db chain). Read-only and best-effort: a positive count means
 	// this node would serve CRDT metadata claiming rows its tables lack.
 	// Logged, not fatal — restore still produced the best point available.
+	consistencyT0 := time.Now()
 	if res, cerr := CheckRestoreConsistency(dstPath, MetadataPathFor(dstPath)); cerr != nil {
 		slog.Warn("syzy restore: consistency check skipped", "err", cerr)
 	} else if res.Orphans > 0 {
 		slog.Warn("syzy restore: orphan rows detected (metadata claims rows app.db lacks)",
 			"orphans", res.Orphans, "per_table", res.PerTable)
 	}
+	slog.Info("syzy restore: from bucket complete",
+		"head_dur", headDur.Round(time.Millisecond),
+		"materialize_dur", materializeDur.Round(time.Millisecond),
+		"adopt_dur", adoptDur.Round(time.Millisecond),
+		"consistency_dur", time.Since(consistencyT0).Round(time.Millisecond),
+		"total_dur", time.Since(tStart).Round(time.Millisecond))
 	return nil
 }
 
@@ -360,6 +367,6 @@ func verifyMaterializedDB(path string) error {
 	if len(faults) > 0 {
 		return fmt.Errorf("verify %s: integrity_check: %s", filepath.Base(path), strings.Join(faults, "; "))
 	}
-	slog.Debug("syzy restore: image verified", "db", filepath.Base(path), "dur", time.Since(t0).Round(time.Millisecond))
+	slog.Info("syzy restore: image verified", "db", filepath.Base(path), "dur", time.Since(t0).Round(time.Millisecond))
 	return nil
 }

@@ -36,78 +36,92 @@ func materializeStream(ctx context.Context, be objectstore.Bucket, prefix string
 		return err
 	}
 	defer dstFile.Close()
-	geo, err := restoreBaseline(ctx, be, baseline.LTXRef, dstFile, verifier)
+	geo, baselineStats, err := restoreBaseline(ctx, be, baseline.LTXRef, dstFile, verifier)
 	if err != nil {
 		return err
 	}
-	baselineDur := time.Since(t0)
 	t1 := time.Now()
-	tip, err := chainTip(ctx, be, prefix, baseline.TXID)
+	plan, err := planLTXChain(ctx, be, prefix, baseline.TXID, capTXID)
 	if err != nil {
 		return err
-	}
-	// Couple to metadata's parent_app_txid when given: never materialize past
-	// the TXID the row_clock state is consistent with, so the restored pair is a
-	// coherent snapshot. capTXID==0 (meta streams, legacy/unstamped buckets)
-	// restores to the stream tip. Clamp to the baseline TXID: a cap below the
-	// baseline means the baseline already encodes a later point, so apply nothing
-	// above it (the inverse decoupling — app state ahead of the meta pin — is not
-	// an orphan and needs no trimming).
-	through := tip
-	if capTXID > 0 && capTXID < through {
-		through = capTXID
-	}
-	if through < baseline.TXID {
-		through = baseline.TXID
 	}
 	listDur := time.Since(t1)
-	t2 := time.Now()
-	files, chainBytes, chainGeo, err := applyLTXChain(ctx, be, prefix, baseline.TXID, through, dstFile, verifier)
+	chainStats, err := applyLTXEntries(ctx, be, plan.entries, dstFile, verifier)
 	if err != nil {
 		return fmt.Errorf("apply L0/L1 chain: %w", err)
 	}
-	if chainGeo.commit != 0 {
-		geo = chainGeo
+	if chainStats.geo.commit != 0 {
+		geo = chainStats.geo
 	}
 	// The last applied frame's commit is the database's page count; a
 	// shorter file means some frame that grew the database never made it
 	// into the stream (e.g. a publisher restart stranding checkpointed-
 	// but-unshipped txns), and the materialized image is malformed.
 	// Refusing here keeps the bad image out of clone.Adopt.
+	t2 := time.Now()
 	if err := verifyMaterializedSize(dstFile, geo); err != nil {
 		return fmt.Errorf("%s stream: %w", prefix, err)
 	}
+	geometryDur := time.Since(t2)
 	// End-to-end attestation: the finished file must hash to the last
 	// applied frame's attested post-apply state.
+	t3 := time.Now()
 	if err := verifier.verifyFinal(dstFile); err != nil {
 		return fmt.Errorf("%s stream: %w", prefix, err)
 	}
+	attestDur := time.Since(t3)
 	verifier.logSummary(prefix)
+	t4 := time.Now()
 	if err := syncFile(dstFile); err != nil {
 		return fmt.Errorf("%s stream: sync materialized image: %w", prefix, err)
 	}
+	syncDur := time.Since(t4)
 	// Per-stream restore cost. The chain_files count is the number of L0/L1 frames
 	// applied above the baseline; a large value means the baseline is stale and the
 	// restore is replaying a long delta chain (one GET per frame), the dominant
 	// cold-restore latency. baseline_txid..through is the TXID span bridged (tip is
 	// the stream's own tip, which may exceed through under a parent_app_txid cap).
 	slog.Info("syzy restore: stream materialized",
-		"prefix", prefix, "baseline_txid", baseline.TXID, "tip", tip, "through", through,
-		"baseline_bytes", baseline.LTXRef.Size, "baseline_dur", baselineDur.Round(time.Millisecond),
+		"prefix", prefix, "baseline_txid", baseline.TXID, "tip", plan.tip, "through", plan.through,
+		"baseline_bytes", baseline.LTXRef.Size,
+		"baseline_fetch_dur", baselineStats.fetch.Round(time.Millisecond),
+		"baseline_verify_dur", baselineStats.verify.Round(time.Millisecond),
+		"baseline_decode_dur", baselineStats.decode.Round(time.Millisecond),
+		"baseline_dur", baselineStats.total().Round(time.Millisecond),
 		"chain_list_dur", listDur.Round(time.Millisecond),
-		"chain_files", files, "chain_bytes", chainBytes, "chain_apply_dur", time.Since(t2).Round(time.Millisecond))
+		"chain_l0_listed", plan.l0Listed, "chain_l1_listed", plan.l1Listed,
+		"chain_l0_files", plan.l0Selected, "chain_l1_files", plan.l1Selected,
+		"chain_files", len(plan.entries), "chain_bytes", chainStats.bytes,
+		"chain_prefetch", restorePrefetch,
+		"chain_fetch_wait_dur", chainStats.fetchWait().Round(time.Millisecond),
+		"chain_apply_cpu_dur", chainStats.apply.Round(time.Millisecond),
+		"chain_apply_dur", chainStats.pipeline.Round(time.Millisecond),
+		"final_geometry_dur", geometryDur.Round(time.Millisecond),
+		"final_attest_dur", attestDur.Round(time.Millisecond),
+		"final_sync_dur", syncDur.Round(time.Millisecond),
+		"stream_total_dur", time.Since(t0).Round(time.Millisecond))
 	return nil
 }
 
-// chainTip returns max(L0 tip, L1 tip, baselineTXID) for one stream.
-func chainTip(ctx context.Context, be objectstore.Bucket, prefix string, baselineTXID uint64) (uint64, error) {
+type ltxChainPlan struct {
+	tip, through           uint64
+	l0Listed, l1Listed     int
+	l0Selected, l1Selected int
+	entries                []objstore.LTXFile
+}
+
+// planLTXChain lists each post-baseline level once, derives the stream tip, and
+// selects the non-overlapping chain from that same snapshot. Re-listing for the
+// apply phase doubles remote LIST work and can even choose from a different
+// bucket view than the tip calculation.
+func planLTXChain(ctx context.Context, be objectstore.Bucket, prefix string, baselineTXID, capTXID uint64) (ltxChainPlan, error) {
 	l0Files, err := objstore.ListLTXAfter(ctx, be, prefix, objstore.L0Level, baselineTXID)
 	if err != nil {
-		return 0, fmt.Errorf("max L0 TXID: %w", err)
+		return ltxChainPlan{}, fmt.Errorf("list L0 after baseline: %w", err)
 	}
 	l1Files, err := objstore.ListLTXAfter(ctx, be, prefix, objstore.L1Level, baselineTXID)
 	if err != nil {
-		return 0, fmt.Errorf("max L1 TXID: %w", err)
+		return ltxChainPlan{}, fmt.Errorf("list L1 after baseline: %w", err)
 	}
 	tip := baselineTXID
 	for _, files := range [][]objstore.LTXFile{l0Files, l1Files} {
@@ -117,7 +131,26 @@ func chainTip(ctx context.Context, be objectstore.Bucket, prefix string, baselin
 			}
 		}
 	}
-	return tip, nil
+	// Couple to metadata's parent_app_txid when given: never materialize past
+	// the TXID the row_clock state is consistent with. A cap below the baseline
+	// cannot rewind that baseline, so it applies no deltas above it.
+	through := tip
+	if capTXID > 0 && capTXID < through {
+		through = capTXID
+	}
+	if through < baselineTXID {
+		through = baselineTXID
+	}
+	selection := selectLTXChain(l0Files, l1Files, baselineTXID, through)
+	if err := verifyChainTXIDs(selection.entries); err != nil {
+		return ltxChainPlan{}, err
+	}
+	return ltxChainPlan{
+		tip: tip, through: through,
+		l0Listed: len(l0Files), l1Listed: len(l1Files),
+		l0Selected: selection.l0, l1Selected: selection.l1,
+		entries: selection.entries,
+	}, nil
 }
 
 // restoreBaseline materializes the baseline LTX into dstPath: one
@@ -130,54 +163,80 @@ func chainTip(ctx context.Context, be objectstore.Bucket, prefix string, baselin
 // pointer on one node's metadata and the object on another's bytes.
 // Decoding a foreign baseline silently yields a corrupt database;
 // failing the hash here names the problem instead.
-func restoreBaseline(ctx context.Context, be objectstore.Bucket, ref objstore.FileRef, dst *os.File, v *chainVerifier) (ltxGeometry, error) {
+type baselineRestoreStats struct {
+	fetch, verify, decode time.Duration
+}
+
+func (s baselineRestoreStats) total() time.Duration { return s.fetch + s.verify + s.decode }
+
+func restoreBaseline(ctx context.Context, be objectstore.Bucket, ref objstore.FileRef, dst *os.File, v *chainVerifier) (ltxGeometry, baselineRestoreStats, error) {
+	var stats baselineRestoreStats
 	tmpPath := dst.Name() + ".baseline.ltx"
 	defer os.Remove(tmpPath)
-	if err := FetchVerifiedRef(ctx, be, ref, tmpPath); err != nil {
-		return ltxGeometry{}, fmt.Errorf("baseline %s: %w", ref.Key, err)
+	refStats, err := fetchVerifiedRef(ctx, be, ref, tmpPath)
+	stats.fetch, stats.verify = refStats.fetch, refStats.verify
+	if err != nil {
+		return ltxGeometry{}, stats, fmt.Errorf("baseline %s: %w", ref.Key, err)
 	}
 	f, err := os.Open(tmpPath)
 	if err != nil {
-		return ltxGeometry{}, err
+		return ltxGeometry{}, stats, err
 	}
 	defer f.Close()
+	t0 := time.Now()
 	geo, err := decodeLTXReaderToFile(ctx, f, ref.Key, dst, true, v)
+	stats.decode = time.Since(t0)
 	if err != nil {
-		return ltxGeometry{}, fmt.Errorf("apply baseline: %w", err)
+		return ltxGeometry{}, stats, fmt.Errorf("apply baseline: %w", err)
 	}
-	return geo, nil
+	return geo, stats, nil
 }
 
 // FetchVerifiedRef downloads the object at ref.Key into dstPath and
 // checks its size and sha256 against the FileRef recorded in HEAD
 // (hash check skipped when ref carries no hash — older HEADs).
 func FetchVerifiedRef(ctx context.Context, be objectstore.Bucket, ref objstore.FileRef, dstPath string) error {
+	_, err := fetchVerifiedRef(ctx, be, ref, dstPath)
+	return err
+}
+
+type fetchVerifiedRefStats struct {
+	fetch, verify time.Duration
+}
+
+func fetchVerifiedRef(ctx context.Context, be objectstore.Bucket, ref objstore.FileRef, dstPath string) (fetchVerifiedRefStats, error) {
+	var stats fetchVerifiedRefStats
 	f, err := os.OpenFile(dstPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
-		return err
+		return stats, err
 	}
 	defer f.Close()
+	t0 := time.Now()
 	if _, err := objectstore.FetchRangedAt(ctx, be, ref.Key, f, objectstore.FetchOpts{}); err != nil {
-		return fmt.Errorf("download: %w", err)
+		stats.fetch = time.Since(t0)
+		return stats, fmt.Errorf("download: %w", err)
 	}
+	stats.fetch = time.Since(t0)
 	if ref.Sha256 == "" {
-		return nil
+		return stats, nil
 	}
+	t1 := time.Now()
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return err
+		return stats, err
 	}
 	h := sha256.New()
 	n, err := io.Copy(h, f)
 	if err != nil {
-		return fmt.Errorf("read for verify: %w", err)
+		return stats, fmt.Errorf("read for verify: %w", err)
 	}
+	stats.verify = time.Since(t1)
 	if ref.Size != 0 && n != ref.Size {
-		return fmt.Errorf("size mismatch: object %d bytes, HEAD recorded %d", n, ref.Size)
+		return stats, fmt.Errorf("size mismatch: object %d bytes, HEAD recorded %d", n, ref.Size)
 	}
 	if got := hex.EncodeToString(h.Sum(nil)); got != ref.Sha256 {
-		return fmt.Errorf("sha256 mismatch: object %s, HEAD recorded %s (foreign bytes from a concurrent publisher?)", got, ref.Sha256)
+		return stats, fmt.Errorf("sha256 mismatch: object %s, HEAD recorded %s (foreign bytes from a concurrent publisher?)", got, ref.Sha256)
 	}
-	return nil
+	return stats, nil
 }
 
 // ltxGeometry is a decoded frame's database geometry: the committed
@@ -289,43 +348,35 @@ func verifyMaterializedSize(f *os.File, geo ltxGeometry) error {
 	return nil
 }
 
-// applyLTXChain lists L0 and L1 LTX files under streamPrefix, picks
-// those whose TXID range falls inside (after, through], and applies
-// them in ascending MinTXID order to dst. Returns the last applied
-// frame's geometry (zero when the chain is empty).
-func applyLTXChain(ctx context.Context, be objectstore.Bucket, streamPrefix string, after, through uint64, dst *os.File, v *chainVerifier) (int, int64, ltxGeometry, error) {
-	l0, err := objstore.ListLTXAfter(ctx, be, streamPrefix, objstore.L0Level, after)
-	if err != nil {
-		return 0, 0, ltxGeometry{}, err
-	}
-	l1, err := objstore.ListLTXAfter(ctx, be, streamPrefix, objstore.L1Level, after)
-	if err != nil {
-		return 0, 0, ltxGeometry{}, err
-	}
-	entries := SelectLTXChain(l0, l1, after, through)
-	if err := verifyChainTXIDs(entries); err != nil {
-		return 0, 0, ltxGeometry{}, err
-	}
-	bytes, geo, err := applyLTXEntries(ctx, be, entries, dst, v)
-	return len(entries), bytes, geo, err
-}
-
 // restorePrefetch bounds how many LTX frames are downloaded concurrently while
 // the apply loop consumes them in order. Restore wall time is dominated by
 // sequential object-store round-trips (one GET per frame) to a possibly-distant
 // bucket — a chain of N small frames costs N*RTT applied naively. Overlapping
 // the downloads collapses that to ~ceil(N/restorePrefetch)*RTT; the apply stays
 // strictly ordered (frames are page deltas that must land in TXID order).
-const restorePrefetch = 16
+const restorePrefetch = 32
 
 // applyLTXEntries applies an ordered LTX chain to dstPath, prefetching each
 // frame's bytes concurrently (bounded by restorePrefetch) ahead of the in-order
 // apply. Frame bytes are small (page deltas); the bounded window keeps the
 // download buffer to ~restorePrefetch frames regardless of chain length.
 // Returns the last applied frame's geometry (zero when entries is empty).
-func applyLTXEntries(ctx context.Context, be objectstore.Bucket, entries []objstore.LTXFile, dst *os.File, v *chainVerifier) (int64, ltxGeometry, error) {
-	var total int64 // applies run serially in PrefetchOrdered, so no lock needed
-	var last ltxGeometry
+type chainApplyStats struct {
+	bytes           int64
+	pipeline, apply time.Duration
+	geo             ltxGeometry
+}
+
+func (s chainApplyStats) fetchWait() time.Duration {
+	if s.pipeline <= s.apply {
+		return 0
+	}
+	return s.pipeline - s.apply
+}
+
+func applyLTXEntries(ctx context.Context, be objectstore.Bucket, entries []objstore.LTXFile, dst *os.File, v *chainVerifier) (chainApplyStats, error) {
+	var stats chainApplyStats // applies run serially, so no lock needed
+	t0 := time.Now()
 	err := PrefetchOrdered(ctx, len(entries), restorePrefetch,
 		func(ctx context.Context, i int) ([]byte, error) {
 			data, err := fetchObject(ctx, be, entries[i].Key)
@@ -335,15 +386,18 @@ func applyLTXEntries(ctx context.Context, be objectstore.Bucket, entries []objst
 			return data, nil
 		},
 		func(i int, data []byte) error {
-			total += int64(len(data))
+			stats.bytes += int64(len(data))
+			applyT0 := time.Now()
 			geo, err := decodeLTXReaderToFile(ctx, bytes.NewReader(data), entries[i].Key, dst, false, v)
+			stats.apply += time.Since(applyT0)
 			if err == nil {
-				last = geo
+				stats.geo = geo
 			}
 			return err
 		},
 	)
-	return total, last, err
+	stats.pipeline = time.Since(t0)
+	return stats, err
 }
 
 // restoreBound* bound every object-store request the restore makes, so a single
@@ -615,19 +669,30 @@ func PrefetchOrdered[T any](
 }
 
 func SelectLTXChain(l0, l1 []objstore.LTXFile, after, through uint64) []objstore.LTXFile {
+	return selectLTXChain(l0, l1, after, through).entries
+}
+
+type ltxChainSelection struct {
+	entries []objstore.LTXFile
+	l0, l1  int
+}
+
+func selectLTXChain(l0, l1 []objstore.LTXFile, after, through uint64) ltxChainSelection {
 	l1Entries := filterLTXRange(l1, after, through)
 	sortLTXChain(l1Entries)
 	l1Coverage := newRestoreLTXCoverage(l1Entries)
 
 	entries := append([]objstore.LTXFile{}, l1Entries...)
+	l0Selected := 0
 	for _, f := range filterLTXRange(l0, after, through) {
 		if l1Coverage.Covers(f.MinTXID, f.MaxTXID) {
 			continue
 		}
 		entries = append(entries, f)
+		l0Selected++
 	}
 	sortLTXChain(entries)
-	return entries
+	return ltxChainSelection{entries: entries, l0: l0Selected, l1: len(l1Entries)}
 }
 
 func filterLTXRange(files []objstore.LTXFile, after, through uint64) []objstore.LTXFile {

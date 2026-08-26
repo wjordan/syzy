@@ -64,6 +64,16 @@ func publishTestLTX(t *testing.T, be objectstore.Bucket, level int, minTXID, max
 	return ref
 }
 
+type listCountingBucket struct {
+	objectstore.Bucket
+	lists int
+}
+
+func (b *listCountingBucket) List(ctx context.Context, prefix, startAfter string) ([]objectstore.ObjectInfo, error) {
+	b.lists++
+	return b.Bucket.List(ctx, prefix, startAfter)
+}
+
 // TestRestoreLTXStreamDetectsLostGrowthFrame reproduces the incident
 // shape: baseline commits 3 pages; the frame that grew the database to
 // 5 pages (writing pages 4 and 5) never reached the bucket; a later
@@ -149,7 +159,8 @@ func TestMaterializeStreamSyncsCompletedImageOnce(t *testing.T) {
 
 	dst := filepath.Join(t.TempDir(), "app.db")
 	syncs := 0
-	err = materializeStream(ctx, be, objstore.DBPrefix,
+	counted := &listCountingBucket{Bucket: be}
+	err = materializeStream(ctx, counted, objstore.DBPrefix,
 		&objstore.Baseline{TXID: 1, LTXRef: baselineRef}, dst, 0,
 		func(f *os.File) error {
 			syncs++
@@ -174,6 +185,9 @@ func TestMaterializeStreamSyncsCompletedImageOnce(t *testing.T) {
 	}
 	if syncs != 1 {
 		t.Fatalf("sync calls = %d, want 1", syncs)
+	}
+	if counted.lists != 2 {
+		t.Fatalf("bucket LIST calls = %d, want one L0 and one L1 listing", counted.lists)
 	}
 }
 

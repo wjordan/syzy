@@ -1475,6 +1475,10 @@ the covering object has aged past the grace window. Retention also
 reclaims superseded baselines (below HEAD's active baseline pointer)
 and origin epochs whose records are durable at/below the applied
 frontier — both likewise only after grace.
+Structural rebaseline accounting matches restore selection: every L1 object
+counts once, while grace-retained L0 counts only when no L1 covers it. Covered
+history therefore cannot trigger a baseline or disguise the actual restore GET
+count.
 
 **Full restore (`Restore`, `RestoreFromBucket`).** Read HEAD → app and metadata
 baseline LTX FileRefs. Both baselines are required. Apply each baseline, then a
@@ -1487,7 +1491,9 @@ and never adopts an image that merely passes SQLite's narrower `quick_check`. A
 HEAD without either baseline has no restorable state. Baseline and delta frames
 write into one private staged file without per-frame durability barriers; after
 the complete stream passes its geometry and checksum checks, that file is synced
-once. `RestoreFromBucket` adopts those durable staged files directly by
+once. Restore lists each stream's post-baseline L0/L1 objects once and reuses
+that snapshot to choose the tip and the non-overlapping apply chain.
+`RestoreFromBucket` adopts those durable staged files directly by
 same-filesystem rename; URL and peer clone streams still sync their received
 copies before installation.
 

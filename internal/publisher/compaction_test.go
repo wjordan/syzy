@@ -410,6 +410,9 @@ func TestCompactor_SkipsBaselineCoveredL0(t *testing.T) {
 	if got, want := lb.startAfterFor(objstore.LTXLevelPrefix(objstore.DBPrefix, objstore.L0Level)), objstore.LTXKey(objstore.DBPrefix, objstore.L0Level, 10, ^uint64(0)); got != want {
 		t.Fatalf("L0 list startAfter = %q, want %q", got, want)
 	}
+	if got, want := lb.startAfterFor(objstore.LTXLevelPrefix(objstore.DBPrefix, objstore.L1Level)), objstore.LTXKey(objstore.DBPrefix, objstore.L1Level, 10, ^uint64(0)); got != want {
+		t.Fatalf("L1 list startAfter = %q, want %q", got, want)
+	}
 	if _, _, err := be.Get(ctx, objstore.LTXKey(objstore.DBPrefix, objstore.L1Level, 11, 12)); err != nil {
 		t.Fatalf("expected post-baseline L1: %v", err)
 	}

@@ -168,6 +168,63 @@ func TestMaybeRebaseline_NoTriggerWhenSmall(t *testing.T) {
 	}
 }
 
+// TestMaybeRebaseline_ChainObjectsMatchesRestoreSelection pins the object-count
+// trigger to the chain a restore actually fetches. Grace-retained L0 files
+// covered by one L1 count as that one L1, not as every overlapping object.
+func TestMaybeRebaseline_ChainObjectsMatchesRestoreSelection(t *testing.T) {
+	be, err := objectstore.OpenFS(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	p := newRebaselinePub(t, be, Config{
+		RebaselineChainBytesRatio: 1e9,
+		RebaselineMaxChainObjects: 2,
+		RebaselineMaxBaselineSkew: 1 << 60,
+	})
+	if err := p.seedTXIDCounters(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := p.takeCoupledBaselines(ctx); err != nil {
+		t.Fatalf("init baseline: %v", err)
+	}
+	head, _, _ := objstore.LoadHEAD(ctx, be)
+	base := head.Baseline.TXID
+
+	for txid := base + 1; txid <= base+3; txid++ {
+		if _, err := objstore.PublishLTX(ctx, be, objstore.DBPrefix, objstore.L0Level, txid, txid, rebTinyLTX(t, txid)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := objstore.PublishLTX(ctx, be, objstore.DBPrefix, objstore.L1Level, base+1, base+3, rebTinyLTX(t, base+3)); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.seedTXIDCounters(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.maybeRebaseline(ctx); err != nil {
+		t.Fatal(err)
+	}
+	head, _, _ = objstore.LoadHEAD(ctx, be)
+	if head.Baseline.TXID != base {
+		t.Fatalf("covered L0 inflated one selected object past threshold: baseline %d -> %d", base, head.Baseline.TXID)
+	}
+
+	if _, err := objstore.PublishLTX(ctx, be, objstore.DBPrefix, objstore.L0Level, base+4, base+4, rebTinyLTX(t, base+4)); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.seedTXIDCounters(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.maybeRebaseline(ctx); err != nil {
+		t.Fatal(err)
+	}
+	head, _, _ = objstore.LoadHEAD(ctx, be)
+	if head.Baseline.TXID <= base {
+		t.Fatalf("two selected objects did not trigger rebaseline: baseline still %d", head.Baseline.TXID)
+	}
+}
+
 func TestSeedTXIDCountersStartsAfterActiveBaselines(t *testing.T) {
 	be, err := objectstore.OpenFS(t.TempDir())
 	if err != nil {

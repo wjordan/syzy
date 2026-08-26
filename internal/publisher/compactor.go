@@ -21,7 +21,7 @@ import (
 const (
 	defaultCompactorMinFiles       = 60
 	defaultCompactorMaxInputFiles  = 64
-	defaultCompactorMaxRunsPerPass = 8
+	defaultCompactorMaxRunsPerPass = 32
 )
 
 // Compactor merges adjacent L0 LTX files into one L1 LTX, reducing
@@ -58,7 +58,8 @@ type Compactor struct {
 
 	// MaxRunsPerPass caps one compaction tick's object-store work.
 	// Later ticks skip the L1 coverage just emitted and resume from
-	// the remaining uncovered L0 backlog. Default 8.
+	// the remaining uncovered L0 backlog. Default 32 (at most 2048
+	// one-second L0 inputs), enough to catch up one default interval.
 	MaxRunsPerPass int
 }
 
@@ -116,7 +117,7 @@ func (c *Compactor) CompactOnceDetailed(ctx context.Context) (CompactionResult, 
 	}
 	res.BaselineTXID = baselineTXID
 
-	l1, err := objstore.ListLTX(ctx, c.Backend, c.StreamPrefix, objstore.L1Level)
+	l1, err := objstore.ListLTXAfter(ctx, c.Backend, c.StreamPrefix, objstore.L1Level, baselineTXID)
 	if err != nil {
 		return res, err
 	}
