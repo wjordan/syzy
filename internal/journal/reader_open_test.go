@@ -26,6 +26,17 @@ func TestReaderOpenDoesNotCreate(t *testing.T) {
 	}
 }
 
+func TestReaderOpenDoesNotCreateMissingDirectories(t *testing.T) {
+	t.Parallel()
+	dir := filepath.Join(t.TempDir(), "missing", "journal")
+	if j, err := Open(dir, 0, SyncOff); !errors.Is(err, ErrNoSegments) || j != nil {
+		t.Fatalf("reader open: journal=%v error=%v", j, err)
+	}
+	if _, err := os.Stat(filepath.Dir(dir)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("reader created directories: %v", err)
+	}
+}
+
 func TestHasDrainableSegment(t *testing.T) {
 	if HasDrainableSegment(filepath.Join(t.TempDir(), "absent")) {
 		t.Error("missing dir: want false")

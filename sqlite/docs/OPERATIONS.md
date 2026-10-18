@@ -204,6 +204,52 @@ The application `db/` LTX stream is readable by Litestream and can restore a
 plain SQLite file without Syzy metadata. That file is an exit path or recovery
 source; it must be cloned or joined before participating in the cluster again.
 
+## Uninitialized mirror segment recovery
+
+Stop the owning service and its automatic restart policy before repair. Preserve
+a coherent offline backup of the database and its entire `<db>-syzy` directory.
+Check filesystem/kernel errors and the application and metadata databases with
+read-only integrity checks. Validate that another replica or the object store
+can supply the affected origin's history; a valid donor journal is evidence of
+available history, not a file to install on this replica.
+
+Inspect a single suspected origin without opening a database or creating files:
+
+```bash
+syzy repair-mirror --db app.db --origin 123
+```
+
+This command accepts only one regular `seg-00000000.bin`, at least the minimum
+legal segment size and entirely zero-filled. Additional segments, unexpected
+entries, symlinks, and any nonzero byte cause refusal. Record the reported SHA-256 and
+review the path and size. After verifying that every writer and daemon is
+stopped, explicitly apply that exact plan:
+
+```bash
+syzy repair-mirror --db app.db --origin 123 --apply --expected-sha256 <digest>
+```
+
+Application requires the existing daemon lock and takes it and every existing
+producer-origin lock exclusively without blocking. All writers and automatic
+restart policies must remain stopped; these locks cannot prevent an uncoordinated
+external writer from starting. The command rechecks the bytes and moves the whole
+origin directory into a durable recovery directory beside `mirror/`, retaining its bytes and a
+JSON audit manifest. It changes no database or metadata rows. An interrupted
+repair leaves the original either at its original path or in the recorded
+recovery directory; no data is deleted and no donor entries are replayed.
+
+Restart only after inspecting the evidence path. Verify startup, SQLite
+integrity, schema identity, frontier/gap progress and ordinary anti-entropy
+against healthy replicas. Do not declare convergence from a successful process
+start alone. If startup finds another damaged segment, stop and investigate it
+instead of applying a blanket deletion. Keep the evidence and coherent backup
+until the replica's application state and replication progress are verified.
+
+Before restart, an aborted repair can be reversed while still offline only if
+the original origin path has not been recreated. After any restart or new writes,
+rollback requires the coherent database-and-metadata backup together; never put
+an old journal beside newer database or replication state.
+
 ## Health and observability
 
 For daemon deployments, start with:

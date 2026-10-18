@@ -1,7 +1,6 @@
 package journal
 
 import (
-	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -10,7 +9,6 @@ import (
 	"os"
 	"sync/atomic"
 	"syscall"
-	"time"
 	"unsafe"
 )
 
@@ -63,11 +61,12 @@ func openExistingSegment(path string, num uint32) (*segment, uint64, bool, error
 }
 
 func openSegmentFile(path string, num uint32, size uint32, create bool) (*segment, uint64, bool, error) {
-	flags := os.O_RDWR
-	if create {
-		flags |= os.O_CREATE
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if errors.Is(err, os.ErrNotExist) && create {
+		f, err = initializeSegment(path, size, segmentInitOps{
+			syncFile: fdatasyncFile, link: os.Link, syncDir: syncJournalDirectories,
+		})
 	}
-	f, err := os.OpenFile(path, flags, 0o600)
 	if err != nil {
 		return nil, 0, false, fmt.Errorf("journal: open segment: %w", err)
 	}
@@ -76,41 +75,10 @@ func openSegmentFile(path string, num uint32, size uint32, create bool) (*segmen
 		f.Close()
 		return nil, 0, false, fmt.Errorf("journal: stat segment: %w", err)
 	}
-	created := stat.Size() == 0
-	if created {
-		if size < minSegmentSize {
-			f.Close()
-			return nil, 0, false, fmt.Errorf("journal: segmentSize %d too small (min %d)", size, minSegmentSize)
-		}
-		var saltBuf [16]byte
-		if _, err := rand.Read(saltBuf[:]); err != nil {
-			f.Close()
-			return nil, 0, false, fmt.Errorf("journal: salt: %w", err)
-		}
-		if err := f.Truncate(int64(size)); err != nil {
-			f.Close()
-			return nil, 0, false, fmt.Errorf("journal: truncate segment: %w", err)
-		}
-		data, err := mmapFile(f, int(size))
-		if err != nil {
-			f.Close()
-			return nil, 0, false, err
-		}
-		hdr := fileHeader{
-			Magic:       magic,
-			Version:     formatVersion,
-			SegmentSize: size,
-			CreatedUs:   uint64(time.Now().UnixMicro()),
-			Salt0:       binary.LittleEndian.Uint64(saltBuf[0:]),
-			Salt1:       binary.LittleEndian.Uint64(saltBuf[8:]),
-		}
-		hdrBytes := encodeFileHeader(hdr)
-		copy(data[:fileHeaderSize], hdrBytes[:])
-		s := &segment{num: num, file: f, data: data, segmentSize: size, syncedHead: fileHeaderSize}
-		s.head.Store(fileHeaderSize)
-		return s, 0, false, nil
+	if !stat.Mode().IsRegular() || stat.Size() < fileHeaderSize || stat.Size() > int64(^uint32(0)) {
+		f.Close()
+		return nil, 0, false, fmt.Errorf("journal: invalid segment file size or type: %d bytes, %s", stat.Size(), stat.Mode())
 	}
-
 	size = uint32(stat.Size())
 	data, err := mmapFile(f, int(size))
 	if err != nil {
@@ -121,7 +89,7 @@ func openSegmentFile(path string, num uint32, size uint32, create bool) (*segmen
 	if err != nil {
 		_ = syscall.Munmap(data)
 		f.Close()
-		return nil, 0, false, fmt.Errorf("journal: header: %w", err)
+		return nil, 0, false, fmt.Errorf("journal: header %s: %w", path, err)
 	}
 	if hdr.SegmentSize != size {
 		_ = syscall.Munmap(data)

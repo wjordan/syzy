@@ -48,6 +48,21 @@ func planRanges(t *testing.T, c *nodestate.Cache, ts transport.TipSource) Result
 	return Plan(context.Background(), c, c.Self(), ts, 32)
 }
 
+func TestPlanDoesNotSpendRangeBudgetOnRetiredLocalHistory(t *testing.T) {
+	t.Parallel()
+	c := nodestate.New(2)
+	c.ObserveSelfSeq(7, 500000)
+	res := Plan(context.Background(), c, c.Self(), &fakeTips{
+		tips: map[crdt.Origin]crdt.Seq{7: 500000, 9: 4},
+	}, 1)
+	if len(res.Ranges) != 1 || res.Ranges[0] != (transport.Range{Origin: 9, Lo: 1, Hi: 4}) {
+		t.Fatalf("local producer replay starved remote history: %+v", res.Ranges)
+	}
+	if _, ok := res.Before[7]; ok {
+		t.Fatal("retired local producer was scheduled for remote replay")
+	}
+}
+
 // TestPlanDemotesUncoveredRange: a missing range intersecting no surviving
 // epoch interval moves to Unserveable, out of the normal per-round plan.
 func TestPlanDemotesUncoveredRange(t *testing.T) {

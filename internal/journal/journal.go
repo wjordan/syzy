@@ -151,9 +151,6 @@ type Journal struct {
 	// explicitly-installed wake/wait transport is unaffected.
 	pollOnly bool
 
-	// dirFile is held open for fsync at segment rotation. nil under SyncOff.
-	dirFile *os.File
-
 	// mu guards segments. The active segment pointer is published via
 	// atomic so the hot-path Append doesn't take mu in the common case.
 	mu       sync.RWMutex
@@ -200,18 +197,17 @@ func HasDrainableSegment(dir string) bool {
 // cache; SyncOn makes Sync() fsync new records to disk and is the
 // symmetric knob to app.db's synchronous=FULL.
 func Open(dir string, segmentSize uint32, mode SyncMode) (*Journal, error) {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if segmentSize == 0 {
+		if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+			return nil, ErrNoSegments
+		} else if err != nil {
+			return nil, err
+		}
+	} else if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("journal: mkdir: %w", err)
 	}
 	j := &Journal{dir: dir, segmentSize: segmentSize, notify: make(chan struct{}, 1), mode: mode,
 		pollOnly: !futex.PathEligible(dir)}
-	if mode == SyncOn {
-		df, err := os.Open(dir)
-		if err != nil {
-			return nil, fmt.Errorf("journal: open dir for fsync: %w", err)
-		}
-		j.dirFile = df
-	}
 	nums, err := listSegmentNumbers(dir)
 	if err != nil {
 		j.closeAll()
@@ -233,15 +229,6 @@ func Open(dir string, segmentSize uint32, mode SyncMode) (*Journal, error) {
 		j.segments = []*segment{s}
 		j.active.Store(s)
 		j.nextSeq.Store(1)
-		// Make the freshly-created first segment durable under SyncOn.
-		// Without this a host crash before the first Append could leave
-		// the file absent (no dir-entry fsync) or zero-length.
-		if mode == SyncOn {
-			if err := j.fsyncSegmentMeta(s); err != nil {
-				j.closeAll()
-				return nil, err
-			}
-		}
 		return j, nil
 	}
 	var maxSeq uint64
@@ -272,12 +259,6 @@ func Open(dir string, segmentSize uint32, mode SyncMode) (*Journal, error) {
 		}
 		j.segments = append(j.segments, s)
 		last = s
-		if mode == SyncOn {
-			if err := j.fsyncSegmentMeta(s); err != nil {
-				j.closeAll()
-				return nil, err
-			}
-		}
 	}
 	j.active.Store(last)
 	j.nextSeq.Store(maxSeq + 1)
@@ -328,12 +309,6 @@ func (j *Journal) closeAll() error {
 	}
 	j.segments = nil
 	j.active.Store(nil)
-	if j.dirFile != nil {
-		if err := j.dirFile.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-		j.dirFile = nil
-	}
 	return firstErr
 }
 
@@ -419,23 +394,6 @@ func (j *Journal) Sync() error {
 		return errors.New("journal: closed")
 	}
 	return s.sync()
-}
-
-// fsyncSegmentMeta makes a freshly-created segment's file metadata
-// (size, directory entry) durable: fdatasync on the segment's fd
-// covers the size; fsync on the parent dir covers the entry. Called
-// from rotate() and from Open() for a brand-new journal under
-// SyncOn. Caller holds j.mu.
-func (j *Journal) fsyncSegmentMeta(s *segment) error {
-	if err := fdatasyncFile(s.file); err != nil {
-		return fmt.Errorf("journal: segment %d fdatasync: %w", s.num, err)
-	}
-	if j.dirFile != nil {
-		if err := j.dirFile.Sync(); err != nil {
-			return fmt.Errorf("journal: dir fsync: %w", err)
-		}
-	}
-	return nil
 }
 
 // Head returns this process's cached offset just past the last observed
@@ -594,9 +552,8 @@ func (j *Journal) notifyAppend() {
 // ErrSegmentFull; if it's no longer active, another caller already
 // rotated and we just retry.
 //
-// Under SyncOn the new segment file is made durable (fdatasync on the
-// fd, fsync on the parent dir) before it is published as active, so a
-// host crash after rotate returns cannot leave a hole between an
+// In every sync mode the initialized segment is durable before it is
+// published as active. A host crash after rotate returns cannot leave a hole between an
 // fsync'd record and a missing-from-disk segment file.
 func (j *Journal) rotate(expected *segment, minSize uint32) error {
 	j.mu.Lock()
@@ -616,13 +573,6 @@ func (j *Journal) rotate(expected *segment, minSize uint32) error {
 	if s.segmentSize < newSize {
 		_ = s.close()
 		return fmt.Errorf("journal: rotate: segment %d size %d smaller than required %d", newNum, s.segmentSize, newSize)
-	}
-	if j.mode == SyncOn {
-		if err := j.fsyncSegmentMeta(s); err != nil {
-			_ = s.close()
-			_ = os.Remove(segmentPath(j.dir, newNum))
-			return fmt.Errorf("journal: rotate: %w", err)
-		}
 	}
 	if existing := j.findSegment(newNum); existing != nil {
 		_ = s.close()

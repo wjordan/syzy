@@ -126,8 +126,7 @@ func TestSyncOnRotationCreatesDurableSegment(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	// Every segment file should exist on disk (rotation's
-	// fsyncSegmentMeta path makes the directory entry durable).
+	// Every segment file should exist on disk after durable publication.
 	for _, n := range segs {
 		path := segmentPath(dir, n)
 		if _, err := os.Stat(path); err != nil {
@@ -136,33 +135,21 @@ func TestSyncOnRotationCreatesDurableSegment(t *testing.T) {
 	}
 }
 
-// TestSyncOnDirFileLifecycle: dirFile opens under SyncOn, clears on
-// Close, stays nil under SyncOff.
-func TestSyncOnDirFileLifecycle(t *testing.T) {
+func TestJournalReopensAcrossSyncModes(t *testing.T) {
 	dir := t.TempDir()
 	j, err := Open(dir, testSegmentSize, SyncOn)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	if j.dirFile == nil {
-		t.Errorf("SyncOn: dirFile is nil; want open")
-	}
 	if err := j.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if j.dirFile != nil {
-		t.Errorf("after Close: dirFile not cleared")
-	}
-
-	// Reopen (existing journal) under SyncOff; dirFile should remain nil.
+	// Reopen the durably initialized journal with asynchronous appends.
 	j2, err := Open(dir, testSegmentSize, SyncOff)
 	if err != nil {
 		t.Fatalf("Reopen(SyncOff): %v", err)
 	}
 	defer j2.Close()
-	if j2.dirFile != nil {
-		t.Errorf("SyncOff: dirFile not nil; want nil")
-	}
 
 	// Sanity: directory still exists and contains segments.
 	entries, err := os.ReadDir(dir)

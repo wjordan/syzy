@@ -1061,6 +1061,14 @@ seeding a permanent peer wedge.
 
 ### Anti-Entropy
 
+Gap planning counts a locally produced origin's `sender_seq - 1` prefix as
+already captured locally, including when an unclean restart has retired that
+origin and selected a new identity. It must not re-fetch that prefix as missing
+remote DML. Peer tips are the maximum of the captured-local prefix and the
+received tip. This is a planning bound, not a rewrite of persisted frontiers or
+an exemption from journal recovery: recovery still folds post-snapshot journal
+records into row and cell clocks, even when their sequence was allocated locally.
+
 Each origin's wire history lives in exactly one journal per node: the
 self origin's mirror journal (the self-log) for the node's own
 commits, and one mirror journal per remote or locally-drained secondary
@@ -1896,9 +1904,28 @@ combinations are safe, just not symmetric. Per-commit cost ranges
 from ~15 µs (`NORMAL`, journal sync off) to ~6 ms (`FULL`, journal
 sync on); see `internal/producer/journalsync_bench_test.go`.
 
-Mirror journals are intentionally never synced: a trailing mirror
-append lost on host crash is recoverable via peer re-delivery — an
-availability concern, not a durability one.
+Remote mirror record appends remain asynchronous: a trailing append lost on
+host crash is recoverable via peer re-delivery. Segment initialization is a
+separate durability boundary in every sync mode. A new segment's complete
+header and size must be synced in a private temporary file before its final
+name is published without replacing an existing segment. The final directory
+entry and its ancestors must also be synced, including caller-created parents
+and symlink-target paths. Unpublished
+temporary files are not journal segments and are ignored on recovery.
+
+Existing invalid headers remain fatal; startup never guesses that a damaged
+journal is empty or silently rewrites it. Offline `syzy repair-mirror` handles
+only one first segment whose entire content is zero and whose origin directory
+contains no other files. Inspection is the default. Explicit application holds
+the daemon and existing producer-origin locks, revalidates the inspected SHA-256,
+and durably preserves the whole original directory and an audit manifest outside
+the mirror scan before returning. It never edits database files, frontiers, gaps,
+or snapshot markers.
+The node subsequently obtains missing changes through its ordinary apply path.
+Installing a donor mirror is prohibited: recovery treats mirror entries as
+evidence of DML already applied locally, so a donor could falsely advance the
+local frontier without applying its rows. Nonzero corruption or uncertain
+database/metadata consistency requires a coherent clone, not this narrow repair.
 
 Out-of-band writes to replicated tables or schema (manual `sqlite3`
 shell without the producer loaded, naive backup restore that mixes a

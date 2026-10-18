@@ -544,8 +544,8 @@ func (c *Cache) appliedTipLocked(origin crdt.Origin) crdt.Seq {
 
 // AppliedTipMap returns the per-origin applied-tip in one lock
 // acquisition, with locally-drained origins (self + secondaries from
-// senderNextSeq) overlaid as next-1 (the producer is contiguous, so
-// tip == frontier for those). Used by the broker's gap-fill planner
+// senderNextSeq) merged as next-1. Received records beyond the persisted
+// local-production bound must not be hidden. Used by the broker's gap-fill planner
 // to bound its Fetch ranges against locally-observed tips.
 func (c *Cache) AppliedTipMap() map[crdt.Origin]crdt.Seq {
 	c.mu.Lock()
@@ -556,7 +556,7 @@ func (c *Cache) AppliedTipMap() map[crdt.Origin]crdt.Seq {
 		tips[o] = c.appliedTipLocked(o)
 	}
 	for o, next := range c.senderNextSeq {
-		if next > 0 {
+		if next > 0 && next-1 > tips[o] {
 			tips[o] = next - 1
 		}
 	}
@@ -597,15 +597,18 @@ func (c *Cache) RetentionFrontierMap() map[crdt.Origin]crdt.Seq {
 	return fr
 }
 
-// MissingRangesUpTo returns ranges in [frontier[o]+1, tip] that are
-// neither in the contiguous frontier nor in applied_gaps for origin o.
-// Returns nil when nothing is missing (frontier already at or above
-// tip). Used by the broker's gap planner to translate cache state into
-// transport.Range requests.
+// MissingRangesUpTo returns ranges not covered by the received frontier,
+// local-production prefix, or applied_gaps for origin o. A retired local
+// producer's captured prefix remains local history after identity rotation.
+// Returns nil when nothing is missing. Used by the broker's gap planner to
+// translate cache state into transport.Range requests.
 func (c *Cache) MissingRangesUpTo(o crdt.Origin, tip crdt.Seq) []crdt.SeqRange {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	head := c.frontier[o].LastSeq
+	if next := c.senderNextSeq[o]; next > 0 && next-1 > head {
+		head = next - 1
+	}
 	if tip <= head {
 		return nil
 	}

@@ -4,6 +4,7 @@
 //	syzy status  print frontier + applied gaps + schema_seq
 //	syzy join    seed a fresh database with an existing cluster_id
 //	syzy check   metadata/journal integrity scan
+//	syzy repair-mirror  inspect or quarantine one empty mirror journal
 //	syzy wait    block until this replica's writes have reached its peers
 //
 // Run any subcommand with -h for its options.
@@ -25,6 +26,7 @@ Subcommands:
   join      seed a fresh database with an existing cluster_id
   clone     bootstrap a fresh database from a peer or stopped local db
   check     metadata/journal integrity scan
+  repair-mirror  inspect or quarantine one entirely uninitialized mirror
   wait      block until this replica's writes have reached its peers
   snapshot  publish a logical snapshot of a stopped db to object storage
   s3-gc     remove unreferenced snapshot directories from a bucket
@@ -41,19 +43,20 @@ func main() {
 		os.Exit(2)
 	}
 	cmds := map[string]subcommand{
-		"daemon":    daemonCmd,
-		"status":    statusCmd,
-		"join":      joinCmd,
-		"clone":     cloneCmd,
-		"check":     checkCmd,
-		"wait":      waitCmd,
-		"snapshot":  snapshotCmd,
-		"s3-gc":     s3GCCmd,
-		"version":   versionCmd,
-		"-h":        func([]string) error { fmt.Print(usage); return nil },
-		"--help":    func([]string) error { fmt.Print(usage); return nil },
-		"help":      func([]string) error { fmt.Print(usage); return nil },
-		"--version": versionCmd,
+		"daemon":        daemonCmd,
+		"status":        statusCmd,
+		"join":          joinCmd,
+		"clone":         cloneCmd,
+		"check":         checkCmd,
+		"repair-mirror": repairMirrorCmd,
+		"wait":          waitCmd,
+		"snapshot":      snapshotCmd,
+		"s3-gc":         s3GCCmd,
+		"version":       versionCmd,
+		"-h":            func([]string) error { fmt.Print(usage); return nil },
+		"--help":        func([]string) error { fmt.Print(usage); return nil },
+		"help":          func([]string) error { fmt.Print(usage); return nil },
+		"--version":     versionCmd,
 	}
 	cmd, ok := cmds[os.Args[1]]
 	if !ok {
