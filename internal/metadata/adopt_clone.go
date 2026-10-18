@@ -23,6 +23,7 @@ import (
 //
 //   - node_id           — set to newOrigin.
 //   - sender_seq        — wiped; one fresh row (newOrigin, 1).
+//     The matched snapshot's captured prefixes become received frontiers first.
 //   - clean_shutdown    — true (next start is treated as clean).
 //   - hlc_last          — pulled forward to atLeastHLC if it would
 //     regress otherwise; never moves backward.
@@ -40,6 +41,29 @@ func (s *Store) AdoptClone(newOrigin crdt.Origin, atLeastHLC crdt.Clock) error {
 		return fmt.Errorf("metadata: AdoptClone: newOrigin must be non-zero")
 	}
 	return s.WithTx(func(tx *Tx) error {
+		hlc, err := tx.getUint64(keyHLCLast)
+		if err != nil {
+			return fmt.Errorf("metadata: AdoptClone: read hlc_last: %w", err)
+		}
+		// The bundle contains the source's local writes as well as its remote
+		// receipts. Preserve that coverage before discarding producer ownership.
+		// The source HLC is a conservative bound, independent of our new clock.
+		stmt, _, err := tx.conn.Prepare(`
+INSERT INTO frontier (origin, last_seq, last_hlc)
+SELECT origin, next_seq - 1, ? FROM sender_seq WHERE next_seq > 1
+ON CONFLICT(origin) DO UPDATE SET
+    last_seq = max(frontier.last_seq, excluded.last_seq),
+    last_hlc = max(frontier.last_hlc, excluded.last_hlc)`)
+		if err != nil {
+			return fmt.Errorf("metadata: AdoptClone: prepare captured prefixes: %w", err)
+		}
+		defer stmt.Finalize()
+		if err := stmt.BindInt64(1, int64(hlc)); err != nil {
+			return err
+		}
+		if _, err := stmt.Step(); err != nil {
+			return fmt.Errorf("metadata: AdoptClone: preserve captured prefixes: %w", err)
+		}
 		if err := tx.execNoArgs(`DELETE FROM sender_seq`); err != nil {
 			return fmt.Errorf("metadata: AdoptClone: clear sender_seq: %w", err)
 		}
@@ -51,10 +75,6 @@ func (s *Store) AdoptClone(newOrigin crdt.Origin, atLeastHLC crdt.Clock) error {
 		}
 		if err := tx.SetMeta(keyCleanShutdown, []byte{1}); err != nil {
 			return fmt.Errorf("metadata: AdoptClone: set clean_shutdown: %w", err)
-		}
-		hlc, err := tx.getUint64(keyHLCLast)
-		if err != nil {
-			return fmt.Errorf("metadata: AdoptClone: read hlc_last: %w", err)
 		}
 		merged := crdt.UnpackClock(hlc).Forward(atLeastHLC)
 		if err := tx.SetHLCLast(merged); err != nil {

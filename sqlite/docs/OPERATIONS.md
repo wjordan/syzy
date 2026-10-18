@@ -170,7 +170,9 @@ There are three bootstrap paths:
   and durable history. Use this for small or young databases.
 - **Clone.** `syzy clone <source> <destination>` copies a stopped local replica
   or streams a consistent bundle from a live daemon, then assigns a new writer
-  identity.
+  identity. Adoption preserves coverage of the source's locally produced writes
+  before clearing its producer identity, so restoring current state does not
+  require replaying the source's own history.
 - **Restore.** `sqlite.Restore` tries sources in order. A typical call prefers a
   live peer and falls back to the bucket:
 
@@ -182,6 +184,14 @@ err := syzy.Restore(ctx, "app.db",
 ```
 
 `sqlite.RestoreFromBucket` accepts an already-open `objectstore.Bucket`.
+
+When replacing an existing replica, stop every writer and retain a coherent
+backup of its application database, metadata, and journals. Require the staged
+clone's receipt coverage (frontiers plus gaps) to include the stopped replica's
+entire received and locally produced history. Compare complete ranges, not just
+the highest sequence: a newer tip does not prove that an earlier write survived.
+If coverage is incomplete, keep the original pair and refresh the clone or
+reconcile the missing tail through ordinary replication before installation.
 
 ### Full restore and lazy bootstrap
 

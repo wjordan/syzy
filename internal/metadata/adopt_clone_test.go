@@ -135,3 +135,64 @@ func TestAdoptClone_RejectsZeroOrigin(t *testing.T) {
 		t.Fatalf("AdoptClone with zero origin should error")
 	}
 }
+
+func TestAdoptClone_PreservesCapturedLocalPrefixes(t *testing.T) {
+	t.Parallel()
+	sc, err := Open(filepath.Join(t.TempDir(), "metadata.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sc.Close()
+	sourceClock := crdt.Clock{WallTime: 1000}
+	if err := sc.SetHLCLast(sourceClock); err != nil {
+		t.Fatal(err)
+	}
+	if err := sc.WithTx(func(tx *Tx) error {
+		for origin, next := range map[crdt.Origin]crdt.Seq{7: 6, 8: 4, 10: 3, 11: 1} {
+			if err := tx.PutSenderSeq(origin, next); err != nil {
+				return err
+			}
+		}
+		if err := tx.AdvanceFrontier(10, 9, sourceClock); err != nil {
+			return err
+		}
+		return tx.AdvanceFrontier(9, 1, sourceClock)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var remoteGaps, localGaps crdt.SeqSet
+	remoteGaps.Add(3)
+	localGaps.Add(8)
+	if err := sc.SetAppliedGaps(map[crdt.Origin]crdt.SeqSet{9: remoteGaps, 7: localGaps}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sc.AdoptClone(12, crdt.Clock{WallTime: 5000}); err != nil {
+		t.Fatal(err)
+	}
+	front, err := sc.Frontier()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for origin, want := range map[crdt.Origin]crdt.Seq{7: 5, 8: 3, 10: 9, 9: 1} {
+		if got := front[origin]; got.LastSeq != want || got.LastHLC != sourceClock {
+			t.Fatalf("origin %d: %+v, want seq %d with source clock", origin, got, want)
+		}
+	}
+	if _, ok := front[11]; ok {
+		t.Fatal("invented coverage for an unused producer")
+	}
+	if got := front[12]; got.LastSeq != 0 || got.LastHLC.WallTime != 5000 {
+		t.Fatalf("new identity inherited old production: %+v", got)
+	}
+	gaps, err := sc.GetAppliedGaps()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !gaps[9].Contains(3) || gaps[9].Contains(2) || !gaps[7].Contains(8) || gaps[7].Contains(6) {
+		t.Fatal("clone changed remote gaps or filled an uncaptured suffix")
+	}
+	seqs, err := sc.SenderSeqs()
+	if err != nil || len(seqs) != 1 || seqs[12] != 1 {
+		t.Fatalf("retained source producer ownership: %v, %v", seqs, err)
+	}
+}

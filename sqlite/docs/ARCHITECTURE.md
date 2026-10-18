@@ -1400,6 +1400,14 @@ the source WAL. The staged files are removed when the bundle is closed.
    staged metadata dir.
 3. Mint a fresh `node_id` (`layout.MintOrigin`).
 4. **Identity reset on the staged metadata** (one transaction):
+   - Before removing producer counters, materialize each source-owned
+     `sender_seq - 1` prefix into the received frontier. The matched bundle
+     already contains those local writes and their clocks; losing this coverage
+     would make the adopter replay the source's own history. Preserve larger
+     received frontiers and all remote gaps. Use the source snapshot's HLC as a
+     conservative clock bound for these captured prefixes, before advancing the
+     adopter's clock. This conversion is valid only for a consistent clone pair,
+     never as a repair of a lagging replica's live frontier.
    - Write `node_id = newOrigin`.
    - Wipe `sender_seq`; seed `(newOrigin, 1)`.
    - `clean_shutdown = true`.

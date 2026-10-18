@@ -15,6 +15,8 @@ import (
 	"github.com/wjordan/syzy/internal/clone"
 	"github.com/wjordan/syzy/internal/layout"
 	"github.com/wjordan/syzy/internal/metadata"
+	"github.com/wjordan/syzy/internal/nodestate"
+	"github.com/wjordan/syzy/schemalog"
 	syzy "github.com/wjordan/syzy/sqlite"
 	"github.com/wjordan/syzy/sqlitebridge"
 	"github.com/wjordan/syzy/tcpmesh"
@@ -66,17 +68,37 @@ func TestClone_OfflineRoundtrip(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	src := filepath.Join(dir, "src.db")
-	openSourceNode(t, src, func(n *syzy.Node) {
-		if err := n.Exec(`CREATE TABLE notes (
+	tx, err := syzy.NewTestTx(tcpmesh.Config{Listen: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Close()
+	n, err := syzy.Open(context.Background(), syzy.Config{Path: src, Transport: tx, ObjectBackend: testBackend(t), SchemaLog: schemalog.NewLocal()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n.Close()
+	if err := n.Exec(`CREATE TABLE notes (
 			id BLOB PRIMARY KEY NOT NULL DEFAULT (uuidv7()),
 			body TEXT NOT NULL
 		)`); err != nil {
-			t.Fatalf("create: %v", err)
-		}
-		if err := n.Exec(`INSERT INTO notes (body) VALUES ('alpha'), ('beta'), ('gamma')`); err != nil {
-			t.Fatalf("insert: %v", err)
-		}
-	})
+		t.Fatalf("create: %v", err)
+	}
+	if err := n.Exec(`INSERT INTO notes (body) VALUES ('alpha'), ('beta'), ('gamma')`); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := n.Close(); err != nil {
+		t.Fatal(err)
+	}
+	sourceMeta, err := metadata.Open(layout.MetaDB(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	produced, err := sourceMeta.SenderSeqs()
+	_ = sourceMeta.Close()
+	if err != nil || len(produced) == 0 {
+		t.Fatalf("source production bounds: %v, %v", produced, err)
+	}
 
 	var bundle bytes.Buffer
 	if err := clone.Stream(&bundle, src); err != nil {
@@ -120,6 +142,18 @@ func TestClone_OfflineRoundtrip(t *testing.T) {
 	}
 	if len(seqs) != 1 || seqs[newOrigin] != 1 {
 		t.Fatalf("dst sender_seqs: %+v", seqs)
+	}
+	cache := nodestate.New(newOrigin)
+	if err := cache.LoadFromMeta(sc); err != nil {
+		t.Fatal(err)
+	}
+	for origin, next := range produced {
+		if next <= 1 {
+			t.Fatal("source workload produced no history")
+		}
+		if missing := cache.MissingRangesUpTo(origin, next-1); len(missing) != 0 {
+			t.Fatalf("cloned rows still require source replay: %+v", missing)
+		}
 	}
 
 	// Real test: open the destination as a syzy node. The producer's
